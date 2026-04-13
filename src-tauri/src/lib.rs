@@ -1,3 +1,4 @@
+use std::env;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -118,14 +119,17 @@ struct LoadedConfig {
 fn get_xray_snapshot() -> XraySnapshot {
     let mut notes = Vec::new();
 
-    let binary_path = command_output("which", &["xray"]);
-    let installed = binary_path.is_some();
+    let xray_binary = resolve_command_path("xray");
+    let binary_path = xray_binary
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let installed = xray_binary.is_some();
 
-    let version = if installed {
-        command_output("xray", &["version"])
+    let version = if let Some(binary) = xray_binary.as_ref() {
+        command_output_at(binary, &["version"])
             .and_then(|output| output.lines().next().map(|line| line.trim().to_string()))
     } else {
-        notes.push("`xray` was not found in PATH.".to_string());
+        notes.push("`xray` was not found in PATH or known install locations.".to_string());
         None
     };
 
@@ -286,7 +290,8 @@ fn service_action(action: String) -> Result<String, String> {
         return Err(format!("Invalid action: {action}"));
     }
 
-    let output = Command::new("brew")
+    let brew_binary = resolve_required_command_path("brew")?;
+    let output = Command::new(&brew_binary)
         .args(["services", action.as_str(), "xray"])
         .output()
         .map_err(|error| format!("Failed to run brew services {action}: {error}"))?;
@@ -352,7 +357,19 @@ fn get_user_traffic() -> TrafficResponse {
     let port = api_port.unwrap();
     let server = format!("127.0.0.1:{port}");
 
-    match Command::new("xray")
+    let xray_binary = match resolve_required_command_path("xray") {
+        Ok(path) => path,
+        Err(error) => {
+            return TrafficResponse {
+                available: false,
+                api_port: Some(port),
+                users: vec![],
+                error: Some(error),
+            }
+        }
+    };
+
+    match Command::new(&xray_binary)
         .args(["api", "statsquery", "--server", &server, "-pattern", "user>>>"])
         .output()
     {
@@ -686,7 +703,8 @@ fn temporary_path_for(path: &Path) -> PathBuf {
 
 fn validate_xray_config(path: &Path) -> Result<(), String> {
     let path_string = path.to_string_lossy().into_owned();
-    let output = Command::new("xray")
+    let xray_binary = resolve_required_command_path("xray")?;
+    let output = Command::new(&xray_binary)
         .args(["run", "-c", path_string.as_str(), "-test"])
         .output()
         .map_err(|error| format!("Failed to run xray config validation: {error}"))?;
@@ -709,7 +727,8 @@ fn validate_xray_config(path: &Path) -> Result<(), String> {
 }
 
 fn derive_public_key(private_key: &str) -> Option<String> {
-    let output = command_output("xray", &["x25519", "-i", private_key])?;
+    let xray_binary = resolve_command_path("xray")?;
+    let output = command_output_at(&xray_binary, &["x25519", "-i", private_key])?;
     output.lines().find_map(|line| {
         line.trim()
             .strip_prefix("Password (PublicKey): ")
@@ -815,7 +834,51 @@ fn pgrep_status(process: &str) -> Option<(bool, Option<u32>)> {
     Some((true, Some(pid)))
 }
 
+fn resolve_required_command_path(program: &str) -> Result<PathBuf, String> {
+    resolve_command_path(program).ok_or_else(|| {
+        format!("`{program}` was not found in PATH or known install locations.")
+    })
+}
+
+fn resolve_command_path(program: &str) -> Option<PathBuf> {
+    let candidate = Path::new(program);
+    if candidate.components().count() > 1 || candidate.is_absolute() {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+
+    if let Some(path_env) = env::var_os("PATH") {
+        for directory in env::split_paths(&path_env) {
+            let path = directory.join(program);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+
+    for fallback in command_fallbacks(program) {
+        let path = PathBuf::from(fallback);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn command_fallbacks(program: &str) -> &'static [&'static str] {
+    match program {
+        "xray" => &["/opt/homebrew/bin/xray", "/usr/local/bin/xray"],
+        "brew" => &["/opt/homebrew/bin/brew", "/usr/local/bin/brew"],
+        _ => &[],
+    }
+}
+
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let resolved = resolve_command_path(program)?;
+    command_output_at(&resolved, args)
+}
+
+fn command_output_at(program: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
