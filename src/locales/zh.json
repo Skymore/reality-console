@@ -90,6 +90,8 @@
     "quotaExceeded": "已超出配额",
     "setQuota": "设置配额 (GB)",
     "quotaSaved": "配额已更新",
+    "connCount": "{{count}} 次连接",
+    "lastActive": "最后活跃: {{time}}",
     "deleteUser": "删除用户",
     "createTitle": "创建 VLESS 用户",
     "createDesc": "标签留空会自动命名为 friend-N。",

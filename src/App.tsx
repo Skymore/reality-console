@@ -28,7 +28,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
-import type { CreateUserInput, TrafficResponse, UserListResponse, UserMutationResult, UserQuota } from "@/lib/users"
+import type { ConnectionLog, CreateUserInput, TrafficResponse, UserListResponse, UserMutationResult, UserQuota } from "@/lib/users"
 import type { XraySnapshot } from "@/lib/xray"
 import { cn } from "@/lib/utils"
 
@@ -81,6 +81,7 @@ function App() {
   const [mutationNotice, setMutationNotice] = useState<string | null>(null)
   const [trafficResponse, setTrafficResponse] = useState<TrafficResponse | null>(null)
   const [quotas, setQuotas] = useState<UserQuota[]>([])
+  const [connLogs, setConnLogs] = useState<ConnectionLog[]>([])
 
   const [needsRestart, setNeedsRestart] = useState(false)
   const [isRestarting, setIsRestarting] = useState(false)
@@ -230,9 +231,11 @@ function App() {
           setTrafficResponse(nextTraffic.value)
         }
 
-        // Sync cumulative traffic into DB and get quotas
-        invoke<UserQuota[]>("sync_traffic")
-          .then((q) => setQuotas(q))
+        // Sync cumulative traffic + connection logs
+        invoke<UserQuota[]>("sync_traffic").then((q) => setQuotas(q)).catch(() => {})
+        invoke("pull_access_logs")
+          .then(() => invoke<ConnectionLog[]>("get_connection_logs", { limit: 200 }))
+          .then((logs) => setConnLogs(logs))
           .catch(() => {})
 
       })
@@ -340,13 +343,20 @@ function App() {
   useEffect(() => {
     void refreshAll()
 
-    // Auto-refresh at midnight for daily usage reset
+    // Auto sync traffic every 30 minutes + refresh at midnight
     const timer = setInterval(() => {
       const now = new Date()
       if (now.getHours() === 0 && now.getMinutes() === 0) {
         void refreshAll()
+      } else {
+        // Silent traffic sync (no full refresh, just accumulate stats)
+        invoke<UserQuota[]>("sync_traffic").then((q) => setQuotas(q)).catch(() => {})
+        invoke("pull_access_logs")
+          .then(() => invoke<ConnectionLog[]>("get_connection_logs", { limit: 200 }))
+          .then((logs) => setConnLogs(logs))
+          .catch(() => {})
       }
-    }, 60_000)
+    }, 30 * 60_000)
     return () => clearInterval(timer)
   }, [])
 
@@ -490,6 +500,7 @@ function App() {
                 mutationNotice,
                 trafficResponse,
                 quotas,
+                connLogs,
                 isRefreshing,
                 showToast,
                 onRefreshUsers: refreshAll,
@@ -518,6 +529,7 @@ function renderPage({
   mutationNotice,
   trafficResponse,
   quotas,
+  connLogs,
   isRefreshing,
   onRefreshUsers,
   showToast,
@@ -535,6 +547,7 @@ function renderPage({
   mutationNotice: string | null
   trafficResponse: TrafficResponse | null
   quotas: UserQuota[]
+  connLogs: ConnectionLog[]
   isRefreshing: boolean
   showToast: (msg: string) => void
   onRefreshUsers: () => Promise<void>
@@ -546,7 +559,7 @@ function renderPage({
 }) {
   switch (activePage) {
     case "dashboard":
-      return <DashboardPage snapshot={snapshot} loadError={snapshotError} trafficResponse={trafficResponse} />
+      return <DashboardPage snapshot={snapshot} loadError={snapshotError} trafficResponse={trafficResponse} quotas={quotas} />
     case "users":
       return (
         <UsersPage
@@ -554,6 +567,7 @@ function renderPage({
           configPath={usersResponse?.configPath}
           trafficResponse={trafficResponse}
           quotas={quotas}
+          connLogs={connLogs}
           onSetQuota={onSetQuota}
           isLoading={isRefreshing}
           error={usersError}
@@ -585,10 +599,12 @@ function DashboardPage({
   snapshot,
   loadError,
   trafficResponse,
+  quotas,
 }: {
   snapshot: XraySnapshot
   loadError: string | null
   trafficResponse: TrafficResponse | null
+  quotas: UserQuota[]
 }) {
   const { t } = useTranslation()
 
@@ -630,12 +646,9 @@ function DashboardPage({
               <StatusRow
                 label={t("dashboard.traffic")}
                 value={(() => {
-                  if (!trafficResponse?.available) return t("dashboard.notConfigured")
-                  const total = trafficResponse.users.reduce(
-                    (acc, u) => ({ up: acc.up + u.uplink, down: acc.down + u.downlink }),
-                    { up: 0, down: 0 },
-                  )
-                  return `↑ ${formatBytes(total.up)}  ↓ ${formatBytes(total.down)}`
+                  if (quotas.length === 0 && !trafficResponse?.available) return t("dashboard.notConfigured")
+                  const totalUsed = quotas.reduce((sum, q) => sum + q.usedThisMonth, 0)
+                  return formatBytes(totalUsed)
                 })()}
               />
             </tbody>

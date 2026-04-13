@@ -17,7 +17,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import type { CreateUserInput, ManagedUser, TrafficResponse, UserQuota } from "@/lib/users"
+import type { ConnectionLog, CreateUserInput, ManagedUser, TrafficResponse, UserQuota } from "@/lib/users"
 import { cn } from "@/lib/utils"
 
 function formatBytes(bytes: number): string {
@@ -33,6 +33,7 @@ type UsersPageProps = {
   configPath?: string | null
   trafficResponse?: TrafficResponse | null
   quotas: UserQuota[]
+  connLogs: ConnectionLog[]
   onSetQuota: (userId: string, quotaGb: number) => Promise<void>
   isLoading: boolean
   error?: string | null
@@ -50,6 +51,7 @@ export function UsersPage({
   configPath,
   trafficResponse,
   quotas,
+  connLogs,
   onSetQuota,
   isLoading,
   error,
@@ -237,6 +239,17 @@ export function UsersPage({
                 <p className="mt-0.5 truncate text-xs text-muted-foreground/60">
                   {user.note || t("users.noNote")}
                 </p>
+                {(() => {
+                  const userLogs = connLogs.filter((l) => l.userEmail === user.label)
+                  const lastLog = userLogs[0]
+                  if (!lastLog) return null
+                  return (
+                    <div className="mt-0.5 flex items-center gap-3 text-xs text-muted-foreground/40">
+                      <span>{t("users.connCount", { count: userLogs.length })}</span>
+                      <span>{t("users.lastActive", { time: lastLog.timestamp })}</span>
+                    </div>
+                  )
+                })()}
               </div>
 
               <div className="flex shrink-0 gap-1">

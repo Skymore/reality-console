@@ -486,6 +486,27 @@ fn sync_traffic(db: tauri::State<'_, Db>) -> Result<Vec<db::UserQuota>, String> 
 }
 
 #[tauri::command]
+fn pull_access_logs(db: tauri::State<'_, Db>) -> Result<usize, String> {
+    // Find access log path from xray config
+    let config_path = detect_config_path().ok_or("No Xray config found.")?;
+    let contents = fs::read_to_string(&config_path).map_err(|e| format!("Cannot read config: {e}"))?;
+    let root: Value = serde_json::from_str(&contents).map_err(|e| format!("Cannot parse config: {e}"))?;
+
+    let log_path = root
+        .get("log")
+        .and_then(|l| l.get("access"))
+        .and_then(Value::as_str)
+        .ok_or("Access log not configured in Xray config.")?;
+
+    db.sync_access_log(log_path)
+}
+
+#[tauri::command]
+fn get_connection_logs(db: tauri::State<'_, Db>, user_email: Option<String>, limit: Option<i64>) -> Result<Vec<db::ConnectionLog>, String> {
+    db.get_connections(user_email.as_deref(), limit.unwrap_or(50))
+}
+
+#[tauri::command]
 fn set_user_quota(db: tauri::State<'_, Db>, user_id: String, quota_gb: f64) -> Result<(), String> {
     let quota_bytes = (quota_gb * 1_073_741_824.0) as i64;
     db.set_quota(&user_id, quota_bytes)
@@ -1088,6 +1109,8 @@ pub fn run() {
             get_user_traffic,
             sync_traffic,
             set_user_quota,
+            pull_access_logs,
+            get_connection_logs,
             service_action
         ])
         .run(tauri::generate_context!())

@@ -36,6 +36,14 @@ export type TrafficResponse = {
   error?: string | null
 }
 
+export type ConnectionLog = {
+  id: number
+  userEmail: string
+  timestamp: string
+  clientIp: string
+  destination: string
+}
+
 export type UserQuota = {
   userId: string
   monthlyQuotaBytes: number

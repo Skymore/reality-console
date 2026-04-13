@@ -90,6 +90,8 @@
     "quotaExceeded": "Quota exceeded",
     "setQuota": "Set quota (GB)",
     "quotaSaved": "Quota updated",
+    "connCount": "{{count}} connections",
+    "lastActive": "Last active: {{time}}",
     "deleteUser": "Delete user",
     "createTitle": "Create VLESS user",
     "createDesc": "Leave the label empty to auto-generate the next friend-N slot.",

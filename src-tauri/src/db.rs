@@ -2,11 +2,23 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
+use std::fs;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
 const DEFAULT_MONTHLY_QUOTA: i64 = 53_687_091_200; // 50 GB
 
 pub struct Db {
     conn: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionLog {
+    pub id: i64,
+    pub user_email: String,
+    pub timestamp: String,
+    pub client_ip: String,
+    pub destination: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,7 +44,20 @@ impl Db {
                 last_reset_month TEXT NOT NULL DEFAULT '',
                 last_known_uplink INTEGER NOT NULL DEFAULT 0,
                 last_known_downlink INTEGER NOT NULL DEFAULT 0
-            );"
+            );
+            CREATE TABLE IF NOT EXISTS connection_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_email TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                client_ip TEXT NOT NULL,
+                destination TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kv (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_connlog_user ON connection_logs(user_email);
+            CREATE INDEX IF NOT EXISTS idx_connlog_ts ON connection_logs(timestamp DESC);"
         ))
         .map_err(|e| format!("Failed to create tables: {e}"))?;
 
@@ -103,10 +128,107 @@ impl Db {
         self.get_quotas_inner(&conn)
     }
 
+    /// Read new lines from xray access log and store parsed connections.
+    pub fn sync_access_log(&self, log_path: &str) -> Result<usize, String> {
+        let conn = self.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
+
+        // Get last read offset
+        let last_offset: i64 = conn
+            .query_row(
+                "SELECT value FROM kv WHERE key = 'log_offset'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let file = fs::File::open(log_path).map_err(|e| format!("Cannot open access log: {e}"))?;
+        let file_len = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
+
+        // If file is smaller than last offset, it was rotated/truncated
+        let start = if file_len < last_offset { 0 } else { last_offset };
+
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(start as u64)).map_err(|e| format!("Seek failed: {e}"))?;
+
+        let mut count = 0;
+        let mut line = String::new();
+
+        while reader.read_line(&mut line).map_err(|e| format!("Read failed: {e}"))? > 0 {
+            if let Some(entry) = parse_access_line(&line) {
+                conn.execute(
+                    "INSERT INTO connection_logs (user_email, timestamp, client_ip, destination) VALUES (?1, ?2, ?3, ?4)",
+                    params![entry.0, entry.1, entry.2, entry.3],
+                ).map_err(|e| format!("DB insert log: {e}"))?;
+                count += 1;
+            }
+            line.clear();
+        }
+
+        // Save new offset
+        let new_offset = reader.stream_position().unwrap_or(file_len as u64) as i64;
+        conn.execute(
+            "INSERT INTO kv (key, value) VALUES ('log_offset', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![new_offset],
+        ).map_err(|e| format!("DB save offset: {e}"))?;
+
+        // Keep only last 1000 entries per user to avoid unbounded growth
+        conn.execute(
+            "DELETE FROM connection_logs WHERE id NOT IN (SELECT id FROM connection_logs ORDER BY id DESC LIMIT 5000)",
+            [],
+        ).map_err(|_| "".to_string()).ok();
+
+        Ok(count)
+    }
+
+    /// Get recent connection logs for a specific user, or all users.
+    pub fn get_connections(&self, user_email: Option<&str>, limit: i64) -> Result<Vec<ConnectionLog>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
+
+        let mut logs = Vec::new();
+
+        if let Some(email) = user_email {
+            let mut stmt = conn
+                .prepare("SELECT id, user_email, timestamp, client_ip, destination FROM connection_logs WHERE user_email = ?1 ORDER BY id DESC LIMIT ?2")
+                .map_err(|e| format!("DB prepare: {e}"))?;
+            let rows = stmt.query_map(params![email, limit], |row| {
+                Ok(ConnectionLog {
+                    id: row.get(0)?,
+                    user_email: row.get(1)?,
+                    timestamp: row.get(2)?,
+                    client_ip: row.get(3)?,
+                    destination: row.get(4)?,
+                })
+            }).map_err(|e| format!("DB query: {e}"))?;
+            for row in rows {
+                logs.push(row.map_err(|e| format!("DB row: {e}"))?);
+            }
+        } else {
+            let mut stmt = conn
+                .prepare("SELECT id, user_email, timestamp, client_ip, destination FROM connection_logs ORDER BY id DESC LIMIT ?1")
+                .map_err(|e| format!("DB prepare: {e}"))?;
+            let rows = stmt.query_map(params![limit], |row| {
+                Ok(ConnectionLog {
+                    id: row.get(0)?,
+                    user_email: row.get(1)?,
+                    timestamp: row.get(2)?,
+                    client_ip: row.get(3)?,
+                    destination: row.get(4)?,
+                })
+            }).map_err(|e| format!("DB query: {e}"))?;
+            for row in rows {
+                logs.push(row.map_err(|e| format!("DB row: {e}"))?);
+            }
+        }
+
+        Ok(logs)
+    }
+
     pub fn delete_user(&self, user_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
         conn.execute("DELETE FROM user_traffic WHERE user_id = ?1", params![user_id])
             .map_err(|e| format!("DB delete: {e}"))?;
+        conn.execute("DELETE FROM connection_logs WHERE user_email = ?1", params![user_id])
+            .map_err(|e| format!("DB delete logs: {e}"))?;
         Ok(())
     }
 
@@ -132,4 +254,40 @@ impl Db {
         }
         Ok(result)
     }
+}
+
+/// Parse a single xray access log line.
+/// Format: "2026/04/12 20:00:00 1.2.3.4:5678 accepted tcp:www.google.com:443 email: friend-1"
+fn parse_access_line(line: &str) -> Option<(String, String, String, String)> {
+    let line = line.trim();
+    if line.is_empty() || !line.contains("accepted") {
+        return None;
+    }
+
+    // Extract email
+    let email = line.rsplit("email: ").next()?.trim().to_string();
+    if email.is_empty() || email == line {
+        return None;
+    }
+
+    // Extract timestamp (first 19 chars: "2026/04/12 20:00:00")
+    if line.len() < 20 {
+        return None;
+    }
+    let timestamp = line[..19].to_string();
+
+    // Extract client IP (after timestamp, before "accepted")
+    let after_ts = line[20..].trim();
+    let client_ip = after_ts.split_whitespace().next().unwrap_or("").to_string();
+
+    // Extract destination (after "accepted", before "email:")
+    let dest = after_ts
+        .split("accepted")
+        .nth(1)?
+        .split("email:")
+        .next()?
+        .trim()
+        .to_string();
+
+    Some((email, timestamp, client_ip, dest))
 }
