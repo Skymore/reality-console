@@ -28,7 +28,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
-import type { CreateUserInput, TrafficResponse, UserListResponse, UserMutationResult } from "@/lib/users"
+import type { CreateUserInput, TrafficResponse, UserListResponse, UserMutationResult, UserQuota } from "@/lib/users"
 import type { XraySnapshot } from "@/lib/xray"
 import { cn } from "@/lib/utils"
 
@@ -80,6 +80,8 @@ function App() {
   const [usersError, setUsersError] = useState<string | null>(null)
   const [mutationNotice, setMutationNotice] = useState<string | null>(null)
   const [trafficResponse, setTrafficResponse] = useState<TrafficResponse | null>(null)
+  const [quotas, setQuotas] = useState<UserQuota[]>([])
+
   const [needsRestart, setNeedsRestart] = useState(false)
   const [isRestarting, setIsRestarting] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
@@ -227,6 +229,12 @@ function App() {
         if (nextTraffic.status === "fulfilled") {
           setTrafficResponse(nextTraffic.value)
         }
+
+        // Sync cumulative traffic into DB and get quotas
+        invoke<UserQuota[]>("sync_traffic")
+          .then((q) => setQuotas(q))
+          .catch(() => {})
+
       })
       showToast(t("action.refreshed"))
     } finally {
@@ -297,6 +305,17 @@ function App() {
     }
   }
 
+  async function handleSetQuota(userId: string, quotaGb: number) {
+    try {
+      await invoke("set_user_quota", { userId, quotaGb })
+      const q = await invoke<UserQuota[]>("sync_traffic")
+      setQuotas(q)
+      showToast(t("users.quotaSaved"))
+    } catch (error) {
+      showToast(toErrorMessage(error, t("users.createFailed")))
+    }
+  }
+
   async function handleDeleteUser(userId: string) {
     try {
       const result = await invoke<UserMutationResult>("delete_vless_user", { userId })
@@ -320,6 +339,15 @@ function App() {
 
   useEffect(() => {
     void refreshAll()
+
+    // Auto-refresh at midnight for daily usage reset
+    const timer = setInterval(() => {
+      const now = new Date()
+      if (now.getHours() === 0 && now.getMinutes() === 0) {
+        void refreshAll()
+      }
+    }, 60_000)
+    return () => clearInterval(timer)
   }, [])
 
   return (
@@ -461,12 +489,14 @@ function App() {
                 usersError,
                 mutationNotice,
                 trafficResponse,
+                quotas,
                 isRefreshing,
                 showToast,
                 onRefreshUsers: refreshAll,
                 onCreateUser: handleCreateUser,
                 onUpdateLabel: handleUpdateLabel,
                 onUpdateNote: handleUpdateNote,
+                onSetQuota: handleSetQuota,
                 onDeleteUser: handleDeleteUser,
               })}
             </div>
@@ -487,12 +517,14 @@ function renderPage({
   usersError,
   mutationNotice,
   trafficResponse,
+  quotas,
   isRefreshing,
   onRefreshUsers,
   showToast,
   onCreateUser,
   onUpdateLabel,
   onUpdateNote,
+  onSetQuota,
   onDeleteUser,
 }: {
   activePage: PageId
@@ -502,12 +534,14 @@ function renderPage({
   usersError: string | null
   mutationNotice: string | null
   trafficResponse: TrafficResponse | null
+  quotas: UserQuota[]
   isRefreshing: boolean
   showToast: (msg: string) => void
   onRefreshUsers: () => Promise<void>
   onCreateUser: (input: CreateUserInput) => Promise<void>
   onUpdateLabel: (userId: string, newLabel: string) => Promise<void>
   onUpdateNote: (userId: string, newNote: string) => Promise<void>
+  onSetQuota: (userId: string, quotaGb: number) => Promise<void>
   onDeleteUser: (userId: string) => Promise<void>
 }) {
   switch (activePage) {
@@ -519,6 +553,8 @@ function renderPage({
           users={usersResponse?.users ?? []}
           configPath={usersResponse?.configPath}
           trafficResponse={trafficResponse}
+          quotas={quotas}
+          onSetQuota={onSetQuota}
           isLoading={isRefreshing}
           error={usersError}
           mutationNotice={mutationNotice}

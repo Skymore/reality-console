@@ -17,7 +17,8 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import type { CreateUserInput, ManagedUser, TrafficResponse } from "@/lib/users"
+import type { CreateUserInput, ManagedUser, TrafficResponse, UserQuota } from "@/lib/users"
+import { cn } from "@/lib/utils"
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B"
@@ -31,6 +32,8 @@ type UsersPageProps = {
   users: ManagedUser[]
   configPath?: string | null
   trafficResponse?: TrafficResponse | null
+  quotas: UserQuota[]
+  onSetQuota: (userId: string, quotaGb: number) => Promise<void>
   isLoading: boolean
   error?: string | null
   mutationNotice?: string | null
@@ -46,6 +49,8 @@ export function UsersPage({
   users,
   configPath,
   trafficResponse,
+  quotas,
+  onSetQuota,
   isLoading,
   error,
   mutationNotice,
@@ -65,7 +70,7 @@ export function UsersPage({
   const [submitBusy, setSubmitBusy] = useState(false)
   const [actionBusyId, setActionBusyId] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ManagedUser | null>(null)
-  const [editingUser, setEditingUser] = useState<{ id: string; label: string; note: string } | null>(null)
+  const [editingUser, setEditingUser] = useState<{ id: string; label: string; note: string; quotaGb: string } | null>(null)
   const qrRef = useRef<HTMLDivElement>(null)
 
   const handleCopyQr = useCallback(async () => {
@@ -129,6 +134,10 @@ export function UsersPage({
     try {
       await onUpdateLabel(editingUser.id, editingUser.label.trim())
       await onUpdateNote(editingUser.id, editingUser.note)
+      const gb = parseFloat(editingUser.quotaGb)
+      if (!isNaN(gb) && gb > 0) {
+        await onSetQuota(editingUser.id, gb)
+      }
       setEditingUser(null)
     } catch { /* error shown by parent */ }
   }
@@ -183,7 +192,7 @@ export function UsersPage({
           {users.map((user) => (
             <div
               key={user.id}
-              className="flex items-center gap-3 rounded-xl border border-border/60 bg-background/80 px-3 py-2.5"
+              className="flex items-start gap-3 rounded-xl border border-border/60 bg-background/80 px-3 py-2.5"
             >
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
@@ -197,15 +206,34 @@ export function UsersPage({
                     <span className="size-1.5 shrink-0 rounded-full bg-muted-foreground/40" title="N/A" />
                   )}
                 </div>
-                <div className="mt-0.5 flex items-center gap-3 text-xs text-muted-foreground">
-                  <span className="truncate font-mono">{user.id}</span>
-                  <span className="shrink-0">
+                <div className="mt-0.5 flex items-center justify-between text-xs text-muted-foreground">
+                  <span className="min-w-0 truncate font-mono">{user.id}</span>
+                  <span className="shrink-0 pl-3">
                     {(() => {
                       const tr = trafficResponse?.users.find((u) => u.email === user.label)
                       return `↑${formatBytes(tr?.uplink ?? 0)} ↓${formatBytes(tr?.downlink ?? 0)}`
                     })()}
                   </span>
                 </div>
+                {(() => {
+                  const q = quotas.find((q) => q.userId === user.label)
+                  if (!q) return null
+                  const pct = q.monthlyQuotaBytes > 0 ? Math.min(100, (q.usedThisMonth / q.monthlyQuotaBytes) * 100) : 0
+                  const exceeded = q.usedThisMonth >= q.monthlyQuotaBytes
+                  return (
+                    <div className="mt-1 flex items-center gap-2">
+                      <div className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-border/60">
+                        <div
+                          className={cn("h-full rounded-full transition-all", exceeded ? "bg-destructive" : "bg-primary")}
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                      <span className={cn("shrink-0 text-xs", exceeded ? "text-destructive" : "text-muted-foreground")}>
+                        {formatBytes(q.usedThisMonth)} / {formatBytes(q.monthlyQuotaBytes)}
+                      </span>
+                    </div>
+                  )
+                })()}
                 <p className="mt-0.5 truncate text-xs text-muted-foreground/60">
                   {user.note || t("users.noNote")}
                 </p>
@@ -217,7 +245,11 @@ export function UsersPage({
                     <Button
                       variant="ghost"
                       size="icon-xs"
-                      onClick={() => setEditingUser({ id: user.id, label: user.label, note: user.note ?? "" })}
+                      onClick={() => {
+                        const q = quotas.find((q) => q.userId === user.label)
+                        const quotaGb = q ? String(Math.round(q.monthlyQuotaBytes / 1_073_741_824)) : "50"
+                        setEditingUser({ id: user.id, label: user.label, note: user.note ?? "", quotaGb })
+                      }}
                     >
                       <Pencil className="size-3.5" />
                     </Button>
@@ -369,6 +401,26 @@ export function UsersPage({
                 placeholder={t("users.notePlaceholder")}
                 rows={2}
               />
+            </div>
+            <div className="space-y-1">
+              <Label>{t("users.setQuota")}</Label>
+              <div className="flex gap-2">
+                {["50", "200", "1000"].map((gb) => (
+                  <button
+                    key={gb}
+                    type="button"
+                    onClick={() => setEditingUser((prev) => prev ? { ...prev, quotaGb: gb } : null)}
+                    className={cn(
+                      "rounded-lg border px-3 py-1.5 text-sm transition-colors",
+                      editingUser?.quotaGb === gb
+                        ? "border-primary bg-primary/10 font-medium text-foreground"
+                        : "border-border/60 text-muted-foreground hover:bg-secondary",
+                    )}
+                  >
+                    {gb} GB
+                  </button>
+                ))}
+              </div>
             </div>
             <div className="flex justify-end gap-2">
               <Button variant="outline" onClick={() => setEditingUser(null)}>

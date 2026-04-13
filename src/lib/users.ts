@@ -35,3 +35,10 @@ export type TrafficResponse = {
   users: UserTraffic[]
   error?: string | null
 }
+
+export type UserQuota = {
+  userId: string
+  monthlyQuotaBytes: number
+  usedThisMonth: number
+  lastResetMonth: string
+}

@@ -1,3 +1,5 @@
+mod db;
+
 use std::env;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -7,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+use db::Db;
+use dirs;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -438,6 +443,70 @@ fn get_user_traffic() -> TrafficResponse {
             error: Some(format!("Failed to run xray api: {e}")),
         },
     }
+}
+
+#[tauri::command]
+fn sync_traffic(db: tauri::State<'_, Db>) -> Result<Vec<db::UserQuota>, String> {
+    // Get live stats from xray
+    let config_path = detect_config_path().ok_or("No Xray config found.")?;
+    let contents = fs::read_to_string(&config_path).map_err(|e| format!("Cannot read config: {e}"))?;
+    let root: Value = serde_json::from_str(&contents).map_err(|e| format!("Cannot parse config: {e}"))?;
+
+    let has_stats = root.get("stats").is_some();
+    let api_port = find_api_port(&root);
+
+    if !has_stats || api_port.is_none() {
+        return db.get_quotas();
+    }
+
+    let port = api_port.unwrap();
+    let server = format!("127.0.0.1:{port}");
+    let xray_binary = resolve_required_command_path("xray")?;
+
+    let live_stats = match Command::new(&xray_binary)
+        .args(["api", "statsquery", "--server", &server, "-pattern", "user>>>"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            parse_traffic_stats(&stdout)
+        }
+        _ => vec![],
+    };
+
+    let stats_tuples: Vec<(String, u64, u64)> = live_stats
+        .into_iter()
+        .map(|t| (t.email, t.uplink, t.downlink))
+        .collect();
+
+    let now = time_now();
+    let current_month = format!("{}-{:02}", now.0, now.1);
+
+    db.sync_traffic(&stats_tuples, &current_month)
+}
+
+#[tauri::command]
+fn set_user_quota(db: tauri::State<'_, Db>, user_id: String, quota_gb: f64) -> Result<(), String> {
+    let quota_bytes = (quota_gb * 1_073_741_824.0) as i64;
+    db.set_quota(&user_id, quota_bytes)
+}
+
+fn time_now() -> (i32, u32) {
+    // Returns (year, month)
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let days = secs / 86400 + 719468;
+    let era = if days >= 0 { days } else { days - 146096 } / 146097;
+    let doe = days - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32)
 }
 
 #[tauri::command]
@@ -999,8 +1068,15 @@ fn unix_timestamp() -> u64 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Init DB in the same directory as the xray config, or fallback to home
+    let db_dir = detect_config_path()
+        .and_then(|p| Path::new(&p).parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")));
+    let db = Db::open(&db_dir).expect("Failed to open database");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(db)
         .invoke_handler(tauri::generate_handler![
             get_xray_snapshot,
             get_vless_users,
@@ -1010,6 +1086,8 @@ pub fn run() {
             update_user_note,
             update_config,
             get_user_traffic,
+            sync_traffic,
+            set_user_quota,
             service_action
         ])
         .run(tauri::generate_context!())
