@@ -246,6 +246,12 @@ function App() {
   return (
     <TooltipProvider delayDuration={120}>
       <div className="flex h-screen text-foreground">
+        {/* ── Draggable title bar region ── */}
+        <div
+          className="absolute inset-x-0 top-0 z-50 h-8"
+          style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
+        />
+
         {/* ── Sidebar ── */}
         <aside className="flex w-[220px] shrink-0 flex-col border-r border-border/60 bg-panel/75 px-3 pb-3 pt-8 backdrop-blur-xl">
           <div className="flex items-center justify-between px-2 py-1">
@@ -262,7 +268,7 @@ function App() {
               />
               <span className="font-heading text-sm font-medium">Xray✈️</span>
             </div>
-            <div className="flex gap-0.5">
+            <div className="flex gap-0.5" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
               {currentSnapshot.running ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -328,8 +334,7 @@ function App() {
 
         {/* ── Main ── */}
         <main className="relative flex flex-1 flex-col overflow-hidden">
-          <div className="h-7 shrink-0" style={{ WebkitAppRegion: "drag" } as React.CSSProperties} />
-          <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 pb-3">
+          <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 pb-3 pt-8" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
             <h2 className="font-heading text-2xl leading-none">{t(currentNav.labelKey)}</h2>
             <Button
               variant="outline"
