@@ -74,6 +74,7 @@
     "noUsers": "No VLESS users found in the current config.",
     "copyLink": "Copy share link",
     "showQr": "Show QR code",
+    "editLabel": "Edit label",
     "deleteUser": "Delete user",
     "createTitle": "Create VLESS user",
     "createDesc": "Leave the label empty to auto-generate the next friend-N slot.",

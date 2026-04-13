@@ -229,6 +229,32 @@ fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, Strin
 }
 
 #[tauri::command]
+fn update_user_label(user_id: String, new_label: String) -> Result<UserMutationResult, String> {
+    let ip = resolve_public_ipv4();
+    let mut loaded = load_config_with_ip(ip.clone())?;
+    let clients = clients_mut(&mut loaded.root)?;
+
+    let found = clients.iter_mut().find(|client| {
+        client.get("id").and_then(Value::as_str) == Some(user_id.as_str())
+    });
+
+    match found {
+        Some(client) => {
+            client["email"] = json!(new_label.trim());
+        }
+        None => return Err("User was not found in the current config.".to_string()),
+    }
+
+    let backup_path = persist_config_and_metadata(&loaded)?;
+    let reloaded = load_config_with_ip(ip)?;
+
+    Ok(UserMutationResult {
+        backup_path,
+        users: collect_users(&reloaded.root, &reloaded.metadata, &reloaded.link_context)?,
+    })
+}
+
+#[tauri::command]
 fn restart_xray() -> Result<String, String> {
     let output = Command::new("brew")
         .args(["services", "restart", "xray"])
@@ -852,6 +878,7 @@ pub fn run() {
             get_vless_users,
             create_vless_user,
             delete_vless_user,
+            update_user_label,
             get_user_traffic,
             restart_xray
         ])

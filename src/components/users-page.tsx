@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
-import { ClipboardCopy, Copy, QrCode, RefreshCcw, Trash2, UserPlus } from "lucide-react"
+import { Check, ClipboardCopy, Copy, QrCode, RefreshCcw, Trash2, UserPlus, X } from "lucide-react"
 import QRCode from "react-qr-code"
 
 import { Banner } from "@/components/banner"
@@ -37,6 +37,7 @@ type UsersPageProps = {
   showToast: (msg: string) => void
   onRefresh: () => Promise<void>
   onCreateUser: (input: CreateUserInput) => Promise<void>
+  onUpdateLabel: (userId: string, newLabel: string) => Promise<void>
   onDeleteUser: (userId: string) => Promise<void>
 }
 
@@ -50,6 +51,7 @@ export function UsersPage({
   showToast,
   onRefresh,
   onCreateUser,
+  onUpdateLabel,
   onDeleteUser,
 }: UsersPageProps) {
   const { t } = useTranslation()
@@ -61,6 +63,8 @@ export function UsersPage({
   const [submitBusy, setSubmitBusy] = useState(false)
   const [actionBusyId, setActionBusyId] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ManagedUser | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editValue, setEditValue] = useState("")
   const qrRef = useRef<HTMLDivElement>(null)
 
   const handleCopyQr = useCallback(async () => {
@@ -119,6 +123,14 @@ export function UsersPage({
     }
   }
 
+  async function saveLabel() {
+    if (!editingId || !editValue.trim()) return
+    try {
+      await onUpdateLabel(editingId, editValue.trim())
+      setEditingId(null)
+    } catch { /* error shown by parent */ }
+  }
+
   async function confirmDelete() {
     if (!deleteTarget) return
     try {
@@ -173,7 +185,34 @@ export function UsersPage({
             >
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="truncate text-sm font-medium">{user.label}</span>
+                  {editingId === user.id ? (
+                    <div className="flex items-center gap-1">
+                      <Input
+                        className="h-6 w-32 px-1.5 text-sm"
+                        value={editValue}
+                        onChange={(e) => setEditValue(e.currentTarget.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") void saveLabel()
+                          if (e.key === "Escape") setEditingId(null)
+                        }}
+                        autoFocus
+                      />
+                      <Button variant="ghost" size="icon-xs" onClick={() => void saveLabel()}>
+                        <Check className="size-3" />
+                      </Button>
+                      <Button variant="ghost" size="icon-xs" onClick={() => setEditingId(null)}>
+                        <X className="size-3" />
+                      </Button>
+                    </div>
+                  ) : (
+                    <span
+                      className="cursor-pointer truncate text-sm font-medium hover:underline"
+                      onClick={() => { setEditingId(user.id); setEditValue(user.label) }}
+                      title={t("users.editLabel")}
+                    >
+                      {user.label}
+                    </span>
+                  )}
                   <Badge variant="secondary" className="shrink-0 rounded-full text-[10px]">
                     {user.flow ?? "xtls-rprx-vision"}
                   </Badge>

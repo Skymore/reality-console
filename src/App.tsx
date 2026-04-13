@@ -181,6 +181,24 @@ function App() {
     }
   }
 
+  async function handleUpdateLabel(userId: string, newLabel: string) {
+    try {
+      const result = await invoke<UserMutationResult>("update_user_label", { userId, newLabel })
+      startTransition(() => {
+        setUsersResponse((current) => ({
+          configPath: current?.configPath ?? currentSnapshot.configPath ?? null,
+          metadataPath: current?.metadataPath ?? null,
+          users: result.users,
+        }))
+        setNeedsRestart(true)
+      })
+      showToast(t("action.refreshed"))
+    } catch (error) {
+      setUsersError(toErrorMessage(error, t("users.createFailed")))
+      throw new Error(toErrorMessage(error, t("users.createFailed")))
+    }
+  }
+
   async function handleDeleteUser(userId: string) {
     try {
       const result = await invoke<UserMutationResult>("delete_vless_user", { userId })
@@ -323,6 +341,7 @@ function App() {
                 showToast,
                 onRefreshUsers: refreshAll,
                 onCreateUser: handleCreateUser,
+                onUpdateLabel: handleUpdateLabel,
                 onDeleteUser: handleDeleteUser,
               })}
             </div>
@@ -347,6 +366,7 @@ function renderPage({
   onRefreshUsers,
   showToast,
   onCreateUser,
+  onUpdateLabel,
   onDeleteUser,
 }: {
   activePage: PageId
@@ -360,6 +380,7 @@ function renderPage({
   showToast: (msg: string) => void
   onRefreshUsers: () => Promise<void>
   onCreateUser: (input: CreateUserInput) => Promise<void>
+  onUpdateLabel: (userId: string, newLabel: string) => Promise<void>
   onDeleteUser: (userId: string) => Promise<void>
 }) {
   switch (activePage) {
@@ -377,6 +398,7 @@ function renderPage({
           showToast={showToast}
           onRefresh={onRefreshUsers}
           onCreateUser={onCreateUser}
+          onUpdateLabel={onUpdateLabel}
           onDeleteUser={onDeleteUser}
         />
       )

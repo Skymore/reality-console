@@ -74,6 +74,7 @@
     "noUsers": "当前配置中没有 VLESS 用户。",
     "copyLink": "复制分享链接",
     "showQr": "显示二维码",
+    "editLabel": "编辑标签",
     "deleteUser": "删除用户",
     "createTitle": "创建 VLESS 用户",
     "createDesc": "标签留空会自动命名为 friend-N。",
