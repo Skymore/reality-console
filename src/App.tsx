@@ -248,8 +248,8 @@ function App() {
       <div className="flex h-screen text-foreground">
         {/* ── Draggable title bar region ── */}
         <div
+          data-tauri-drag-region
           className="absolute inset-x-0 top-0 z-50 h-8"
-          style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
         />
 
         {/* ── Sidebar ── */}
@@ -268,7 +268,7 @@ function App() {
               />
               <span className="font-heading text-sm font-medium">Xray✈️</span>
             </div>
-            <div className="flex gap-0.5" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
+            <div className="flex gap-0.5">
               {currentSnapshot.running ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -312,7 +312,7 @@ function App() {
                     "flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-sm transition-colors",
                     active
                       ? "bg-primary/10 font-medium text-foreground"
-                      : "text-muted-foreground hover:bg-background/70 hover:text-foreground",
+                      : "text-muted-foreground hover:bg-secondary hover:text-foreground",
                   )}
                 >
                   <Icon className="size-4 shrink-0" />
@@ -325,7 +325,7 @@ function App() {
           <button
             type="button"
             onClick={toggleLocale}
-            className="flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-background/70 hover:text-foreground"
+            className="flex items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
           >
             <Languages className="size-4 shrink-0" />
             <span>{i18n.language === "zh" ? "English" : "中文"}</span>
@@ -334,7 +334,7 @@ function App() {
 
         {/* ── Main ── */}
         <main className="relative flex flex-1 flex-col overflow-hidden">
-          <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 pb-3 pt-8" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
+          <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 pb-3 pt-8">
             <h2 className="font-heading text-2xl leading-none">{t(currentNav.labelKey)}</h2>
             <Button
               variant="outline"
