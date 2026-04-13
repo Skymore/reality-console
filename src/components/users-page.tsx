@@ -199,15 +199,12 @@ export function UsersPage({
                 </div>
                 <div className="mt-0.5 flex items-center gap-3 text-xs text-muted-foreground">
                   <span className="truncate font-mono">{user.id}</span>
-                  {(() => {
-                    const tr = trafficResponse?.users.find((u) => u.email === user.label)
-                    if (!tr) return null
-                    return (
-                      <span className="shrink-0">
-                        ↑{formatBytes(tr.uplink)} ↓{formatBytes(tr.downlink)}
-                      </span>
-                    )
-                  })()}
+                  <span className="shrink-0">
+                    {(() => {
+                      const tr = trafficResponse?.users.find((u) => u.email === user.label)
+                      return `↑${formatBytes(tr?.uplink ?? 0)} ↓${formatBytes(tr?.downlink ?? 0)}`
+                    })()}
+                  </span>
                 </div>
                 <p className="mt-0.5 truncate text-xs text-muted-foreground/60">
                   {user.note || t("users.noNote")}

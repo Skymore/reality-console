@@ -589,18 +589,17 @@ function DashboardPage({
               <StatusRow label={t("dashboard.users")} value={snapshot.userCount != null ? String(snapshot.userCount) : t("dashboard.unknown")} />
               <StatusRow label={t("dashboard.config")} value={snapshot.configPath ?? t("dashboard.notDetected")} mono />
               <StatusRow label={t("dashboard.binary")} value={snapshot.binaryPath ?? t("dashboard.notDetected")} mono />
-              {trafficResponse?.available ? (
-                <StatusRow
-                  label={t("dashboard.traffic")}
-                  value={(() => {
-                    const total = trafficResponse.users.reduce(
-                      (acc, u) => ({ up: acc.up + u.uplink, down: acc.down + u.downlink }),
-                      { up: 0, down: 0 },
-                    )
-                    return `↑ ${formatBytes(total.up)}  ↓ ${formatBytes(total.down)}`
-                  })()}
-                />
-              ) : null}
+              <StatusRow
+                label={t("dashboard.traffic")}
+                value={(() => {
+                  if (!trafficResponse?.available) return t("dashboard.notConfigured")
+                  const total = trafficResponse.users.reduce(
+                    (acc, u) => ({ up: acc.up + u.uplink, down: acc.down + u.downlink }),
+                    { up: 0, down: 0 },
+                  )
+                  return `↑ ${formatBytes(total.up)}  ↓ ${formatBytes(total.down)}`
+                })()}
+              />
             </tbody>
           </table>
         </CardContent>
