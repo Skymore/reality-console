@@ -16,11 +16,13 @@ import {
   Users,
 } from "lucide-react"
 
+import { UsersPage } from "@/components/users-page"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { TooltipProvider } from "@/components/ui/tooltip"
+import type { CreateUserInput, UserListResponse, UserMutationResult } from "@/lib/users"
 import type { XraySnapshot } from "@/lib/xray"
 import { cn } from "@/lib/utils"
 
@@ -59,8 +61,11 @@ const fallbackSnapshot: XraySnapshot = {
 function App() {
   const [activePage, setActivePage] = useState<PageId>("dashboard")
   const [snapshot, setSnapshot] = useState<XraySnapshot | null>(null)
+  const [usersResponse, setUsersResponse] = useState<UserListResponse | null>(null)
   const [isRefreshing, setIsRefreshing] = useState(false)
-  const [loadError, setLoadError] = useState<string | null>(null)
+  const [snapshotError, setSnapshotError] = useState<string | null>(null)
+  const [usersError, setUsersError] = useState<string | null>(null)
+  const [mutationNotice, setMutationNotice] = useState<string | null>(null)
 
   const activeNavItem = useMemo(
     () => navItems.find((item) => item.id === activePage) ?? navItems[0],
@@ -68,6 +73,7 @@ function App() {
   )
 
   const currentSnapshot = snapshot ?? fallbackSnapshot
+  const currentUsers = usersResponse?.users ?? []
   const serviceLabel = getServiceLabel(currentSnapshot)
   const endpointLabel =
     currentSnapshot.publicIpv4 && currentSnapshot.listenPort
@@ -76,27 +82,95 @@ function App() {
         ? `Port ${currentSnapshot.listenPort}`
         : "Not detected"
   const userLabel =
-    currentSnapshot.userCount !== undefined && currentSnapshot.userCount !== null
-      ? `${currentSnapshot.userCount} UUIDs`
-      : "Unknown"
+    currentUsers.length > 0
+      ? `${currentUsers.length} UUIDs`
+      : currentSnapshot.userCount !== undefined && currentSnapshot.userCount !== null
+        ? `${currentSnapshot.userCount} UUIDs`
+        : "Unknown"
 
-  async function refreshSnapshot() {
+  async function loadSnapshot() {
+    return invoke<XraySnapshot>("get_xray_snapshot")
+  }
+
+  async function loadUsers() {
+    return invoke<UserListResponse>("get_vless_users")
+  }
+
+  async function refreshAll() {
     try {
       setIsRefreshing(true)
-      const next = await invoke<XraySnapshot>("get_xray_snapshot")
+      const [nextSnapshot, nextUsers] = await Promise.allSettled([loadSnapshot(), loadUsers()])
+
       startTransition(() => {
-        setSnapshot(next)
-        setLoadError(null)
+        if (nextSnapshot.status === "fulfilled") {
+          setSnapshot(nextSnapshot.value)
+          setSnapshotError(null)
+        } else {
+          setSnapshotError(toErrorMessage(nextSnapshot.reason, "Snapshot request failed."))
+        }
+
+        if (nextUsers.status === "fulfilled") {
+          setUsersResponse(nextUsers.value)
+          setUsersError(null)
+        } else {
+          setUsersError(toErrorMessage(nextUsers.reason, "User list request failed."))
+        }
       })
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : "Snapshot request failed.")
     } finally {
       setIsRefreshing(false)
     }
   }
 
+  async function refreshSnapshotOnly() {
+    const nextSnapshot = await loadSnapshot()
+    startTransition(() => {
+      setSnapshot(nextSnapshot)
+      setSnapshotError(null)
+    })
+  }
+
+  async function handleCreateUser(input: CreateUserInput) {
+    try {
+      const result = await invoke<UserMutationResult>("create_vless_user", { input })
+      startTransition(() => {
+        setUsersResponse((current) => ({
+          configPath: current?.configPath ?? currentSnapshot.configPath ?? null,
+          metadataPath: current?.metadataPath ?? null,
+          users: result.users,
+        }))
+        setMutationNotice(`User saved. Backup created at ${result.backupPath}.`)
+        setUsersError(null)
+      })
+      await refreshSnapshotOnly()
+    } catch (error) {
+      const message = toErrorMessage(error, "Failed to create user.")
+      setUsersError(message)
+      throw new Error(message)
+    }
+  }
+
+  async function handleDeleteUser(userId: string) {
+    try {
+      const result = await invoke<UserMutationResult>("delete_vless_user", { userId })
+      startTransition(() => {
+        setUsersResponse((current) => ({
+          configPath: current?.configPath ?? currentSnapshot.configPath ?? null,
+          metadataPath: current?.metadataPath ?? null,
+          users: result.users,
+        }))
+        setMutationNotice(`User deleted. Backup created at ${result.backupPath}.`)
+        setUsersError(null)
+      })
+      await refreshSnapshotOnly()
+    } catch (error) {
+      const message = toErrorMessage(error, "Failed to delete user.")
+      setUsersError(message)
+      throw new Error(message)
+    }
+  }
+
   useEffect(() => {
-    void refreshSnapshot()
+    void refreshAll()
   }, [])
 
   return (
@@ -179,8 +253,8 @@ function App() {
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-3 text-sm">
-                    {loadError ? (
-                      <MilestoneRow label={loadError} tone="danger" />
+                    {snapshotError ? (
+                      <MilestoneRow label={snapshotError} tone="danger" />
                     ) : currentSnapshot.notes.length > 0 ? (
                       currentSnapshot.notes.slice(0, 4).map((note) => (
                         <MilestoneRow key={note} label={note} tone="warning" />
@@ -205,15 +279,15 @@ function App() {
                   <div className="space-y-3">
                     <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
                       <Sparkles className="size-3.5 text-primary" />
-                      Phase 5 local xray inspection
+                      Phase 6 user management MVP
                     </div>
                     <div>
                       <h2 className="font-heading text-4xl leading-[0.95] sm:text-5xl">
                         {activeNavItem.label}
                       </h2>
                       <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground sm:text-base">
-                        {activeNavItem.hint}. The shell now pulls a real local snapshot from the Tauri
-                        backend instead of using only static placeholders.
+                        {activeNavItem.hint}. The shell now includes config-backed user listing, safe
+                        add/delete flows, local metadata notes, and real VLESS share links.
                       </p>
                     </div>
                   </div>
@@ -222,13 +296,13 @@ function App() {
                     <Button
                       variant="outline"
                       className="rounded-full px-4"
-                      onClick={() => void refreshSnapshot()}
+                      onClick={() => void refreshAll()}
                       disabled={isRefreshing}
                     >
                       <RefreshCcw className={cn("size-4", isRefreshing && "animate-spin")} />
-                      {isRefreshing ? "Refreshing..." : "Refresh snapshot"}
+                      {isRefreshing ? "Refreshing..." : "Refresh data"}
                     </Button>
-                    <Button className="rounded-full px-4">
+                    <Button className="rounded-full px-4" onClick={() => setActivePage("diagnostics")}>
                       Open diagnostics
                       <ArrowUpRight className="size-4" />
                     </Button>
@@ -252,14 +326,25 @@ function App() {
                     icon={Users}
                     label="Friend slots"
                     value={userLabel}
-                    hint={currentSnapshot.configPath ?? "Config path unknown"}
+                    hint={usersResponse?.configPath ?? currentSnapshot.configPath ?? "Config path unknown"}
                   />
                 </div>
               </header>
 
               <ScrollArea className="flex-1">
                 <div className="px-5 py-5 sm:px-8 lg:px-10 lg:py-8">
-                  {renderPage(activePage, currentSnapshot, loadError)}
+                  {renderPage({
+                    activePage,
+                    snapshot: currentSnapshot,
+                    snapshotError,
+                    usersResponse,
+                    usersError,
+                    mutationNotice,
+                    isRefreshing,
+                    onRefreshUsers: refreshAll,
+                    onCreateUser: handleCreateUser,
+                    onDeleteUser: handleDeleteUser,
+                  })}
                 </div>
               </ScrollArea>
             </div>
@@ -270,16 +355,50 @@ function App() {
   )
 }
 
-function renderPage(activePage: PageId, snapshot: XraySnapshot, loadError: string | null) {
+function renderPage({
+  activePage,
+  snapshot,
+  snapshotError,
+  usersResponse,
+  usersError,
+  mutationNotice,
+  isRefreshing,
+  onRefreshUsers,
+  onCreateUser,
+  onDeleteUser,
+}: {
+  activePage: PageId
+  snapshot: XraySnapshot
+  snapshotError: string | null
+  usersResponse: UserListResponse | null
+  usersError: string | null
+  mutationNotice: string | null
+  isRefreshing: boolean
+  onRefreshUsers: () => Promise<void>
+  onCreateUser: (input: CreateUserInput) => Promise<void>
+  onDeleteUser: (userId: string) => Promise<void>
+}) {
   switch (activePage) {
     case "dashboard":
-      return <DashboardPage snapshot={snapshot} loadError={loadError} />
+      return <DashboardPage snapshot={snapshot} loadError={snapshotError} />
     case "users":
-      return <UsersPage snapshot={snapshot} />
+      return (
+        <UsersPage
+          users={usersResponse?.users ?? []}
+          configPath={usersResponse?.configPath}
+          metadataPath={usersResponse?.metadataPath}
+          isLoading={isRefreshing}
+          error={usersError}
+          mutationNotice={mutationNotice}
+          onRefresh={onRefreshUsers}
+          onCreateUser={onCreateUser}
+          onDeleteUser={onDeleteUser}
+        />
+      )
     case "config":
       return <ConfigPage snapshot={snapshot} />
     case "diagnostics":
-      return <DiagnosticsPage snapshot={snapshot} loadError={loadError} />
+      return <DiagnosticsPage snapshot={snapshot} loadError={snapshotError ?? usersError} />
     case "logs":
       return <LogsPage />
     case "backups":
@@ -312,8 +431,8 @@ function DashboardPage({
                 </h3>
                 <p className="mt-4 max-w-xl text-sm leading-6 text-muted-foreground sm:text-base">
                   The backend is already reporting the real binary path, process state, config location,
-                  listen port, public IPv4, and REALITY target. From here we can replace the remaining
-                  placeholders page by page.
+                  listen port, public IPv4, and REALITY target. User management now writes the live config
+                  with backup and validation before restart-sensitive changes.
                 </p>
 
                 {loadError ? (
@@ -390,74 +509,6 @@ function DashboardPage({
   )
 }
 
-function UsersPage({ snapshot }: { snapshot: XraySnapshot }) {
-  const previewUsers = [
-    { name: "friend-1", note: "Primary test account", state: "Healthy" },
-    { name: "friend-2", note: "Mobile only", state: "Needs note" },
-    { name: "friend-3", note: "Shadowrocket import", state: "Healthy" },
-  ]
-
-  return (
-    <div className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]">
-      <Card className="border-border/60 bg-panel/80 shadow-panel">
-        <CardHeader className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <CardTitle className="font-heading text-3xl">User roster</CardTitle>
-            <CardDescription>
-              The current config reports{" "}
-              {snapshot.userCount !== undefined && snapshot.userCount !== null
-                ? `${snapshot.userCount} configured client slots`
-                : "an unknown number of client slots"}
-              .
-            </CardDescription>
-          </div>
-          <Button className="rounded-full px-4">Add user</Button>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          {previewUsers.map((user) => (
-            <div
-              key={user.name}
-              className="flex flex-col gap-4 rounded-3xl border border-border/60 bg-background/80 p-4 sm:flex-row sm:items-center sm:justify-between"
-            >
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <span className="font-medium">{user.name}</span>
-                  <Badge variant="secondary" className="rounded-full">
-                    {user.state}
-                  </Badge>
-                </div>
-                <p className="text-sm text-muted-foreground">{user.note}</p>
-              </div>
-
-              <div className="flex flex-wrap gap-2">
-                <Button variant="outline" size="sm" className="rounded-full px-3">
-                  Copy link
-                </Button>
-                <Button variant="outline" size="sm" className="rounded-full px-3">
-                  Show QR
-                </Button>
-              </div>
-            </div>
-          ))}
-        </CardContent>
-      </Card>
-
-      <Card className="border-border/60 bg-secondary/75 shadow-none">
-        <CardHeader>
-          <CardTitle className="font-heading text-2xl">User management intent</CardTitle>
-          <CardDescription>The page will eventually own the full share flow.</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4 text-sm">
-          <ChecklistRow title="Generate UUID" detail="Use xray tooling or local generator." />
-          <ChecklistRow title="Attach note" detail="Human-readable labels should not depend on raw config only." />
-          <ChecklistRow title="Build link + QR" detail="Export exactly the parameters the client needs." />
-          <ChecklistRow title="Disable safely" detail="Single-user revocation without touching others." />
-        </CardContent>
-      </Card>
-    </div>
-  )
-}
-
 function ConfigPage({ snapshot }: { snapshot: XraySnapshot }) {
   return (
     <div className="grid gap-6 xl:grid-cols-3">
@@ -482,7 +533,7 @@ function ConfigPage({ snapshot }: { snapshot: XraySnapshot }) {
       <ConfigBlock
         title="Config safety"
         description="Every write should be previewed, validated, backed up, and only then restarted."
-        lines={["Create backup", "Run xray -test", "Restart service if valid"]}
+        lines={["Create backup", "Run xray -test", "Replace config atomically"]}
       />
     </div>
   )
@@ -756,6 +807,10 @@ function getServiceLabel(snapshot: XraySnapshot) {
   }
 
   return snapshot.running ? "Running" : "Stopped"
+}
+
+function toErrorMessage(error: unknown, fallback: string) {
+  return error instanceof Error ? error.message : fallback
 }
 
 export default App

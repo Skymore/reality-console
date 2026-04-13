@@ -1,8 +1,11 @@
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +23,78 @@ struct XraySnapshot {
     reality_target: Option<String>,
     server_name: Option<String>,
     notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedUser {
+    id: String,
+    label: String,
+    flow: Option<String>,
+    note: Option<String>,
+    created_at: Option<u64>,
+    share_link: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserListResponse {
+    config_path: Option<String>,
+    metadata_path: Option<String>,
+    users: Vec<ManagedUser>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserMutationResult {
+    backup_path: String,
+    users: Vec<ManagedUser>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateUserInput {
+    label: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UserMetadataStore {
+    version: u8,
+    users: HashMap<String, UserMetadataEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UserMetadataEntry {
+    note: Option<String>,
+    created_at: Option<u64>,
+}
+
+#[derive(Default)]
+struct ConfigInspection {
+    listen_port: Option<u16>,
+    user_count: Option<usize>,
+    reality_target: Option<String>,
+    server_name: Option<String>,
+}
+
+#[derive(Default)]
+struct RealityLinkContext {
+    public_ipv4: Option<String>,
+    listen_port: Option<u16>,
+    server_name: Option<String>,
+    public_key: Option<String>,
+    short_id: Option<String>,
+}
+
+struct LoadedConfig {
+    path: PathBuf,
+    metadata_path: PathBuf,
+    root: Value,
+    metadata: UserMetadataStore,
+    link_context: RealityLinkContext,
 }
 
 #[tauri::command]
@@ -90,18 +165,232 @@ fn get_xray_snapshot() -> XraySnapshot {
     }
 }
 
-#[derive(Default)]
-struct ConfigInspection {
-    listen_port: Option<u16>,
-    user_count: Option<usize>,
-    reality_target: Option<String>,
-    server_name: Option<String>,
+#[tauri::command]
+fn get_vless_users() -> Result<UserListResponse, String> {
+    let loaded = load_config()?;
+
+    Ok(UserListResponse {
+        config_path: Some(loaded.path.to_string_lossy().into_owned()),
+        metadata_path: Some(loaded.metadata_path.to_string_lossy().into_owned()),
+        users: collect_users(&loaded.root, &loaded.metadata, &loaded.link_context)?,
+    })
+}
+
+#[tauri::command]
+fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, String> {
+    let mut loaded = load_config()?;
+    let timestamp = unix_timestamp();
+    let label = next_user_label(&loaded.root, input.label.as_deref());
+    let note = input.note.and_then(|value| normalize_optional(&value));
+    let user_id = Uuid::new_v4().to_string();
+    let client = json!({
+        "id": user_id,
+        "flow": "xtls-rprx-vision",
+        "email": label
+    });
+
+    clients_mut(&mut loaded.root)?
+        .push(client);
+
+    loaded.metadata.version = 1;
+    loaded.metadata.users.insert(
+        user_id.clone(),
+        UserMetadataEntry {
+            note,
+            created_at: Some(timestamp),
+        },
+    );
+
+    let backup_path = persist_config_and_metadata(&loaded)?;
+    let reloaded = load_config()?;
+
+    Ok(UserMutationResult {
+        backup_path,
+        users: collect_users(&reloaded.root, &reloaded.metadata, &reloaded.link_context)?,
+    })
+}
+
+#[tauri::command]
+fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String> {
+    let mut loaded = load_config()?;
+    let clients = clients_mut(&mut loaded.root)?;
+    let original_len = clients.len();
+
+    clients.retain(|client| {
+        client
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| id != user_id)
+            .unwrap_or(true)
+    });
+
+    if clients.len() == original_len {
+        return Err("User was not found in the current config.".to_string());
+    }
+
+    loaded.metadata.users.remove(&user_id);
+
+    let backup_path = persist_config_and_metadata(&loaded)?;
+    let reloaded = load_config()?;
+
+    Ok(UserMutationResult {
+        backup_path,
+        users: collect_users(&reloaded.root, &reloaded.metadata, &reloaded.link_context)?,
+    })
+}
+
+fn load_config() -> Result<LoadedConfig, String> {
+    let path = detect_config_path()
+        .map(PathBuf::from)
+        .ok_or_else(|| "No known Xray config path was found.".to_string())?;
+
+    let contents = fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read config file: {error}"))?;
+    let root: Value =
+        serde_json::from_str(&contents).map_err(|error| format!("Failed to parse config JSON: {error}"))?;
+
+    let metadata_path = metadata_path_for(&path)?;
+    let metadata = read_metadata(&metadata_path)?;
+    let link_context = build_link_context(&root);
+
+    Ok(LoadedConfig {
+        path,
+        metadata_path,
+        root,
+        metadata,
+        link_context,
+    })
+}
+
+fn persist_config_and_metadata(loaded: &LoadedConfig) -> Result<String, String> {
+    let candidate = serde_json::to_string_pretty(&loaded.root)
+        .map_err(|error| format!("Failed to serialize updated config: {error}"))?;
+
+    let temp_path = temporary_path_for(&loaded.path);
+    fs::write(&temp_path, candidate).map_err(|error| format!("Failed to write temp config: {error}"))?;
+
+    if let Err(error) = validate_xray_config(&temp_path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    let backup_path = create_backup(&loaded.path)?;
+
+    fs::rename(&temp_path, &loaded.path)
+        .map_err(|error| format!("Failed to replace config file: {error}"))?;
+
+    write_metadata(&loaded.metadata_path, &loaded.metadata)?;
+
+    Ok(backup_path)
+}
+
+fn collect_users(
+    root: &Value,
+    metadata: &UserMetadataStore,
+    link_context: &RealityLinkContext,
+) -> Result<Vec<ManagedUser>, String> {
+    let clients = clients(root)?;
+    let mut users = Vec::with_capacity(clients.len());
+
+    for client in clients {
+        let id = client
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Encountered a client without a valid UUID.".to_string())?
+            .to_string();
+
+        let label = client
+            .get("email")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| id.clone());
+        let flow = client
+            .get("flow")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let metadata_entry = metadata.users.get(&id).cloned().unwrap_or_default();
+
+        users.push(ManagedUser {
+            id: id.clone(),
+            label: label.clone(),
+            flow: flow.clone(),
+            note: metadata_entry.note.clone(),
+            created_at: metadata_entry.created_at,
+            share_link: build_share_link(&id, &label, flow.as_deref(), link_context),
+        });
+    }
+
+    Ok(users)
+}
+
+fn build_link_context(root: &Value) -> RealityLinkContext {
+    let public_ipv4 = command_output("curl", &["-4", "-fsS", "https://api.ipify.org"]);
+    let inspected = inspect_root(root).unwrap_or_default();
+    let inbound = first_inbound(root);
+
+    let private_key = inbound
+        .and_then(|entry| entry.get("streamSettings"))
+        .and_then(|settings| settings.get("realitySettings"))
+        .and_then(|settings| settings.get("privateKey"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    let public_key = private_key
+        .as_deref()
+        .and_then(derive_public_key);
+
+    let short_id = inbound
+        .and_then(|entry| entry.get("streamSettings"))
+        .and_then(|settings| settings.get("realitySettings"))
+        .and_then(|settings| settings.get("shortIds"))
+        .and_then(Value::as_array)
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    RealityLinkContext {
+        public_ipv4,
+        listen_port: inspected.listen_port,
+        server_name: inspected.server_name,
+        public_key,
+        short_id,
+    }
+}
+
+fn build_share_link(
+    user_id: &str,
+    label: &str,
+    flow: Option<&str>,
+    link_context: &RealityLinkContext,
+) -> Option<String> {
+    let host = link_context.public_ipv4.as_deref()?;
+    let port = link_context.listen_port?;
+    let server_name = link_context.server_name.as_deref()?;
+    let public_key = link_context.public_key.as_deref()?;
+    let short_id = link_context.short_id.as_deref()?;
+    let flow = flow.unwrap_or("xtls-rprx-vision");
+    let fragment = {
+        let slug = slugify(label);
+        if slug.is_empty() {
+            format!("user-{}", &user_id[..8])
+        } else {
+            slug
+        }
+    };
+
+    Some(format!(
+        "vless://{user_id}@{host}:{port}?encryption=none&flow={flow}&security=reality&sni={server_name}&fp=chrome&pbk={public_key}&sid={short_id}&type=tcp&headerType=none#{fragment}"
+    ))
 }
 
 fn inspect_config(path: &str) -> Option<ConfigInspection> {
     let contents = fs::read_to_string(path).ok()?;
     let root: Value = serde_json::from_str(&contents).ok()?;
-    let inbound = root.get("inbounds")?.as_array()?.first()?;
+    inspect_root(&root)
+}
+
+fn inspect_root(root: &Value) -> Option<ConfigInspection> {
+    let inbound = first_inbound(root)?;
 
     let listen_port = inbound
         .get("port")
@@ -136,6 +425,167 @@ fn inspect_config(path: &str) -> Option<ConfigInspection> {
         reality_target,
         server_name,
     })
+}
+
+fn first_inbound(root: &Value) -> Option<&Value> {
+    root.get("inbounds")?.as_array()?.first()
+}
+
+fn clients(root: &Value) -> Result<&Vec<Value>, String> {
+    root.get("inbounds")
+        .and_then(Value::as_array)
+        .and_then(|inbounds| inbounds.first())
+        .and_then(|entry| entry.get("settings"))
+        .and_then(|settings| settings.get("clients"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Could not find `inbounds[0].settings.clients` in config.".to_string())
+}
+
+fn clients_mut(root: &mut Value) -> Result<&mut Vec<Value>, String> {
+    root.get_mut("inbounds")
+        .and_then(Value::as_array_mut)
+        .and_then(|inbounds| inbounds.first_mut())
+        .and_then(|entry| entry.get_mut("settings"))
+        .and_then(|settings| settings.get_mut("clients"))
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "Could not find mutable `inbounds[0].settings.clients` in config.".to_string())
+}
+
+fn metadata_path_for(config_path: &Path) -> Result<PathBuf, String> {
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| "Config path has no parent directory.".to_string())?;
+    Ok(parent.join("reality-console.users.json"))
+}
+
+fn read_metadata(path: &Path) -> Result<UserMetadataStore, String> {
+    if !path.exists() {
+        return Ok(UserMetadataStore {
+            version: 1,
+            users: HashMap::new(),
+        });
+    }
+
+    let contents =
+        fs::read_to_string(path).map_err(|error| format!("Failed to read metadata file: {error}"))?;
+    let metadata: UserMetadataStore = serde_json::from_str(&contents)
+        .map_err(|error| format!("Failed to parse metadata JSON: {error}"))?;
+
+    Ok(metadata)
+}
+
+fn write_metadata(path: &Path, metadata: &UserMetadataStore) -> Result<(), String> {
+    let contents = serde_json::to_string_pretty(metadata)
+        .map_err(|error| format!("Failed to serialize metadata: {error}"))?;
+    fs::write(path, contents).map_err(|error| format!("Failed to write metadata file: {error}"))
+}
+
+fn create_backup(path: &Path) -> Result<String, String> {
+    let timestamp = unix_timestamp();
+    let file_stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("config");
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("json");
+    let backup_name = format!("{file_stem}.backup-{timestamp}.{extension}");
+    let backup_path = path
+        .parent()
+        .ok_or_else(|| "Config path has no parent directory.".to_string())?
+        .join(backup_name);
+
+    fs::copy(path, &backup_path).map_err(|error| format!("Failed to create backup: {error}"))?;
+
+    Ok(backup_path.to_string_lossy().into_owned())
+}
+
+fn temporary_path_for(path: &Path) -> PathBuf {
+    let timestamp = unix_timestamp();
+    let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("config.json");
+    path.with_file_name(format!("{file_name}.tmp-{timestamp}"))
+}
+
+fn validate_xray_config(path: &Path) -> Result<(), String> {
+    let path_string = path.to_string_lossy().into_owned();
+    let output = Command::new("xray")
+        .args(["run", "-c", path_string.as_str(), "-test"])
+        .output()
+        .map_err(|error| format!("Failed to run xray config validation: {error}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "Unknown xray validation failure.".to_string()
+    };
+
+    Err(format!("Updated config did not pass `xray -test`: {detail}"))
+}
+
+fn derive_public_key(private_key: &str) -> Option<String> {
+    let output = command_output("xray", &["x25519", "-i", private_key])?;
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("Password (PublicKey): ")
+            .map(ToString::to_string)
+    })
+}
+
+fn next_user_label(root: &Value, preferred: Option<&str>) -> String {
+    if let Some(preferred) = preferred.and_then(normalize_optional) {
+        return preferred;
+    }
+
+    let existing: Vec<String> = clients(root)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|client| client.get("email").and_then(Value::as_str))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut index = 1;
+    loop {
+        let candidate = format!("friend-{index}");
+        if !existing.iter().any(|entry| entry == &candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn normalize_optional(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn slugify(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else if character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+
+    slug.trim_matches('-').to_string()
 }
 
 fn detect_config_path() -> Option<String> {
@@ -199,11 +649,23 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_xray_snapshot])
+        .invoke_handler(tauri::generate_handler![
+            get_xray_snapshot,
+            get_vless_users,
+            create_vless_user,
+            delete_vless_user
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
