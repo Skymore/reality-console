@@ -1,13 +1,15 @@
 import { invoke } from "@tauri-apps/api/core"
-import { startTransition, useEffect, useState } from "react"
+import { startTransition, useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import type { LucideIcon } from "lucide-react"
 import {
   Archive,
+  Check,
   FileText,
   Languages,
   LayoutDashboard,
   RefreshCcw,
+  RotateCcw,
   Settings2,
   Shield,
   Stethoscope,
@@ -20,7 +22,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { TooltipProvider } from "@/components/ui/tooltip"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import type { CreateUserInput, TrafficResponse, UserListResponse, UserMutationResult } from "@/lib/users"
 import type { XraySnapshot } from "@/lib/xray"
 import { cn } from "@/lib/utils"
@@ -70,14 +72,38 @@ function App() {
   const [usersError, setUsersError] = useState<string | null>(null)
   const [mutationNotice, setMutationNotice] = useState<string | null>(null)
   const [trafficResponse, setTrafficResponse] = useState<TrafficResponse | null>(null)
+  const [needsRestart, setNeedsRestart] = useState(false)
+  const [isRestarting, setIsRestarting] = useState(false)
+  const [toast, setToast] = useState<string | null>(null)
+  const toastTimer = useRef<ReturnType<typeof setTimeout>>(null)
 
   const currentSnapshot = snapshot ?? fallbackSnapshot
   const currentNav = navItems.find((item) => item.id === activePage) ?? navItems[0]
+
+  const showToast = useCallback((msg: string) => {
+    setToast(msg)
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(null), 2500)
+  }, [])
 
   function toggleLocale() {
     const next = i18n.language === "zh" ? "en" : "zh"
     i18n.changeLanguage(next)
     localStorage.setItem("locale", next)
+  }
+
+  async function handleRestart() {
+    try {
+      setIsRestarting(true)
+      await invoke<string>("restart_xray")
+      setNeedsRestart(false)
+      showToast(t("action.restarted"))
+      await refreshAll()
+    } catch (error) {
+      showToast(toErrorMessage(error, t("action.restartFailed")))
+    } finally {
+      setIsRestarting(false)
+    }
   }
 
   async function loadSnapshot() {
@@ -120,6 +146,7 @@ function App() {
           setTrafficResponse(nextTraffic.value)
         }
       })
+      showToast(t("action.refreshed"))
     } finally {
       setIsRefreshing(false)
     }
@@ -144,6 +171,7 @@ function App() {
         }))
         setMutationNotice(t("users.saved", { path: result.backupPath }))
         setUsersError(null)
+        setNeedsRestart(true)
       })
       await refreshSnapshotOnly()
     } catch (error) {
@@ -164,6 +192,7 @@ function App() {
         }))
         setMutationNotice(t("users.deleted", { path: result.backupPath }))
         setUsersError(null)
+        setNeedsRestart(true)
       })
       await refreshSnapshotOnly()
     } catch (error) {
@@ -182,18 +211,33 @@ function App() {
       <div className="flex h-screen text-foreground">
         {/* ── Sidebar ── */}
         <aside className="flex w-[220px] shrink-0 flex-col border-r border-border/60 bg-panel/75 px-3 py-3 backdrop-blur-xl">
-          <div className="flex items-center gap-2 px-2 py-1">
-            <div
-              className={cn(
-                "size-2 rounded-full",
-                currentSnapshot.running
-                  ? "bg-green-500"
-                  : currentSnapshot.installed
-                    ? "bg-yellow-500"
-                    : "bg-muted-foreground/40",
-              )}
-            />
-            <span className="font-heading text-sm font-medium">Xray✈️</span>
+          <div className="flex items-center justify-between px-2 py-1">
+            <div className="flex items-center gap-2">
+              <div
+                className={cn(
+                  "size-2 rounded-full",
+                  currentSnapshot.running
+                    ? "bg-green-500"
+                    : currentSnapshot.installed
+                      ? "bg-yellow-500"
+                      : "bg-muted-foreground/40",
+                )}
+              />
+              <span className="font-heading text-sm font-medium">Xray✈️</span>
+            </div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={() => void handleRestart()}
+                  disabled={isRestarting}
+                >
+                  <RotateCcw className={cn("size-3.5", isRestarting && "animate-spin")} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t("action.restart")}</TooltipContent>
+            </Tooltip>
           </div>
 
           <nav className="mt-4 flex flex-1 flex-col gap-0.5">
@@ -245,6 +289,26 @@ function App() {
             </Button>
           </header>
 
+          {needsRestart ? (
+            <div className="flex items-center justify-between gap-3 border-b border-primary/20 bg-primary/5 px-5 py-2 text-sm text-primary">
+              <span>{t("action.needsRestart")}</span>
+              <Button
+                size="xs"
+                onClick={() => void handleRestart()}
+                disabled={isRestarting}
+              >
+                {isRestarting ? t("action.restarting") : t("action.restart")}
+              </Button>
+            </div>
+          ) : null}
+
+          {toast ? (
+            <div className="pointer-events-none absolute right-5 top-14 z-50 flex items-center gap-2 rounded-lg bg-foreground px-3 py-1.5 text-xs text-background shadow-float">
+              <Check className="size-3.5" />
+              {toast}
+            </div>
+          ) : null}
+
           <ScrollArea className="flex-1">
             <div className="px-5 py-4">
               {renderPage({
@@ -256,6 +320,7 @@ function App() {
                 mutationNotice,
                 trafficResponse,
                 isRefreshing,
+                showToast,
                 onRefreshUsers: refreshAll,
                 onCreateUser: handleCreateUser,
                 onDeleteUser: handleDeleteUser,
@@ -280,6 +345,7 @@ function renderPage({
   trafficResponse,
   isRefreshing,
   onRefreshUsers,
+  showToast,
   onCreateUser,
   onDeleteUser,
 }: {
@@ -291,6 +357,7 @@ function renderPage({
   mutationNotice: string | null
   trafficResponse: TrafficResponse | null
   isRefreshing: boolean
+  showToast: (msg: string) => void
   onRefreshUsers: () => Promise<void>
   onCreateUser: (input: CreateUserInput) => Promise<void>
   onDeleteUser: (userId: string) => Promise<void>
@@ -307,6 +374,7 @@ function renderPage({
           isLoading={isRefreshing}
           error={usersError}
           mutationNotice={mutationNotice}
+          showToast={showToast}
           onRefresh={onRefreshUsers}
           onCreateUser={onCreateUser}
           onDeleteUser={onDeleteUser}

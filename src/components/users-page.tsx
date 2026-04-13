@@ -34,6 +34,7 @@ type UsersPageProps = {
   isLoading: boolean
   error?: string | null
   mutationNotice?: string | null
+  showToast: (msg: string) => void
   onRefresh: () => Promise<void>
   onCreateUser: (input: CreateUserInput) => Promise<void>
   onDeleteUser: (userId: string) => Promise<void>
@@ -46,6 +47,7 @@ export function UsersPage({
   isLoading,
   error,
   mutationNotice,
+  showToast,
   onRefresh,
   onCreateUser,
   onDeleteUser,
@@ -58,7 +60,6 @@ export function UsersPage({
   const [formError, setFormError] = useState<string | null>(null)
   const [submitBusy, setSubmitBusy] = useState(false)
   const [actionBusyId, setActionBusyId] = useState<string | null>(null)
-  const [copyFeedback, setCopyFeedback] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ManagedUser | null>(null)
   const qrRef = useRef<HTMLDivElement>(null)
 
@@ -81,10 +82,10 @@ export function UsersPage({
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"))
       if (blob) {
         await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })])
-        setCopyFeedback(t("users.qrCopied"))
+        showToast(t("users.qrCopied"))
       }
     } catch {
-      setCopyFeedback(t("users.qrCopyFailed"))
+      showToast(t("users.qrCopyFailed"))
     }
   }, [selectedUser, t])
 
@@ -105,14 +106,14 @@ export function UsersPage({
 
   async function handleCopyLink(user: ManagedUser) {
     if (!user.shareLink) {
-      setCopyFeedback(t("users.linkNA", { label: user.label }))
+      showToast(t("users.linkNA", { label: user.label }))
       return
     }
     try {
       await navigator.clipboard.writeText(user.shareLink)
-      setCopyFeedback(t("users.copied", { label: user.label }))
+      showToast(t("users.copied", { label: user.label }))
     } catch (nextError) {
-      setCopyFeedback(
+      showToast(
         nextError instanceof Error ? nextError.message : t("users.copyFailed", { label: user.label }),
       )
     }
@@ -157,7 +158,6 @@ export function UsersPage({
       {/* Banners */}
       {error ? <Banner tone="danger" text={error} /> : null}
       {mutationNotice ? <Banner tone="neutral" text={mutationNotice} /> : null}
-      {copyFeedback ? <Banner tone="neutral" text={copyFeedback} /> : null}
 
       {/* User list */}
       {users.length === 0 ? (
