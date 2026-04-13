@@ -228,7 +228,7 @@ function App() {
     <TooltipProvider delayDuration={120}>
       <div className="flex h-screen text-foreground">
         {/* ── Sidebar ── */}
-        <aside className="flex w-[220px] shrink-0 flex-col border-r border-border/60 bg-panel/75 px-3 py-3 backdrop-blur-xl">
+        <aside className="flex w-[220px] shrink-0 flex-col border-r border-border/60 bg-panel/75 px-3 pb-3 pt-8 backdrop-blur-xl">
           <div className="flex items-center justify-between px-2 py-1">
             <div className="flex items-center gap-2">
               <div
@@ -292,8 +292,9 @@ function App() {
         </aside>
 
         {/* ── Main ── */}
-        <main className="flex flex-1 flex-col overflow-hidden">
-          <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 py-3">
+        <main className="relative flex flex-1 flex-col overflow-hidden">
+          <div className="h-7 shrink-0" style={{ WebkitAppRegion: "drag" } as React.CSSProperties} />
+          <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 pb-3">
             <h2 className="font-heading text-2xl leading-none">{t(currentNav.labelKey)}</h2>
             <Button
               variant="outline"
