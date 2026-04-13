@@ -9,7 +9,13 @@
     "settings": "Settings"
   },
   "action": {
-    "refresh": "Refresh"
+    "refresh": "Refresh",
+    "refreshed": "Refreshed",
+    "restart": "Restart Xray",
+    "restarting": "Restarting…",
+    "restarted": "Xray restarted",
+    "restartFailed": "Restart failed",
+    "needsRestart": "Config changed — restart to apply"
   },
   "dashboard": {
     "service": "Service",

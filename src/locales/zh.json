@@ -9,7 +9,13 @@
     "settings": "设置"
   },
   "action": {
-    "refresh": "刷新"
+    "refresh": "刷新",
+    "refreshed": "已刷新",
+    "restart": "重启 Xray",
+    "restarting": "重启中…",
+    "restarted": "Xray 已重启",
+    "restartFailed": "重启失败",
+    "needsRestart": "配置已修改，重启后生效"
   },
   "dashboard": {
     "service": "服务状态",

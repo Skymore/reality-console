@@ -137,7 +137,7 @@ fn get_xray_snapshot() -> XraySnapshot {
         });
 
     let config_path = detect_config_path();
-    let public_ipv4 = command_output("curl", &["-4", "-fsS", "https://api.ipify.org"]).or_else(|| {
+    let public_ipv4: Option<String> = resolve_public_ipv4().or_else(|| {
         notes.push("Public IPv4 lookup failed.".to_string());
         None
     });
@@ -184,7 +184,7 @@ fn get_xray_snapshot() -> XraySnapshot {
 
 #[tauri::command]
 fn get_vless_users() -> Result<UserListResponse, String> {
-    let loaded = load_config()?;
+    let loaded = load_config_with_ip(resolve_public_ipv4())?;
 
     Ok(UserListResponse {
         config_path: Some(loaded.path.to_string_lossy().into_owned()),
@@ -195,7 +195,8 @@ fn get_vless_users() -> Result<UserListResponse, String> {
 
 #[tauri::command]
 fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, String> {
-    let mut loaded = load_config()?;
+    let ip = resolve_public_ipv4();
+    let mut loaded = load_config_with_ip(ip.clone())?;
     let timestamp = unix_timestamp();
     let label = next_user_label(&loaded.root, input.label.as_deref());
     let note = input.note.and_then(|value| normalize_optional(&value));
@@ -219,12 +220,27 @@ fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, Strin
     );
 
     let backup_path = persist_config_and_metadata(&loaded)?;
-    let reloaded = load_config()?;
+    let reloaded = load_config_with_ip(ip)?;
 
     Ok(UserMutationResult {
         backup_path,
         users: collect_users(&reloaded.root, &reloaded.metadata, &reloaded.link_context)?,
     })
+}
+
+#[tauri::command]
+fn restart_xray() -> Result<String, String> {
+    let output = Command::new("brew")
+        .args(["services", "restart", "xray"])
+        .output()
+        .map_err(|error| format!("Failed to run brew services restart: {error}"))?;
+
+    if output.status.success() {
+        Ok("ok".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("Restart failed: {stderr}"))
+    }
 }
 
 #[tauri::command]
@@ -314,7 +330,8 @@ fn get_user_traffic() -> TrafficResponse {
 
 #[tauri::command]
 fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String> {
-    let mut loaded = load_config()?;
+    let ip = resolve_public_ipv4();
+    let mut loaded = load_config_with_ip(ip.clone())?;
     let clients = clients_mut(&mut loaded.root)?;
     let original_len = clients.len();
 
@@ -333,7 +350,7 @@ fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String> {
     loaded.metadata.users.remove(&user_id);
 
     let backup_path = persist_config_and_metadata(&loaded)?;
-    let reloaded = load_config()?;
+    let reloaded = load_config_with_ip(ip)?;
 
     Ok(UserMutationResult {
         backup_path,
@@ -341,7 +358,11 @@ fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String> {
     })
 }
 
-fn load_config() -> Result<LoadedConfig, String> {
+fn resolve_public_ipv4() -> Option<String> {
+    command_output("curl", &["-4", "-fsS", "--connect-timeout", "3", "https://api.ipify.org"])
+}
+
+fn load_config_with_ip(public_ipv4: Option<String>) -> Result<LoadedConfig, String> {
     let path = detect_config_path()
         .map(PathBuf::from)
         .ok_or_else(|| "No known Xray config path was found.".to_string())?;
@@ -353,7 +374,7 @@ fn load_config() -> Result<LoadedConfig, String> {
 
     let metadata_path = metadata_path_for(&path)?;
     let metadata = read_metadata(&metadata_path)?;
-    let link_context = build_link_context(&root);
+    let link_context = build_link_context(&root, public_ipv4);
 
     Ok(LoadedConfig {
         path,
@@ -425,8 +446,7 @@ fn collect_users(
     Ok(users)
 }
 
-fn build_link_context(root: &Value) -> RealityLinkContext {
-    let public_ipv4 = command_output("curl", &["-4", "-fsS", "https://api.ipify.org"]);
+fn build_link_context(root: &Value, public_ipv4: Option<String>) -> RealityLinkContext {
     let inspected = inspect_root(root).unwrap_or_default();
     let inbound = vless_inbound(root);
 
@@ -832,7 +852,8 @@ pub fn run() {
             get_vless_users,
             create_vless_user,
             delete_vless_user,
-            get_user_traffic
+            get_user_traffic,
+            restart_xray
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
