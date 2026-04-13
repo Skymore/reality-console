@@ -42,19 +42,16 @@
     "users": "Users",
     "realityTarget": "REALITY target",
     "sni": "SNI",
-    "configPath": "Config path"
+    "configPath": "Config path",
+    "edit": "Edit",
+    "saveConfig": "Save config",
+    "saving": "Saving…",
+    "saved": "Config saved. Backup → {{path}}",
+    "saveFailed": "Failed to save config"
   },
   "diag": {
-    "binary": "Xray path",
-    "service": "Service",
-    "endpoint": "Endpoint",
-    "config": "Config",
-    "notes": "Notes",
-    "allPassed": "All checks passed — no warnings.",
-    "notFound": "xray not found in PATH",
-    "notRunning": "Not running",
-    "ipUnavailable": "Public IPv4 unavailable",
-    "noConfig": "No config file detected"
+    "title": "Troubleshooting",
+    "desc": "Port checks, config validation, connectivity tests, and common issue diagnostics"
   },
   "placeholder": {
     "comingSoon": "Coming soon"

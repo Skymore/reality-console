@@ -23,7 +23,8 @@ import { UsersPage } from "@/components/users-page"
 import { Banner } from "@/components/banner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import type { CreateUserInput, TrafficResponse, UserListResponse, UserMutationResult } from "@/lib/users"
@@ -529,9 +530,9 @@ function renderPage({
         />
       )
     case "config":
-      return <ConfigPage snapshot={snapshot} />
+      return <ConfigPage snapshot={snapshot} showToast={showToast} />
     case "diagnostics":
-      return <DiagnosticsPage snapshot={snapshot} loadError={snapshotError ?? usersError} />
+      return <DiagnosticsPage />
     case "logs":
       return <LogsPage />
     case "backups":
@@ -608,10 +609,71 @@ function DashboardPage({
   )
 }
 
-/* ─── Config ─── */
+/* ─── Config (editable) ─── */
 
-function ConfigPage({ snapshot }: { snapshot: XraySnapshot }) {
+function ConfigPage({ snapshot, showToast }: { snapshot: XraySnapshot; showToast: (msg: string) => void }) {
   const { t } = useTranslation()
+  const [editing, setEditing] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [port, setPort] = useState("")
+  const [target, setTarget] = useState("")
+  const [sni, setSni] = useState("")
+
+  function startEdit() {
+    setPort(snapshot.listenPort ? String(snapshot.listenPort) : "")
+    setTarget(snapshot.realityTarget ?? "")
+    setSni(snapshot.serverName ?? "")
+    setEditing(true)
+  }
+
+  async function saveConfig() {
+    try {
+      setSaving(true)
+      const backupPath = await invoke<string>("update_config", {
+        input: {
+          listenPort: port ? Number(port) : null,
+          realityTarget: target || null,
+          serverName: sni || null,
+        },
+      })
+      setEditing(false)
+      showToast(t("config.saved", { path: backupPath }))
+    } catch (error) {
+      showToast(toErrorMessage(error, t("config.saveFailed")))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (editing) {
+    return (
+      <Card className="border-border/60 bg-panel/80 shadow-panel">
+        <CardContent className="space-y-3 p-4">
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">{t("config.port")}</label>
+            <Input value={port} onChange={(e) => setPort(e.currentTarget.value)} placeholder="443" />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">{t("config.realityTarget")}</label>
+            <Input value={target} onChange={(e) => setTarget(e.currentTarget.value)} placeholder="www.microsoft.com:443" />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs text-muted-foreground">{t("config.sni")}</label>
+            <Input value={sni} onChange={(e) => setSni(e.currentTarget.value)} placeholder="www.microsoft.com" />
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" size="sm" onClick={() => setEditing(false)} disabled={saving}>
+              {t("users.cancel")}
+            </Button>
+            <Button size="sm" onClick={() => void saveConfig()} disabled={saving}>
+              {saving ? t("config.saving") : t("config.saveConfig")}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+    )
+  }
+
   return (
     <Card className="border-border/60 bg-panel/80 shadow-panel">
       <CardContent className="p-0">
@@ -625,66 +687,21 @@ function ConfigPage({ snapshot }: { snapshot: XraySnapshot }) {
             <StatusRow label={t("config.configPath")} value={snapshot.configPath ?? t("dashboard.unknown")} mono />
           </tbody>
         </table>
+        <div className="border-t border-border/60 px-4 py-3">
+          <Button variant="outline" size="sm" className="rounded-full" onClick={startEdit}>
+            {t("config.edit")}
+          </Button>
+        </div>
       </CardContent>
     </Card>
   )
 }
 
-/* ─── Diagnostics ─── */
+/* ─── Diagnostics (placeholder) ─── */
 
-function DiagnosticsPage({
-  snapshot,
-  loadError,
-}: {
-  snapshot: XraySnapshot
-  loadError: string | null
-}) {
+function DiagnosticsPage() {
   const { t } = useTranslation()
-  return (
-    <div className="space-y-4">
-      {loadError ? <Banner tone="danger" text={loadError} /> : null}
-
-      <div className="grid grid-cols-2 gap-3">
-        <DiagnosticHint
-          title={t("diag.binary")}
-          detail={snapshot.installed ? snapshot.binaryPath ?? "Installed" : t("diag.notFound")}
-        />
-        <DiagnosticHint
-          title={t("diag.service")}
-          detail={snapshot.running ? `${t("dashboard.running")}${snapshot.pid ? ` · PID ${snapshot.pid}` : ""}` : t("diag.notRunning")}
-        />
-        <DiagnosticHint
-          title={t("diag.endpoint")}
-          detail={
-            snapshot.publicIpv4
-              ? `${snapshot.publicIpv4}${snapshot.listenPort ? `:${snapshot.listenPort}` : ""}`
-              : t("diag.ipUnavailable")
-          }
-        />
-        <DiagnosticHint
-          title={t("diag.config")}
-          detail={snapshot.configPath ?? t("diag.noConfig")}
-        />
-      </div>
-
-      {snapshot.notes.length > 0 ? (
-        <Card className="border-border/60 bg-secondary/75 shadow-none">
-          <CardHeader className="pb-2">
-            <CardTitle className="font-heading text-lg">{t("diag.notes")}</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-2">
-            {snapshot.notes.map((note) => (
-              <Banner key={note} tone="warning" text={note} />
-            ))}
-          </CardContent>
-        </Card>
-      ) : (
-        <div className="rounded-xl border border-border/60 bg-background/80 px-4 py-3 text-sm text-muted-foreground">
-          {t("diag.allPassed")}
-        </div>
-      )}
-    </div>
-  )
+  return <PlaceholderPanel eyebrow={t("placeholder.comingSoon")} title={t("diag.title")} description={t("diag.desc")} />
 }
 
 /* ─── Placeholder pages ─── */
@@ -722,21 +739,6 @@ function StatusRow({
         {value}
       </td>
     </tr>
-  )
-}
-
-function DiagnosticHint({
-  title,
-  detail,
-}: {
-  title: string
-  detail: string
-}) {
-  return (
-    <div className="rounded-xl border border-border/60 bg-background/80 p-4">
-      <div className="font-medium">{title}</div>
-      <p className="mt-1 text-sm leading-6 text-muted-foreground">{detail}</p>
-    </div>
   )
 }
 

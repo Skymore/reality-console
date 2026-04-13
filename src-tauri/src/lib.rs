@@ -283,6 +283,45 @@ fn update_user_note(user_id: String, new_note: String) -> Result<UserMutationRes
     })
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigUpdate {
+    listen_port: Option<u16>,
+    reality_target: Option<String>,
+    server_name: Option<String>,
+}
+
+#[tauri::command]
+fn update_config(input: ConfigUpdate) -> Result<String, String> {
+    let ip = resolve_public_ipv4();
+    let mut loaded = load_config_with_ip(ip)?;
+
+    let inbound = loaded.root
+        .get_mut("inbounds")
+        .and_then(Value::as_array_mut)
+        .and_then(|inbounds| inbounds.iter_mut().find(|e| e.get("protocol").and_then(Value::as_str) == Some("vless")))
+        .ok_or_else(|| "Could not find VLESS inbound in config.".to_string())?;
+
+    if let Some(port) = input.listen_port {
+        inbound["port"] = json!(port);
+    }
+
+    if let Some(ref target) = input.reality_target {
+        if let Some(reality) = inbound.get_mut("streamSettings").and_then(|s| s.get_mut("realitySettings")) {
+            reality["target"] = json!(target);
+        }
+    }
+
+    if let Some(ref sni) = input.server_name {
+        if let Some(reality) = inbound.get_mut("streamSettings").and_then(|s| s.get_mut("realitySettings")) {
+            reality["serverNames"] = json!([sni]);
+        }
+    }
+
+    let backup_path = persist_config_and_metadata(&loaded)?;
+    Ok(backup_path)
+}
+
 #[tauri::command]
 fn service_action(action: String) -> Result<String, String> {
     let valid = ["start", "stop", "restart"];
@@ -969,6 +1008,7 @@ pub fn run() {
             delete_vless_user,
             update_user_label,
             update_user_note,
+            update_config,
             get_user_traffic,
             service_action
         ])

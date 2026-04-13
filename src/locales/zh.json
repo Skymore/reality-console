@@ -42,19 +42,16 @@
     "users": "用户数",
     "realityTarget": "REALITY 伪装站",
     "sni": "SNI",
-    "configPath": "配置路径"
+    "configPath": "配置路径",
+    "edit": "编辑",
+    "saveConfig": "保存配置",
+    "saving": "保存中…",
+    "saved": "配置已保存，备份 → {{path}}",
+    "saveFailed": "保存配置失败"
   },
   "diag": {
-    "binary": "Xray 路径",
-    "service": "服务状态",
-    "endpoint": "公网地址",
-    "config": "配置文件",
-    "notes": "注意事项",
-    "allPassed": "所有检查通过，无异常。",
-    "notFound": "未在 PATH 中找到 xray",
-    "notRunning": "未运行",
-    "ipUnavailable": "无法获取公网 IPv4",
-    "noConfig": "未检测到配置文件"
+    "title": "故障排查",
+    "desc": "端口检测、配置校验、连通性测试与常见问题诊断"
   },
   "placeholder": {
     "comingSoon": "即将推出"
