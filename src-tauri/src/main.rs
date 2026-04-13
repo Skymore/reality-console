@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    reality_console_lib::run()
+    xray_plane_lib::run()
 }

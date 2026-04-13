@@ -255,17 +255,47 @@ fn update_user_label(user_id: String, new_label: String) -> Result<UserMutationR
 }
 
 #[tauri::command]
-fn restart_xray() -> Result<String, String> {
+fn update_user_note(user_id: String, new_note: String) -> Result<UserMutationResult, String> {
+    let ip = resolve_public_ipv4();
+    let mut loaded = load_config_with_ip(ip.clone())?;
+
+    // Verify user exists in config
+    let exists = clients(&loaded.root)?.iter().any(|c| {
+        c.get("id").and_then(Value::as_str) == Some(user_id.as_str())
+    });
+    if !exists {
+        return Err("User was not found in the current config.".to_string());
+    }
+
+    let trimmed = new_note.trim();
+    let entry = loaded.metadata.users.entry(user_id).or_default();
+    entry.note = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+
+    write_metadata(&loaded.metadata_path, &loaded.metadata)?;
+
+    Ok(UserMutationResult {
+        backup_path: loaded.metadata_path.to_string_lossy().into_owned(),
+        users: collect_users(&loaded.root, &loaded.metadata, &loaded.link_context)?,
+    })
+}
+
+#[tauri::command]
+fn service_action(action: String) -> Result<String, String> {
+    let valid = ["start", "stop", "restart"];
+    if !valid.contains(&action.as_str()) {
+        return Err(format!("Invalid action: {action}"));
+    }
+
     let output = Command::new("brew")
-        .args(["services", "restart", "xray"])
+        .args(["services", action.as_str(), "xray"])
         .output()
-        .map_err(|error| format!("Failed to run brew services restart: {error}"))?;
+        .map_err(|error| format!("Failed to run brew services {action}: {error}"))?;
 
     if output.status.success() {
         Ok("ok".to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(format!("Restart failed: {stderr}"))
+        Err(format!("{action} failed: {stderr}"))
     }
 }
 
@@ -879,8 +909,9 @@ pub fn run() {
             create_vless_user,
             delete_vless_user,
             update_user_label,
+            update_user_note,
             get_user_traffic,
-            restart_xray
+            service_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

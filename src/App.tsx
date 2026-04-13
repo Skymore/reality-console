@@ -8,10 +8,12 @@ import {
   FileText,
   Languages,
   LayoutDashboard,
+  Play,
   RefreshCcw,
   RotateCcw,
   Settings2,
   Shield,
+  Square,
   Stethoscope,
   Users,
 } from "lucide-react"
@@ -92,15 +94,16 @@ function App() {
     localStorage.setItem("locale", next)
   }
 
-  async function handleRestart() {
+  async function handleServiceAction(action: "start" | "stop" | "restart") {
     try {
       setIsRestarting(true)
-      await invoke<string>("restart_xray")
-      setNeedsRestart(false)
-      showToast(t("action.restarted"))
+      await invoke<string>("service_action", { action })
+      if (action === "restart") setNeedsRestart(false)
+      const msgKey = action === "restart" ? "action.restarted" : action === "start" ? "action.started" : "action.stopped"
+      showToast(t(msgKey))
       await refreshAll()
     } catch (error) {
-      showToast(toErrorMessage(error, t("action.restartFailed")))
+      showToast(toErrorMessage(error, t("action.serviceFailed")))
     } finally {
       setIsRestarting(false)
     }
@@ -199,6 +202,22 @@ function App() {
     }
   }
 
+  async function handleUpdateNote(userId: string, newNote: string) {
+    try {
+      const result = await invoke<UserMutationResult>("update_user_note", { userId, newNote })
+      startTransition(() => {
+        setUsersResponse((current) => ({
+          configPath: current?.configPath ?? currentSnapshot.configPath ?? null,
+          metadataPath: current?.metadataPath ?? null,
+          users: result.users,
+        }))
+      })
+      showToast(t("action.refreshed"))
+    } catch (error) {
+      setUsersError(toErrorMessage(error, t("users.createFailed")))
+    }
+  }
+
   async function handleDeleteUser(userId: string) {
     try {
       const result = await invoke<UserMutationResult>("delete_vless_user", { userId })
@@ -243,19 +262,35 @@ function App() {
               />
               <span className="font-heading text-sm font-medium">Xray✈️</span>
             </div>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  onClick={() => void handleRestart()}
-                  disabled={isRestarting}
-                >
-                  <RotateCcw className={cn("size-3.5", isRestarting && "animate-spin")} />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>{t("action.restart")}</TooltipContent>
-            </Tooltip>
+            <div className="flex gap-0.5">
+              {currentSnapshot.running ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="ghost" size="icon-xs" onClick={() => void handleServiceAction("stop")} disabled={isRestarting}>
+                      <Square className="size-3" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("action.stop")}</TooltipContent>
+                </Tooltip>
+              ) : (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="ghost" size="icon-xs" onClick={() => void handleServiceAction("start")} disabled={isRestarting}>
+                      <Play className="size-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("action.start")}</TooltipContent>
+                </Tooltip>
+              )}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="ghost" size="icon-xs" onClick={() => void handleServiceAction("restart")} disabled={isRestarting}>
+                    <RotateCcw className={cn("size-3.5", isRestarting && "animate-spin")} />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t("action.restart")}</TooltipContent>
+              </Tooltip>
+            </div>
           </div>
 
           <nav className="mt-4 flex flex-1 flex-col gap-0.5">
@@ -313,7 +348,7 @@ function App() {
               <span>{t("action.needsRestart")}</span>
               <Button
                 size="xs"
-                onClick={() => void handleRestart()}
+                onClick={() => void handleServiceAction("restart")}
                 disabled={isRestarting}
               >
                 {isRestarting ? t("action.restarting") : t("action.restart")}
@@ -343,6 +378,7 @@ function App() {
                 onRefreshUsers: refreshAll,
                 onCreateUser: handleCreateUser,
                 onUpdateLabel: handleUpdateLabel,
+                onUpdateNote: handleUpdateNote,
                 onDeleteUser: handleDeleteUser,
               })}
             </div>
@@ -368,6 +404,7 @@ function renderPage({
   showToast,
   onCreateUser,
   onUpdateLabel,
+  onUpdateNote,
   onDeleteUser,
 }: {
   activePage: PageId
@@ -382,6 +419,7 @@ function renderPage({
   onRefreshUsers: () => Promise<void>
   onCreateUser: (input: CreateUserInput) => Promise<void>
   onUpdateLabel: (userId: string, newLabel: string) => Promise<void>
+  onUpdateNote: (userId: string, newNote: string) => Promise<void>
   onDeleteUser: (userId: string) => Promise<void>
 }) {
   switch (activePage) {
@@ -400,6 +438,7 @@ function renderPage({
           onRefresh={onRefreshUsers}
           onCreateUser={onCreateUser}
           onUpdateLabel={onUpdateLabel}
+          onUpdateNote={onUpdateNote}
           onDeleteUser={onDeleteUser}
         />
       )

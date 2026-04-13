@@ -11,10 +11,14 @@
   "action": {
     "refresh": "Refresh",
     "refreshed": "Refreshed",
-    "restart": "Restart Xray",
+    "restart": "Restart",
+    "start": "Start",
+    "stop": "Stop",
     "restarting": "Restarting…",
     "restarted": "Xray restarted",
-    "restartFailed": "Restart failed",
+    "started": "Xray started",
+    "stopped": "Xray stopped",
+    "serviceFailed": "Action failed",
     "needsRestart": "Config changed — restart to apply"
   },
   "dashboard": {
@@ -75,6 +79,8 @@
     "copyLink": "Copy share link",
     "showQr": "Show QR code",
     "editLabel": "Edit label",
+    "editNote": "Edit note",
+    "noNote": "No note",
     "deleteUser": "Delete user",
     "createTitle": "Create VLESS user",
     "createDesc": "Leave the label empty to auto-generate the next friend-N slot.",

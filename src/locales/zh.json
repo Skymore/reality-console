@@ -11,10 +11,14 @@
   "action": {
     "refresh": "刷新",
     "refreshed": "已刷新",
-    "restart": "重启 Xray",
+    "restart": "重启",
+    "start": "启动",
+    "stop": "停止",
     "restarting": "重启中…",
     "restarted": "Xray 已重启",
-    "restartFailed": "重启失败",
+    "started": "Xray 已启动",
+    "stopped": "Xray 已停止",
+    "serviceFailed": "操作失败",
     "needsRestart": "配置已修改，重启后生效"
   },
   "dashboard": {
@@ -75,6 +79,8 @@
     "copyLink": "复制分享链接",
     "showQr": "显示二维码",
     "editLabel": "编辑标签",
+    "editNote": "编辑备注",
+    "noNote": "暂无备注",
     "deleteUser": "删除用户",
     "createTitle": "创建 VLESS 用户",
     "createDesc": "标签留空会自动命名为 friend-N。",

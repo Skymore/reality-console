@@ -38,6 +38,7 @@ type UsersPageProps = {
   onRefresh: () => Promise<void>
   onCreateUser: (input: CreateUserInput) => Promise<void>
   onUpdateLabel: (userId: string, newLabel: string) => Promise<void>
+  onUpdateNote: (userId: string, newNote: string) => Promise<void>
   onDeleteUser: (userId: string) => Promise<void>
 }
 
@@ -52,6 +53,7 @@ export function UsersPage({
   onRefresh,
   onCreateUser,
   onUpdateLabel,
+  onUpdateNote,
   onDeleteUser,
 }: UsersPageProps) {
   const { t } = useTranslation()
@@ -65,6 +67,8 @@ export function UsersPage({
   const [deleteTarget, setDeleteTarget] = useState<ManagedUser | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editValue, setEditValue] = useState("")
+  const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
+  const [noteValue, setNoteValue] = useState("")
   const qrRef = useRef<HTMLDivElement>(null)
 
   const handleCopyQr = useCallback(async () => {
@@ -128,6 +132,14 @@ export function UsersPage({
     try {
       await onUpdateLabel(editingId, editValue.trim())
       setEditingId(null)
+    } catch { /* error shown by parent */ }
+  }
+
+  async function saveNote() {
+    if (!editingNoteId) return
+    try {
+      await onUpdateNote(editingNoteId, noteValue)
+      setEditingNoteId(null)
     } catch { /* error shown by parent */ }
   }
 
@@ -234,6 +246,35 @@ export function UsersPage({
                     )
                   })()}
                 </div>
+                {editingNoteId === user.id ? (
+                  <div className="mt-1 flex items-center gap-1">
+                    <Input
+                      className="h-6 flex-1 px-1.5 text-xs"
+                      value={noteValue}
+                      onChange={(e) => setNoteValue(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void saveNote()
+                        if (e.key === "Escape") setEditingNoteId(null)
+                      }}
+                      placeholder={t("users.noNote")}
+                      autoFocus
+                    />
+                    <Button variant="ghost" size="icon-xs" onClick={() => void saveNote()}>
+                      <Check className="size-3" />
+                    </Button>
+                    <Button variant="ghost" size="icon-xs" onClick={() => setEditingNoteId(null)}>
+                      <X className="size-3" />
+                    </Button>
+                  </div>
+                ) : (
+                  <p
+                    className="mt-0.5 cursor-pointer truncate text-xs text-muted-foreground/60 hover:text-muted-foreground"
+                    onClick={() => { setEditingNoteId(user.id); setNoteValue(user.note ?? "") }}
+                    title={t("users.editNote")}
+                  >
+                    {user.note || t("users.noNote")}
+                  </p>
+                )}
               </div>
 
               <div className="flex shrink-0 gap-1">
