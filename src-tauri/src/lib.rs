@@ -72,6 +72,23 @@ struct UserMetadataEntry {
     created_at: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserTraffic {
+    email: String,
+    uplink: u64,
+    downlink: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrafficResponse {
+    available: bool,
+    api_port: Option<u16>,
+    users: Vec<UserTraffic>,
+    error: Option<String>,
+}
+
 #[derive(Default)]
 struct ConfigInspection {
     listen_port: Option<u16>,
@@ -211,6 +228,91 @@ fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, Strin
 }
 
 #[tauri::command]
+fn get_user_traffic() -> TrafficResponse {
+    let config_path = match detect_config_path() {
+        Some(path) => path,
+        None => {
+            return TrafficResponse {
+                available: false,
+                api_port: None,
+                users: vec![],
+                error: Some("No Xray config found.".to_string()),
+            }
+        }
+    };
+
+    let contents = match fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return TrafficResponse {
+                available: false,
+                api_port: None,
+                users: vec![],
+                error: Some(format!("Cannot read config: {e}")),
+            }
+        }
+    };
+
+    let root: Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            return TrafficResponse {
+                available: false,
+                api_port: None,
+                users: vec![],
+                error: Some(format!("Cannot parse config: {e}")),
+            }
+        }
+    };
+
+    let has_stats = root.get("stats").is_some();
+    let api_port = find_api_port(&root);
+
+    if !has_stats || api_port.is_none() {
+        return TrafficResponse {
+            available: false,
+            api_port: None,
+            users: vec![],
+            error: Some("Stats API is not enabled in the Xray config. Add \"stats\", \"api\", and \"policy\" sections to enable.".to_string()),
+        };
+    }
+
+    let port = api_port.unwrap();
+    let server = format!("127.0.0.1:{port}");
+
+    match Command::new("xray")
+        .args(["api", "statsquery", "--server", &server, "-pattern", "user>>>"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let users = parse_traffic_stats(&stdout);
+            TrafficResponse {
+                available: true,
+                api_port: Some(port),
+                users,
+                error: None,
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            TrafficResponse {
+                available: true,
+                api_port: Some(port),
+                users: vec![],
+                error: Some(format!("Stats query failed: {stderr}")),
+            }
+        }
+        Err(e) => TrafficResponse {
+            available: true,
+            api_port: Some(port),
+            users: vec![],
+            error: Some(format!("Failed to run xray api: {e}")),
+        },
+    }
+}
+
+#[tauri::command]
 fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String> {
     let mut loaded = load_config()?;
     let clients = clients_mut(&mut loaded.root)?;
@@ -326,7 +428,7 @@ fn collect_users(
 fn build_link_context(root: &Value) -> RealityLinkContext {
     let public_ipv4 = command_output("curl", &["-4", "-fsS", "https://api.ipify.org"]);
     let inspected = inspect_root(root).unwrap_or_default();
-    let inbound = first_inbound(root);
+    let inbound = vless_inbound(root);
 
     let private_key = inbound
         .and_then(|entry| entry.get("streamSettings"))
@@ -390,7 +492,7 @@ fn inspect_config(path: &str) -> Option<ConfigInspection> {
 }
 
 fn inspect_root(root: &Value) -> Option<ConfigInspection> {
-    let inbound = first_inbound(root)?;
+    let inbound = vless_inbound(root)?;
 
     let listen_port = inbound
         .get("port")
@@ -427,24 +529,25 @@ fn inspect_root(root: &Value) -> Option<ConfigInspection> {
     })
 }
 
-fn first_inbound(root: &Value) -> Option<&Value> {
-    root.get("inbounds")?.as_array()?.first()
+fn vless_inbound(root: &Value) -> Option<&Value> {
+    root.get("inbounds")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("protocol").and_then(Value::as_str) == Some("vless"))
 }
 
 fn clients(root: &Value) -> Result<&Vec<Value>, String> {
-    root.get("inbounds")
-        .and_then(Value::as_array)
-        .and_then(|inbounds| inbounds.first())
+    vless_inbound(root)
         .and_then(|entry| entry.get("settings"))
         .and_then(|settings| settings.get("clients"))
         .and_then(Value::as_array)
-        .ok_or_else(|| "Could not find `inbounds[0].settings.clients` in config.".to_string())
+        .ok_or_else(|| "Could not find a VLESS inbound with clients in config.".to_string())
 }
 
 fn clients_mut(root: &mut Value) -> Result<&mut Vec<Value>, String> {
     root.get_mut("inbounds")
         .and_then(Value::as_array_mut)
-        .and_then(|inbounds| inbounds.first_mut())
+        .and_then(|inbounds| inbounds.iter_mut().find(|entry| entry.get("protocol").and_then(Value::as_str) == Some("vless")))
         .and_then(|entry| entry.get_mut("settings"))
         .and_then(|settings| settings.get_mut("clients"))
         .and_then(Value::as_array_mut)
@@ -500,8 +603,9 @@ fn create_backup(path: &Path) -> Result<String, String> {
 
 fn temporary_path_for(path: &Path) -> PathBuf {
     let timestamp = unix_timestamp();
-    let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("config.json");
-    path.with_file_name(format!("{file_name}.tmp-{timestamp}"))
+    let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("config");
+    let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("json");
+    path.with_file_name(format!("{stem}.tmp-{timestamp}.{ext}"))
 }
 
 fn validate_xray_config(path: &Path) -> Result<(), String> {
@@ -649,6 +753,69 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+fn find_api_port(root: &Value) -> Option<u16> {
+    let inbounds = root.get("inbounds")?.as_array()?;
+    for inbound in inbounds {
+        let tag = inbound.get("tag").and_then(Value::as_str);
+        let protocol = inbound.get("protocol").and_then(Value::as_str);
+        if tag == Some("api") && protocol == Some("dokodemo-door") {
+            return inbound
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|p| u16::try_from(p).ok());
+        }
+    }
+    None
+}
+
+fn parse_traffic_stats(output: &str) -> Vec<UserTraffic> {
+    let mut traffic_map: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut current_name: Option<String> = None;
+    let mut current_value: Option<u64> = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("name:") {
+            if let Some(start) = trimmed.find('"') {
+                if let Some(end) = trimmed[start + 1..].find('"') {
+                    current_name = Some(trimmed[start + 1..start + 1 + end].to_string());
+                }
+            }
+        } else if trimmed.starts_with("value:") {
+            if let Some(val_str) = trimmed.strip_prefix("value:") {
+                current_value = val_str.trim().parse::<u64>().ok();
+            }
+        }
+
+        if trimmed == ">" || trimmed == "}" {
+            if let (Some(ref name), Some(value)) = (&current_name, current_value) {
+                // name format: "user>>>email>>>traffic>>>uplink"
+                let parts: Vec<&str> = name.split(">>>").collect();
+                if parts.len() == 4 && parts[0] == "user" && parts[2] == "traffic" {
+                    let email = parts[1].to_string();
+                    let entry = traffic_map.entry(email).or_insert((0, 0));
+                    match parts[3] {
+                        "uplink" => entry.0 = value,
+                        "downlink" => entry.1 = value,
+                        _ => {}
+                    }
+                }
+            }
+            current_name = None;
+            current_value = None;
+        }
+    }
+
+    traffic_map
+        .into_iter()
+        .map(|(email, (uplink, downlink))| UserTraffic {
+            email,
+            uplink,
+            downlink,
+        })
+        .collect()
+}
+
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -664,7 +831,8 @@ pub fn run() {
             get_xray_snapshot,
             get_vless_users,
             create_vless_user,
-            delete_vless_user
+            delete_vless_user,
+            get_user_traffic
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

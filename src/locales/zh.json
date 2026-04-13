@@ -1,0 +1,100 @@
+{
+  "nav": {
+    "dashboard": "概览",
+    "users": "用户",
+    "config": "配置",
+    "diagnostics": "诊断",
+    "logs": "日志",
+    "backups": "备份",
+    "settings": "设置"
+  },
+  "action": {
+    "refresh": "刷新"
+  },
+  "dashboard": {
+    "service": "服务状态",
+    "endpoint": "公网地址",
+    "reality": "REALITY",
+    "users": "用户数",
+    "config": "配置路径",
+    "binary": "Xray 路径",
+    "traffic": "流量",
+    "running": "运行中",
+    "stopped": "已停止",
+    "notInstalled": "未安装",
+    "notDetected": "未检测到",
+    "notConfigured": "未配置",
+    "unknown": "未知"
+  },
+  "config": {
+    "protocol": "协议",
+    "port": "端口",
+    "users": "用户数",
+    "realityTarget": "REALITY 伪装站",
+    "sni": "SNI",
+    "configPath": "配置路径"
+  },
+  "diag": {
+    "binary": "Xray 路径",
+    "service": "服务状态",
+    "endpoint": "公网地址",
+    "config": "配置文件",
+    "notes": "注意事项",
+    "allPassed": "所有检查通过，无异常。",
+    "notFound": "未在 PATH 中找到 xray",
+    "notRunning": "未运行",
+    "ipUnavailable": "无法获取公网 IPv4",
+    "noConfig": "未检测到配置文件"
+  },
+  "placeholder": {
+    "comingSoon": "即将推出"
+  },
+  "logs": {
+    "title": "日志查看器",
+    "desc": "服务事件、配置变更与分享操作的结构化日志"
+  },
+  "backups": {
+    "title": "配置还原点",
+    "desc": "每次配置变更自动创建带时间戳的备份"
+  },
+  "settings": {
+    "title": "本地偏好",
+    "desc": "文件路径、命令与显示选项，所有数据留在本机"
+  },
+  "users": {
+    "count_one": "{{count}} 位用户",
+    "count_other": "{{count}} 位用户",
+    "addUser": "添加用户",
+    "noUsers": "当前配置中没有 VLESS 用户。",
+    "copyLink": "复制分享链接",
+    "showQr": "显示二维码",
+    "deleteUser": "删除用户",
+    "createTitle": "创建 VLESS 用户",
+    "createDesc": "标签留空会自动命名为 friend-N。",
+    "label": "标签",
+    "note": "备注",
+    "cancel": "取消",
+    "create": "创建",
+    "creating": "创建中…",
+    "shareDesc": "用手机客户端扫码，或直接复制链接。",
+    "copyLinkBtn": "复制链接",
+    "copyQr": "复制二维码",
+    "qrCopied": "二维码已复制到剪贴板。",
+    "qrCopyFailed": "复制二维码失败。",
+    "confirmDelete": "删除 {{label}}？此操作会从配置中移除该 UUID。",
+    "linkUnavailable": "无法为此用户生成分享链接。",
+    "copied": "已复制 {{label}} 的链接。",
+    "copyFailed": "无法复制 {{label}} 的链接。",
+    "linkNA": "{{label}} 的分享链接不可用。",
+    "saved": "用户已保存，备份 → {{path}}",
+    "deleted": "用户已删除，备份 → {{path}}",
+    "createFailed": "创建用户失败。",
+    "deleting": "删除中…",
+    "deleteFailed": "删除用户失败。",
+    "notePlaceholder": "临时测试账号（iPhone）"
+  },
+  "error": {
+    "snapshotFailed": "状态获取失败",
+    "userListFailed": "用户列表加载失败"
+  }
+}

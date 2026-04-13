@@ -1,0 +1,100 @@
+{
+  "nav": {
+    "dashboard": "Overview",
+    "users": "Users",
+    "config": "Config",
+    "diagnostics": "Diagnostics",
+    "logs": "Logs",
+    "backups": "Backups",
+    "settings": "Settings"
+  },
+  "action": {
+    "refresh": "Refresh"
+  },
+  "dashboard": {
+    "service": "Service",
+    "endpoint": "Endpoint",
+    "reality": "REALITY",
+    "users": "Users",
+    "config": "Config path",
+    "binary": "Xray path",
+    "traffic": "Traffic",
+    "running": "Running",
+    "stopped": "Stopped",
+    "notInstalled": "Not installed",
+    "notDetected": "Not detected",
+    "notConfigured": "Not configured",
+    "unknown": "Unknown"
+  },
+  "config": {
+    "protocol": "Protocol",
+    "port": "Port",
+    "users": "Users",
+    "realityTarget": "REALITY target",
+    "sni": "SNI",
+    "configPath": "Config path"
+  },
+  "diag": {
+    "binary": "Xray path",
+    "service": "Service",
+    "endpoint": "Endpoint",
+    "config": "Config",
+    "notes": "Notes",
+    "allPassed": "All checks passed — no warnings.",
+    "notFound": "xray not found in PATH",
+    "notRunning": "Not running",
+    "ipUnavailable": "Public IPv4 unavailable",
+    "noConfig": "No config file detected"
+  },
+  "placeholder": {
+    "comingSoon": "Coming soon"
+  },
+  "logs": {
+    "title": "Log viewer",
+    "desc": "Structured logs for service events, config changes, and share actions"
+  },
+  "backups": {
+    "title": "Config restore points",
+    "desc": "Timestamped backups created automatically on every config change"
+  },
+  "settings": {
+    "title": "Local preferences",
+    "desc": "File paths, commands, and display options — everything stays on your machine"
+  },
+  "users": {
+    "count_one": "{{count}} user",
+    "count_other": "{{count}} users",
+    "addUser": "Add user",
+    "noUsers": "No VLESS users found in the current config.",
+    "copyLink": "Copy share link",
+    "showQr": "Show QR code",
+    "deleteUser": "Delete user",
+    "createTitle": "Create VLESS user",
+    "createDesc": "Leave the label empty to auto-generate the next friend-N slot.",
+    "label": "Label",
+    "note": "Note",
+    "cancel": "Cancel",
+    "create": "Create user",
+    "creating": "Creating…",
+    "shareDesc": "Scan this on a supported mobile client, or copy the raw link directly.",
+    "copyLinkBtn": "Copy link",
+    "copyQr": "Copy QR",
+    "qrCopied": "QR code copied to clipboard.",
+    "qrCopyFailed": "Failed to copy QR code.",
+    "confirmDelete": "Delete {{label}}? This removes the UUID from the live config.",
+    "linkUnavailable": "A share link could not be generated for this user.",
+    "copied": "Copied link for {{label}}.",
+    "copyFailed": "Could not copy link for {{label}}.",
+    "linkNA": "Share link unavailable for {{label}}.",
+    "saved": "User saved. Backup → {{path}}",
+    "deleted": "User deleted. Backup → {{path}}",
+    "createFailed": "Failed to create user.",
+    "deleting": "Deleting…",
+    "deleteFailed": "Failed to delete user.",
+    "notePlaceholder": "Temporary test account for iPhone"
+  },
+  "error": {
+    "snapshotFailed": "Failed to fetch status",
+    "userListFailed": "Failed to load user list"
+  }
+}

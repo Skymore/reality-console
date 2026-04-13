@@ -22,3 +22,16 @@ export type CreateUserInput = {
   label?: string
   note?: string
 }
+
+export type UserTraffic = {
+  email: string
+  uplink: number
+  downlink: number
+}
+
+export type TrafficResponse = {
+  available: boolean
+  apiPort?: number | null
+  users: UserTraffic[]
+  error?: string | null
+}

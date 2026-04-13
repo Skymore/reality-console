@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Reality Console",
+  "productName": "Xray✈️",
   "version": "0.1.0",
   "identifier": "com.sky.realityconsole",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Reality Console",
+        "title": "Xray✈️",
         "width": 800,
         "height": 600
       }
