@@ -845,40 +845,36 @@ fn find_api_port(root: &Value) -> Option<u16> {
 }
 
 fn parse_traffic_stats(output: &str) -> Vec<UserTraffic> {
+    // Output is JSON: {"stat": [{"name": "user>>>email>>>traffic>>>uplink", "value": 123}, ...]}
     let mut traffic_map: HashMap<String, (u64, u64)> = HashMap::new();
-    let mut current_name: Option<String> = None;
-    let mut current_value: Option<u64> = None;
 
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("name:") {
-            if let Some(start) = trimmed.find('"') {
-                if let Some(end) = trimmed[start + 1..].find('"') {
-                    current_name = Some(trimmed[start + 1..start + 1 + end].to_string());
-                }
-            }
-        } else if trimmed.starts_with("value:") {
-            if let Some(val_str) = trimmed.strip_prefix("value:") {
-                current_value = val_str.trim().parse::<u64>().ok();
-            }
-        }
+    let root: Value = match serde_json::from_str(output) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
 
-        if trimmed == ">" || trimmed == "}" {
-            if let (Some(ref name), Some(value)) = (&current_name, current_value) {
-                // name format: "user>>>email>>>traffic>>>uplink"
-                let parts: Vec<&str> = name.split(">>>").collect();
-                if parts.len() == 4 && parts[0] == "user" && parts[2] == "traffic" {
-                    let email = parts[1].to_string();
-                    let entry = traffic_map.entry(email).or_insert((0, 0));
-                    match parts[3] {
-                        "uplink" => entry.0 = value,
-                        "downlink" => entry.1 = value,
-                        _ => {}
-                    }
-                }
+    let stats = match root.get("stat").and_then(Value::as_array) {
+        Some(arr) => arr,
+        None => return vec![],
+    };
+
+    for entry in stats {
+        let name = match entry.get("name").and_then(Value::as_str) {
+            Some(n) => n,
+            None => continue,
+        };
+        let value = entry.get("value").and_then(Value::as_u64).unwrap_or(0);
+
+        // name format: "user>>>email>>>traffic>>>uplink"
+        let parts: Vec<&str> = name.split(">>>").collect();
+        if parts.len() == 4 && parts[0] == "user" && parts[2] == "traffic" {
+            let email = parts[1].to_string();
+            let entry = traffic_map.entry(email).or_insert((0, 0));
+            match parts[3] {
+                "uplink" => entry.0 = value,
+                "downlink" => entry.1 = value,
+                _ => {}
             }
-            current_name = None;
-            current_value = None;
         }
     }
 
