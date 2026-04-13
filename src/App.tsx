@@ -246,15 +246,9 @@ function App() {
   return (
     <TooltipProvider delayDuration={120}>
       <div className="flex h-screen text-foreground">
-        {/* ── Draggable title bar region ── */}
-        <div
-          data-tauri-drag-region
-          className="absolute inset-x-0 top-0 z-50 h-8"
-        />
-
         {/* ── Sidebar ── */}
-        <aside className="flex w-[220px] shrink-0 flex-col border-r border-border/60 bg-panel/75 px-3 pb-3 pt-8 backdrop-blur-xl">
-          <div className="flex items-center justify-between px-2 py-1">
+        <aside className="flex w-[220px] shrink-0 flex-col border-r border-border/60 bg-panel/75 px-3 pb-3 backdrop-blur-xl">
+          <div data-tauri-drag-region className="flex items-center justify-between px-2 pb-1 pt-3" style={{ paddingTop: "env(titlebar-area-height, 40px)" }}>
             <div className="flex items-center gap-2">
               <div
                 className={cn(
@@ -334,7 +328,7 @@ function App() {
 
         {/* ── Main ── */}
         <main className="relative flex flex-1 flex-col overflow-hidden">
-          <header className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 pb-3 pt-8">
+          <header data-tauri-drag-region className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 pb-3" style={{ paddingTop: "env(titlebar-area-height, 40px)" }}>
             <h2 className="font-heading text-2xl leading-none">{t(currentNav.labelKey)}</h2>
             <Button
               variant="outline"
