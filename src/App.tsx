@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react"
+import { invoke } from "@tauri-apps/api/core"
+import { startTransition, useEffect, useMemo, useState } from "react"
 import type { LucideIcon } from "lucide-react"
 import {
   Archive,
@@ -20,6 +21,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { TooltipProvider } from "@/components/ui/tooltip"
+import type { XraySnapshot } from "@/lib/xray"
 import { cn } from "@/lib/utils"
 
 type PageId =
@@ -48,21 +50,54 @@ const navItems: NavItem[] = [
   { id: "settings", label: "Settings", hint: "Local preferences", icon: Settings2 },
 ]
 
-const currentState = {
-  profile: "Home Mac",
-  serviceStatus: "Running",
-  publicIp: "73.225.148.112",
-  port: "443",
-  users: 5,
+const fallbackSnapshot: XraySnapshot = {
+  installed: false,
+  running: false,
+  notes: [],
 }
 
 function App() {
   const [activePage, setActivePage] = useState<PageId>("dashboard")
+  const [snapshot, setSnapshot] = useState<XraySnapshot | null>(null)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
 
   const activeNavItem = useMemo(
     () => navItems.find((item) => item.id === activePage) ?? navItems[0],
     [activePage],
   )
+
+  const currentSnapshot = snapshot ?? fallbackSnapshot
+  const serviceLabel = getServiceLabel(currentSnapshot)
+  const endpointLabel =
+    currentSnapshot.publicIpv4 && currentSnapshot.listenPort
+      ? `${currentSnapshot.publicIpv4}:${currentSnapshot.listenPort}`
+      : currentSnapshot.listenPort
+        ? `Port ${currentSnapshot.listenPort}`
+        : "Not detected"
+  const userLabel =
+    currentSnapshot.userCount !== undefined && currentSnapshot.userCount !== null
+      ? `${currentSnapshot.userCount} UUIDs`
+      : "Unknown"
+
+  async function refreshSnapshot() {
+    try {
+      setIsRefreshing(true)
+      const next = await invoke<XraySnapshot>("get_xray_snapshot")
+      startTransition(() => {
+        setSnapshot(next)
+        setLoadError(null)
+      })
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Snapshot request failed.")
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
+  useEffect(() => {
+    void refreshSnapshot()
+  }, [])
 
   return (
     <TooltipProvider delayDuration={120}>
@@ -88,9 +123,12 @@ function App() {
                   </div>
 
                   <div className="mt-6 grid gap-3">
-                    <InfoStrip label="Current node" value={currentState.profile} />
-                    <InfoStrip label="Live users" value={`${currentState.users} seats`} />
-                    <InfoStrip label="Inbound" value={`${currentState.publicIp}:${currentState.port}`} />
+                    <InfoStrip
+                      label="Current node"
+                      value={currentSnapshot.binaryPath ? "Local xray detected" : "Waiting for probe"}
+                    />
+                    <InfoStrip label="Live users" value={userLabel} />
+                    <InfoStrip label="Inbound" value={endpointLabel} />
                   </div>
                 </div>
 
@@ -135,17 +173,25 @@ function App() {
 
                 <Card className="border-border/70 bg-secondary/70 shadow-none">
                   <CardHeader className="pb-3">
-                    <CardTitle className="font-heading text-xl">V1 delivery rhythm</CardTitle>
+                    <CardTitle className="font-heading text-xl">Snapshot notes</CardTitle>
                     <CardDescription>
-                      Build the shell first, then wire service inspection, then user management.
+                      The backend now probes local process state, config shape, and network basics.
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-3 text-sm">
-                    <MilestoneRow done label="Docs locked" />
-                    <MilestoneRow done label="Tauri scaffold" />
-                    <MilestoneRow done label="Tokens and UI foundation" />
-                    <MilestoneRow label="Application shell" />
-                    <MilestoneRow label="Local Xray inspection" />
+                    {loadError ? (
+                      <MilestoneRow label={loadError} tone="danger" />
+                    ) : currentSnapshot.notes.length > 0 ? (
+                      currentSnapshot.notes.slice(0, 4).map((note) => (
+                        <MilestoneRow key={note} label={note} tone="warning" />
+                      ))
+                    ) : (
+                      <>
+                        <MilestoneRow done label="Local probe completed" />
+                        <MilestoneRow done={currentSnapshot.installed} label="xray binary detected" />
+                        <MilestoneRow done={currentSnapshot.running} label="Service running" />
+                      </>
+                    )}
                   </CardContent>
                 </Card>
               </div>
@@ -159,26 +205,31 @@ function App() {
                   <div className="space-y-3">
                     <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
                       <Sparkles className="size-3.5 text-primary" />
-                      Phase 4 application shell
+                      Phase 5 local xray inspection
                     </div>
                     <div>
                       <h2 className="font-heading text-4xl leading-[0.95] sm:text-5xl">
                         {activeNavItem.label}
                       </h2>
                       <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground sm:text-base">
-                        {activeNavItem.hint}. The current shell is static by design, but shaped around
-                        the real workflows we already know this app needs.
+                        {activeNavItem.hint}. The shell now pulls a real local snapshot from the Tauri
+                        backend instead of using only static placeholders.
                       </p>
                     </div>
                   </div>
 
                   <div className="flex flex-wrap gap-2">
-                    <Button variant="outline" className="rounded-full px-4">
-                      <RefreshCcw className="size-4" />
-                      Refresh snapshot
+                    <Button
+                      variant="outline"
+                      className="rounded-full px-4"
+                      onClick={() => void refreshSnapshot()}
+                      disabled={isRefreshing}
+                    >
+                      <RefreshCcw className={cn("size-4", isRefreshing && "animate-spin")} />
+                      {isRefreshing ? "Refreshing..." : "Refresh snapshot"}
                     </Button>
                     <Button className="rounded-full px-4">
-                      Run diagnostics
+                      Open diagnostics
                       <ArrowUpRight className="size-4" />
                     </Button>
                   </div>
@@ -188,26 +239,28 @@ function App() {
                   <StatusChip
                     icon={Server}
                     label="Xray state"
-                    value={currentState.serviceStatus}
-                    hint="brew service healthy"
+                    value={serviceLabel}
+                    hint={currentSnapshot.version ?? "Version not detected"}
                   />
                   <StatusChip
                     icon={Globe}
                     label="Public endpoint"
-                    value={`${currentState.publicIp}:${currentState.port}`}
-                    hint="IPv4 reachable path"
+                    value={endpointLabel}
+                    hint={currentSnapshot.lanIp ? `LAN ${currentSnapshot.lanIp}` : "LAN IP unknown"}
                   />
                   <StatusChip
                     icon={Users}
                     label="Friend slots"
-                    value={`${currentState.users} active UUIDs`}
-                    hint="one UUID per person"
+                    value={userLabel}
+                    hint={currentSnapshot.configPath ?? "Config path unknown"}
                   />
                 </div>
               </header>
 
               <ScrollArea className="flex-1">
-                <div className="px-5 py-5 sm:px-8 lg:px-10 lg:py-8">{renderPage(activePage)}</div>
+                <div className="px-5 py-5 sm:px-8 lg:px-10 lg:py-8">
+                  {renderPage(activePage, currentSnapshot, loadError)}
+                </div>
               </ScrollArea>
             </div>
           </main>
@@ -217,16 +270,16 @@ function App() {
   )
 }
 
-function renderPage(activePage: PageId) {
+function renderPage(activePage: PageId, snapshot: XraySnapshot, loadError: string | null) {
   switch (activePage) {
     case "dashboard":
-      return <DashboardPage />
+      return <DashboardPage snapshot={snapshot} loadError={loadError} />
     case "users":
-      return <UsersPage />
+      return <UsersPage snapshot={snapshot} />
     case "config":
-      return <ConfigPage />
+      return <ConfigPage snapshot={snapshot} />
     case "diagnostics":
-      return <DiagnosticsPage />
+      return <DiagnosticsPage snapshot={snapshot} loadError={loadError} />
     case "logs":
       return <LogsPage />
     case "backups":
@@ -236,7 +289,13 @@ function renderPage(activePage: PageId) {
   }
 }
 
-function DashboardPage() {
+function DashboardPage({
+  snapshot,
+  loadError,
+}: {
+  snapshot: XraySnapshot
+  loadError: string | null
+}) {
   return (
     <div className="space-y-6">
       <div className="grid gap-6 xl:grid-cols-[1.4fr_0.9fr]">
@@ -252,16 +311,16 @@ function DashboardPage() {
                   The app should answer one question instantly: is this node safe to share right now?
                 </h3>
                 <p className="mt-4 max-w-xl text-sm leading-6 text-muted-foreground sm:text-base">
-                  The first release puts status, user links, REALITY parameters, and failure hints in one
-                  place so you stop bouncing between JSON, router settings, and terminal output.
+                  The backend is already reporting the real binary path, process state, config location,
+                  listen port, public IPv4, and REALITY target. From here we can replace the remaining
+                  placeholders page by page.
                 </p>
 
-                <div className="mt-6 flex flex-wrap gap-2">
-                  <Button className="rounded-full px-4">Inspect current config</Button>
-                  <Button variant="outline" className="rounded-full px-4">
-                    Preview user links
-                  </Button>
-                </div>
+                {loadError ? (
+                  <div className="mt-5 rounded-3xl border border-destructive/25 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                    {loadError}
+                  </div>
+                ) : null}
               </div>
             </div>
           </CardContent>
@@ -269,31 +328,69 @@ function DashboardPage() {
 
         <Card className="border-border/60 bg-secondary/75 shadow-none">
           <CardHeader>
-            <CardTitle className="font-heading text-2xl">First build scope</CardTitle>
-            <CardDescription>
-              Keep the first usable version narrow enough to trust.
-            </CardDescription>
+            <CardTitle className="font-heading text-2xl">Live probe coverage</CardTitle>
+            <CardDescription>What the app already knows from your local machine.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4 text-sm">
-            <ChecklistRow title="Read local config" detail="No manual JSON edits for common changes." />
-            <ChecklistRow title="Show runtime state" detail="Installed, running, port, IP, config path." />
-            <ChecklistRow title="Manage users" detail="Add, remove, label, and share individual UUIDs." />
-            <ChecklistRow title="Validate before save" detail="Fail fast with `xray -test` before restart." />
+            <ChecklistRow
+              title="Install state"
+              detail={snapshot.binaryPath ?? "Binary path not detected yet."}
+            />
+            <ChecklistRow
+              title="Config source"
+              detail={snapshot.configPath ?? "No config path detected in known locations."}
+            />
+            <ChecklistRow
+              title="Network basics"
+              detail={
+                snapshot.publicIpv4
+                  ? `Public IPv4 ${snapshot.publicIpv4}${snapshot.lanIp ? ` · LAN ${snapshot.lanIp}` : ""}`
+                  : "Public IPv4 is currently unavailable."
+              }
+            />
+            <ChecklistRow
+              title="REALITY surface"
+              detail={
+                snapshot.realityTarget
+                  ? `${snapshot.realityTarget}${snapshot.serverName ? ` · ${snapshot.serverName}` : ""}`
+                  : "REALITY target not parsed from current config."
+              }
+            />
           </CardContent>
         </Card>
       </div>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-        <MetricCard label="Profile" value="Home Mac" detail="Single local node" />
-        <MetricCard label="Share links" value="5" detail="One per friend" />
-        <MetricCard label="Reality target" value="Microsoft" detail="SNI aligned" />
-        <MetricCard label="Restore points" value="Planned" detail="Before every write" />
+        <MetricCard
+          label="Process"
+          value={snapshot.pid ? `PID ${snapshot.pid}` : snapshot.running ? "Running" : "Offline"}
+          detail={snapshot.version ?? "Version unavailable"}
+        />
+        <MetricCard
+          label="Share links"
+          value={
+            snapshot.userCount !== undefined && snapshot.userCount !== null
+              ? String(snapshot.userCount)
+              : "Unknown"
+          }
+          detail="One UUID per friend"
+        />
+        <MetricCard
+          label="REALITY target"
+          value={snapshot.serverName ?? "Unknown"}
+          detail={snapshot.realityTarget ?? "Target not parsed"}
+        />
+        <MetricCard
+          label="Listen port"
+          value={snapshot.listenPort ? String(snapshot.listenPort) : "Unknown"}
+          detail="Parsed from current config"
+        />
       </div>
     </div>
   )
 }
 
-function UsersPage() {
+function UsersPage({ snapshot }: { snapshot: XraySnapshot }) {
   const previewUsers = [
     { name: "friend-1", note: "Primary test account", state: "Healthy" },
     { name: "friend-2", note: "Mobile only", state: "Needs note" },
@@ -307,7 +404,11 @@ function UsersPage() {
           <div>
             <CardTitle className="font-heading text-3xl">User roster</CardTitle>
             <CardDescription>
-              Individual UUIDs are the minimum viable control boundary for a small private node.
+              The current config reports{" "}
+              {snapshot.userCount !== undefined && snapshot.userCount !== null
+                ? `${snapshot.userCount} configured client slots`
+                : "an unknown number of client slots"}
+              .
             </CardDescription>
           </div>
           <Button className="rounded-full px-4">Add user</Button>
@@ -357,18 +458,26 @@ function UsersPage() {
   )
 }
 
-function ConfigPage() {
+function ConfigPage({ snapshot }: { snapshot: XraySnapshot }) {
   return (
     <div className="grid gap-6 xl:grid-cols-3">
       <ConfigBlock
         title="Inbound"
         description="The local listener and its exposure model."
-        lines={["Protocol: VLESS", "Port: 443", "Flow: xtls-rprx-vision"]}
+        lines={[
+          "Protocol: VLESS",
+          `Port: ${snapshot.listenPort ?? "Unknown"}`,
+          `Users: ${snapshot.userCount ?? "Unknown"}`,
+        ]}
       />
       <ConfigBlock
         title="REALITY"
         description="Parameters that must stay aligned with client import data."
-        lines={["Target: www.microsoft.com:443", "SNI: www.microsoft.com", "shortId: 753bd0a1"]}
+        lines={[
+          `Target: ${snapshot.realityTarget ?? "Unknown"}`,
+          `SNI: ${snapshot.serverName ?? "Unknown"}`,
+          `Config path: ${snapshot.configPath ?? "Unknown"}`,
+        ]}
       />
       <ConfigBlock
         title="Config safety"
@@ -379,33 +488,62 @@ function ConfigPage() {
   )
 }
 
-function DiagnosticsPage() {
+function DiagnosticsPage({
+  snapshot,
+  loadError,
+}: {
+  snapshot: XraySnapshot
+  loadError: string | null
+}) {
   return (
     <div className="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
       <Card className="border-border/60 bg-panel/80 shadow-panel">
         <CardHeader>
-          <CardTitle className="font-heading text-3xl">Failure map</CardTitle>
+          <CardTitle className="font-heading text-3xl">Machine snapshot</CardTitle>
           <CardDescription>
-            Diagnostics should shorten the path from “it doesn&apos;t work” to the actual cause.
+            The diagnostics page now starts from observed local state instead of manual assumptions.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 sm:grid-cols-2">
-          <DiagnosticHint title="Import type mismatch" detail="The client is treating a VLESS link as JSON." />
-          <DiagnosticHint title="Port forwarding missing" detail="Router not sending 443 to the local machine." />
-          <DiagnosticHint title="SNI mismatch" detail="Client `sni` does not match server `serverNames`." />
-          <DiagnosticHint title="Outdated client" detail="No support for REALITY + Vision on the device." />
+          <DiagnosticHint
+            title="Binary"
+            detail={snapshot.installed ? snapshot.binaryPath ?? "Installed" : "xray not found in PATH."}
+          />
+          <DiagnosticHint
+            title="Service"
+            detail={snapshot.running ? `Running${snapshot.pid ? ` as PID ${snapshot.pid}` : ""}` : "Not running"}
+          />
+          <DiagnosticHint
+            title="Endpoint"
+            detail={
+              snapshot.publicIpv4
+                ? `${snapshot.publicIpv4}${snapshot.listenPort ? `:${snapshot.listenPort}` : ""}`
+                : "Public IPv4 unavailable"
+            }
+          />
+          <DiagnosticHint
+            title="Config"
+            detail={snapshot.configPath ?? "No config file detected in standard locations."}
+          />
         </CardContent>
       </Card>
 
       <Card className="border-border/60 bg-secondary/75 shadow-none">
         <CardHeader>
-          <CardTitle className="font-heading text-2xl">Checks to automate</CardTitle>
+          <CardTitle className="font-heading text-2xl">Follow-up probes</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4 text-sm">
-          <ChecklistRow title="Installed?" detail="Detect `xray` binary and version." />
-          <ChecklistRow title="Listening?" detail="Verify the configured local port is open." />
-          <ChecklistRow title="Reachable?" detail="Compare public IP, WAN IP, and forwardability." />
-          <ChecklistRow title="Valid config?" detail="Surface `xray -test` output cleanly." />
+          {loadError ? <ChecklistRow title="Backend error" detail={loadError} /> : null}
+          {snapshot.notes.length > 0 ? (
+            snapshot.notes.map((note) => <ChecklistRow key={note} title="Probe note" detail={note} />)
+          ) : (
+            <>
+              <ChecklistRow title="Installed?" detail="Detected from PATH and version output." />
+              <ChecklistRow title="Running?" detail="Read from brew services or process table." />
+              <ChecklistRow title="Config path?" detail="Read from standard local locations." />
+              <ChecklistRow title="Network basics?" detail="Public IPv4 and LAN IP are probed separately." />
+            </>
+          )}
         </CardContent>
       </Card>
     </div>
@@ -588,21 +726,36 @@ function ChecklistRow({
 function MilestoneRow({
   label,
   done = false,
+  tone = "neutral",
 }: {
   label: string
   done?: boolean
+  tone?: "neutral" | "warning" | "danger"
 }) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-2xl bg-background/80 px-3 py-2.5">
-      <span>{label}</span>
+      <span className="text-sm">{label}</span>
       <Badge
         variant="secondary"
-        className={cn("rounded-full", done ? "bg-primary/12 text-primary" : "text-muted-foreground")}
+        className={cn(
+          "rounded-full",
+          done && "bg-primary/12 text-primary",
+          tone === "warning" && "bg-secondary text-secondary-foreground",
+          tone === "danger" && "bg-destructive/12 text-destructive",
+        )}
       >
-        {done ? "Done" : "Queued"}
+        {done ? "Done" : tone === "danger" ? "Error" : tone === "warning" ? "Note" : "Queued"}
       </Badge>
     </div>
   )
+}
+
+function getServiceLabel(snapshot: XraySnapshot) {
+  if (!snapshot.installed) {
+    return "Missing"
+  }
+
+  return snapshot.running ? "Running" : "Stopped"
 }
 
 export default App
