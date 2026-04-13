@@ -80,6 +80,7 @@
     "showQr": "Show QR code",
     "editLabel": "Edit label",
     "editNote": "Edit note",
+    "save": "Save",
     "noNote": "No note",
     "deleteUser": "Delete user",
     "createTitle": "Create VLESS user",

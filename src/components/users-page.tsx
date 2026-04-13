@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
-import { Check, ClipboardCopy, Copy, QrCode, RefreshCcw, Trash2, UserPlus, X } from "lucide-react"
+import { ClipboardCopy, Copy, Pencil, QrCode, RefreshCcw, Trash2, UserPlus } from "lucide-react"
 import QRCode from "react-qr-code"
 
 import { Banner } from "@/components/banner"
@@ -65,10 +65,7 @@ export function UsersPage({
   const [submitBusy, setSubmitBusy] = useState(false)
   const [actionBusyId, setActionBusyId] = useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ManagedUser | null>(null)
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [editValue, setEditValue] = useState("")
-  const [editingNoteId, setEditingNoteId] = useState<string | null>(null)
-  const [noteValue, setNoteValue] = useState("")
+  const [editingUser, setEditingUser] = useState<{ id: string; label: string; note: string } | null>(null)
   const qrRef = useRef<HTMLDivElement>(null)
 
   const handleCopyQr = useCallback(async () => {
@@ -127,19 +124,12 @@ export function UsersPage({
     }
   }
 
-  async function saveLabel() {
-    if (!editingId || !editValue.trim()) return
+  async function saveEdit() {
+    if (!editingUser || !editingUser.label.trim()) return
     try {
-      await onUpdateLabel(editingId, editValue.trim())
-      setEditingId(null)
-    } catch { /* error shown by parent */ }
-  }
-
-  async function saveNote() {
-    if (!editingNoteId) return
-    try {
-      await onUpdateNote(editingNoteId, noteValue)
-      setEditingNoteId(null)
+      await onUpdateLabel(editingUser.id, editingUser.label.trim())
+      await onUpdateNote(editingUser.id, editingUser.note)
+      setEditingUser(null)
     } catch { /* error shown by parent */ }
   }
 
@@ -197,34 +187,7 @@ export function UsersPage({
             >
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  {editingId === user.id ? (
-                    <div className="flex items-center gap-1">
-                      <Input
-                        className="h-6 w-32 px-1.5 text-sm"
-                        value={editValue}
-                        onChange={(e) => setEditValue(e.currentTarget.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") void saveLabel()
-                          if (e.key === "Escape") setEditingId(null)
-                        }}
-                        autoFocus
-                      />
-                      <Button variant="ghost" size="icon-xs" onClick={() => void saveLabel()}>
-                        <Check className="size-3" />
-                      </Button>
-                      <Button variant="ghost" size="icon-xs" onClick={() => setEditingId(null)}>
-                        <X className="size-3" />
-                      </Button>
-                    </div>
-                  ) : (
-                    <span
-                      className="cursor-pointer truncate text-sm font-medium hover:underline"
-                      onClick={() => { setEditingId(user.id); setEditValue(user.label) }}
-                      title={t("users.editLabel")}
-                    >
-                      {user.label}
-                    </span>
-                  )}
+                  <span className="truncate text-sm font-medium">{user.label}</span>
                   <Badge variant="secondary" className="shrink-0 rounded-full text-[10px]">
                     {user.flow ?? "xtls-rprx-vision"}
                   </Badge>
@@ -246,38 +209,24 @@ export function UsersPage({
                     )
                   })()}
                 </div>
-                {editingNoteId === user.id ? (
-                  <div className="mt-1 flex items-center gap-1">
-                    <Input
-                      className="h-6 flex-1 px-1.5 text-xs"
-                      value={noteValue}
-                      onChange={(e) => setNoteValue(e.currentTarget.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") void saveNote()
-                        if (e.key === "Escape") setEditingNoteId(null)
-                      }}
-                      placeholder={t("users.noNote")}
-                      autoFocus
-                    />
-                    <Button variant="ghost" size="icon-xs" onClick={() => void saveNote()}>
-                      <Check className="size-3" />
-                    </Button>
-                    <Button variant="ghost" size="icon-xs" onClick={() => setEditingNoteId(null)}>
-                      <X className="size-3" />
-                    </Button>
-                  </div>
-                ) : (
-                  <p
-                    className="mt-0.5 cursor-pointer truncate text-xs text-muted-foreground/60 hover:text-muted-foreground"
-                    onClick={() => { setEditingNoteId(user.id); setNoteValue(user.note ?? "") }}
-                    title={t("users.editNote")}
-                  >
-                    {user.note || t("users.noNote")}
-                  </p>
-                )}
+                <p className="mt-0.5 truncate text-xs text-muted-foreground/60">
+                  {user.note || t("users.noNote")}
+                </p>
               </div>
 
               <div className="flex shrink-0 gap-1">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      onClick={() => setEditingUser({ id: user.id, label: user.label, note: user.note ?? "" })}
+                    >
+                      <Pencil className="size-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("users.editLabel")}</TooltipContent>
+                </Tooltip>
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button variant="ghost" size="icon-xs" onClick={() => void handleCopyLink(user)} disabled={!user.shareLink}>
@@ -394,6 +343,45 @@ export function UsersPage({
           ) : (
             <Banner tone="danger" text={t("users.linkUnavailable")} />
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit dialog */}
+      <Dialog open={Boolean(editingUser)} onOpenChange={(open) => !open && setEditingUser(null)}>
+        <DialogContent className="border-border/70 bg-background sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="font-heading text-xl">{t("users.editLabel")}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="edit-label">{t("users.label")}</Label>
+              <Input
+                id="edit-label"
+                value={editingUser?.label ?? ""}
+                onChange={(e) => setEditingUser((prev) => prev ? { ...prev, label: e.currentTarget.value } : null)}
+                onKeyDown={(e) => { if (e.key === "Enter") void saveEdit() }}
+                autoFocus
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-note">{t("users.note")}</Label>
+              <Textarea
+                id="edit-note"
+                value={editingUser?.note ?? ""}
+                onChange={(e) => setEditingUser((prev) => prev ? { ...prev, note: e.currentTarget.value } : null)}
+                placeholder={t("users.notePlaceholder")}
+                rows={2}
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setEditingUser(null)}>
+                {t("users.cancel")}
+              </Button>
+              <Button onClick={() => void saveEdit()}>
+                {t("users.save")}
+              </Button>
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
 

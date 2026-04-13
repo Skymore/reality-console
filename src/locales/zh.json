@@ -80,6 +80,7 @@
     "showQr": "显示二维码",
     "editLabel": "编辑标签",
     "editNote": "编辑备注",
+    "save": "保存",
     "noNote": "暂无备注",
     "deleteUser": "删除用户",
     "createTitle": "创建 VLESS 用户",
