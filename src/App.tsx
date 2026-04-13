@@ -449,7 +449,7 @@ function App() {
             </div>
           ) : null}
 
-          <ScrollArea className="flex-1">
+          <ScrollArea className="min-h-0 flex-1">
             <div className="px-5 py-4">
               {renderPage({
                 activePage,
