@@ -6,6 +6,7 @@ import type { LucideIcon } from "lucide-react"
 import {
   Archive,
   Check,
+  CircleHelp,
   FileText,
   Languages,
   LayoutDashboard,
@@ -679,12 +680,12 @@ function ConfigPage({ snapshot, showToast }: { snapshot: XraySnapshot; showToast
       <CardContent className="p-0">
         <table className="w-full text-sm">
           <tbody className="divide-y divide-border/60">
-            <StatusRow label={t("config.protocol")} value="VLESS" />
-            <StatusRow label={t("config.port")} value={snapshot.listenPort ? String(snapshot.listenPort) : t("dashboard.unknown")} />
-            <StatusRow label={t("config.users")} value={snapshot.userCount != null ? String(snapshot.userCount) : t("dashboard.unknown")} />
-            <StatusRow label={t("config.realityTarget")} value={snapshot.realityTarget ?? t("dashboard.unknown")} />
-            <StatusRow label={t("config.sni")} value={snapshot.serverName ?? t("dashboard.unknown")} />
-            <StatusRow label={t("config.configPath")} value={snapshot.configPath ?? t("dashboard.unknown")} mono />
+            <StatusRow label={t("config.protocol")} value="VLESS" help={t("config.helpProtocol")} />
+            <StatusRow label={t("config.port")} value={snapshot.listenPort ? String(snapshot.listenPort) : t("dashboard.unknown")} help={t("config.helpPort")} />
+            <StatusRow label={t("config.users")} value={snapshot.userCount != null ? String(snapshot.userCount) : t("dashboard.unknown")} help={t("config.helpUsers")} />
+            <StatusRow label={t("config.realityTarget")} value={snapshot.realityTarget ?? t("dashboard.unknown")} help={t("config.helpRealityTarget")} />
+            <StatusRow label={t("config.sni")} value={snapshot.serverName ?? t("dashboard.unknown")} help={t("config.helpSni")} />
+            <StatusRow label={t("config.configPath")} value={snapshot.configPath ?? t("dashboard.unknown")} mono help={t("config.helpConfigPath")} />
           </tbody>
         </table>
         <div className="border-t border-border/60 px-4 py-3">
@@ -727,14 +728,28 @@ function StatusRow({
   label,
   value,
   mono = false,
+  help,
 }: {
   label: string
   value: string
   mono?: boolean
+  help?: string
 }) {
   return (
     <tr>
-      <td className="whitespace-nowrap px-4 py-2.5 text-muted-foreground">{label}</td>
+      <td className="whitespace-nowrap px-4 py-2.5 text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5">
+          {label}
+          {help ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <CircleHelp className="size-3.5 text-muted-foreground/50" />
+              </TooltipTrigger>
+              <TooltipContent className="max-w-56">{help}</TooltipContent>
+            </Tooltip>
+          ) : null}
+        </span>
+      </td>
       <td className={cn("px-4 py-2.5 text-right font-medium", mono && "font-mono text-xs")}>
         {value}
       </td>
