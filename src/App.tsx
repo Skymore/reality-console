@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core"
+import { getCurrentWindow } from "@tauri-apps/api/window"
 import { startTransition, useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import type { LucideIcon } from "lucide-react"
@@ -87,6 +88,15 @@ function App() {
     if (toastTimer.current) clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToast(null), 2500)
   }, [])
+
+  function startDrag(e: React.MouseEvent) {
+    // Only drag on left click, and not on interactive elements
+    if (e.button !== 0) return
+    const tag = (e.target as HTMLElement).closest("button, a, input, [role=button]")
+    if (tag) return
+    e.preventDefault()
+    getCurrentWindow().startDragging()
+  }
 
   function toggleLocale() {
     const next = i18n.language === "zh" ? "en" : "zh"
@@ -248,7 +258,7 @@ function App() {
       <div className="flex h-screen text-foreground">
         {/* ── Sidebar ── */}
         <aside className="flex w-[220px] shrink-0 flex-col border-r border-border/60 bg-panel/75 px-3 pb-3 backdrop-blur-xl">
-          <div data-tauri-drag-region className="flex items-center justify-between px-2 pb-1 pt-3" style={{ paddingTop: "env(titlebar-area-height, 40px)" }}>
+          <div onMouseDown={startDrag} className="flex cursor-default items-center justify-between px-2 pb-1 pt-3" style={{ paddingTop: "env(titlebar-area-height, 40px)" }}>
             <div className="flex items-center gap-2">
               <div
                 className={cn(
@@ -328,7 +338,7 @@ function App() {
 
         {/* ── Main ── */}
         <main className="relative flex flex-1 flex-col overflow-hidden">
-          <header data-tauri-drag-region className="flex shrink-0 items-center justify-between gap-3 border-b border-border/60 px-5 pb-3" style={{ paddingTop: "env(titlebar-area-height, 40px)" }}>
+          <header onMouseDown={startDrag} className="flex shrink-0 cursor-default items-center justify-between gap-3 border-b border-border/60 px-5 pb-3" style={{ paddingTop: "env(titlebar-area-height, 40px)" }}>
             <h2 className="font-heading text-2xl leading-none">{t(currentNav.labelKey)}</h2>
             <Button
               variant="outline"
