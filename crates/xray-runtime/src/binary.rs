@@ -40,7 +40,7 @@ impl Sha256Digest {
         Ok(Self(bytes))
     }
 
-    fn matches(self, actual: &[u8]) -> bool {
+    pub(crate) fn matches(self, actual: &[u8]) -> bool {
         self.0.as_slice() == actual
     }
 }

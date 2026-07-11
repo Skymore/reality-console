@@ -11,17 +11,47 @@ use std::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
+use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 use xray_runtime::{
-    probe_version, test_config, BinaryValidationError, ExecutionLimits, RealityPrivateKey,
-    RealityTarget, RuntimeError, ServerName, Sha256Digest, ShortId, UserEmail, VerifiedXrayBinary,
-    VlessRealityConfigBuilder, VlessUser, XrayBinarySpec,
+    probe_version, start_managed, test_config, BinaryValidationError, ConfigValidationError,
+    ExecutionLimits, RealityPrivateKey, RealityTarget, RuntimeError, ServerName, Sha256Digest,
+    ShortId, UserEmail, VerifiedXrayBinary, VerifiedXrayConfig, VlessRealityConfigBuilder,
+    VlessUser, XrayBinarySpec, XrayConfigSpec,
 };
 
 struct FakeExecutable {
     directory: TempDir,
     path: PathBuf,
     digest: Sha256Digest,
+}
+
+struct ConfigFile {
+    directory: TempDir,
+    path: PathBuf,
+    digest: Sha256Digest,
+}
+
+impl ConfigFile {
+    fn new(contents: &[u8]) -> Self {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("xray-config.json");
+        fs::write(&path, contents).expect("write Xray config");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("make config owner-only");
+        Self {
+            directory,
+            path,
+            digest: digest(contents),
+        }
+    }
+
+    fn verify(&self) -> VerifiedXrayConfig {
+        XrayConfigSpec::new(&self.path, self.digest)
+            .expect("absolute path")
+            .verify()
+            .expect("verified Xray config")
+    }
 }
 
 impl FakeExecutable {
@@ -97,7 +127,21 @@ fn rendered_empty_access_config() -> xray_runtime::RenderedXrayConfig {
 }
 
 fn short_limits() -> ExecutionLimits {
-    ExecutionLimits::new(Duration::from_secs(1), 1024).expect("valid limits")
+    ExecutionLimits::new(Duration::from_secs(2), 1024).expect("valid limits")
+}
+
+async fn read_created_file(path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) => return contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                assert!(Instant::now() < deadline, "timed out waiting for fake Xray");
+                sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("failed to read fake Xray report: {error}"),
+        }
+    }
 }
 
 #[test]
@@ -277,6 +321,145 @@ async fn runtime_revalidates_checksum_before_each_spawn() {
         error,
         RuntimeError::BinaryValidation(BinaryValidationError::ChecksumMismatch)
     ));
+}
+
+#[tokio::test]
+async fn managed_child_receives_exact_arguments() {
+    let fake = FakeExecutable::new(
+        r#"if [ "$#" -ne 3 ] || [ "$1" != "run" ] || [ "$2" != "-config" ]; then
+  exit 51
+fi
+printf '%s\n' "$#" "$1" "$2" "$3" > "$0.argv"
+exec /bin/sleep 30"#,
+    );
+    let report_path = fake.path.with_extension("argv");
+    let config = ConfigFile::new(b"{\"log\":{}}\n");
+    let binary = fake.verify();
+    let verified_config = config.verify();
+
+    let mut child = start_managed(&binary, &verified_config)
+        .await
+        .expect("managed child starts");
+    assert_ne!(child.pid(), 0);
+    let report = read_created_file(&report_path).await;
+    let arguments: Vec<_> = report.lines().collect();
+    assert_eq!(
+        arguments,
+        ["3", "run", "-config", config.path.to_str().unwrap()]
+    );
+
+    child
+        .kill_and_wait()
+        .await
+        .expect("managed child is killed and reaped");
+}
+
+#[tokio::test]
+async fn managed_start_rejects_config_mutation_before_spawn() {
+    const MUTATED_CONFIG: &[u8] = b"{\"mutated\":true}\n";
+
+    let fake = FakeExecutable::new(
+        r#"printf 'spawned\n' > "$0.spawned"
+exec /bin/sleep 30"#,
+    );
+    let spawn_marker = fake.path.with_extension("spawned");
+    let config = ConfigFile::new(b"{\"original\":true}\n");
+    let verified_config = config.verify();
+    fs::write(&config.path, MUTATED_CONFIG).expect("mutate verified config");
+    fs::set_permissions(&config.path, fs::Permissions::from_mode(0o600))
+        .expect("retain owner-only permissions");
+
+    let error = start_managed(&fake.verify(), &verified_config)
+        .await
+        .expect_err("mutated config must fail revalidation");
+    let message = error.to_string();
+    assert!(matches!(
+        error,
+        RuntimeError::ConfigValidation(ConfigValidationError::ChecksumMismatch)
+    ));
+    assert!(!message.contains(String::from_utf8_lossy(MUTATED_CONFIG).as_ref()));
+    assert!(!message.contains(config.path.to_string_lossy().as_ref()));
+    assert!(!spawn_marker.exists());
+}
+
+#[test]
+fn config_spec_rejects_unsafe_files() {
+    let expected = digest(b"{}\n");
+    let relative_error =
+        XrayConfigSpec::new("relative/config.json", expected).expect_err("relative path must fail");
+    assert!(matches!(
+        relative_error,
+        ConfigValidationError::PathMustBeAbsolute
+    ));
+
+    for mode in [0o400, 0o640, 0o700] {
+        let wrong_mode = ConfigFile::new(b"{}\n");
+        fs::set_permissions(&wrong_mode.path, fs::Permissions::from_mode(mode))
+            .expect("set non-0600 config mode");
+        let error = XrayConfigSpec::new(&wrong_mode.path, wrong_mode.digest)
+            .expect("absolute path")
+            .verify()
+            .expect_err("non-0600 config must fail");
+        assert!(matches!(error, ConfigValidationError::UnsafePermissions));
+    }
+
+    let target = ConfigFile::new(b"{}\n");
+    let link = target.directory.path().join("config-link.json");
+    symlink(&target.path, &link).expect("create config symlink");
+    let error = XrayConfigSpec::new(link, target.digest)
+        .expect("absolute path")
+        .verify()
+        .expect_err("config symlink must fail");
+    assert!(matches!(error, ConfigValidationError::SymlinkNotAllowed));
+
+    let error = XrayConfigSpec::new(target.directory.path(), target.digest)
+        .expect("absolute path")
+        .verify()
+        .expect_err("config directory must fail");
+    assert!(matches!(error, ConfigValidationError::NotRegularFile));
+
+    let mismatch = ConfigFile::new(b"{}\n");
+    let error = XrayConfigSpec::new(&mismatch.path, digest(b"different\n"))
+        .expect("absolute path")
+        .verify()
+        .expect_err("config checksum mismatch must fail");
+    assert!(matches!(error, ConfigValidationError::ChecksumMismatch));
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    for (name, length) in [("empty", 0), ("oversized", 2 * 1024 * 1024 + 1)] {
+        let path = directory.path().join(name);
+        let file = fs::File::create(&path).expect("create bounded test config");
+        file.set_len(length).expect("set sparse config length");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("make config owner-only");
+        let error = XrayConfigSpec::new(&path, expected)
+            .expect("absolute path")
+            .verify()
+            .expect_err("invalid config size must fail before hashing");
+        assert!(matches!(error, ConfigValidationError::InvalidFileSize));
+    }
+}
+
+#[tokio::test]
+async fn managed_child_can_be_forcefully_killed_and_reaped() {
+    let fake = FakeExecutable::new("exec /bin/sleep 30");
+    let config = ConfigFile::new(b"{}\n");
+    let binary = fake.verify();
+    let verified_config = config.verify();
+    let mut child = start_managed(&binary, &verified_config)
+        .await
+        .expect("managed child starts");
+
+    assert!(child.try_wait().expect("poll managed child").is_none());
+    let status = child
+        .kill_and_wait()
+        .await
+        .expect("forcefully kill and reap managed child");
+    assert!(!status.success());
+    assert!(child
+        .try_wait()
+        .expect("poll reaped managed child")
+        .is_some());
 }
 
 #[tokio::test]

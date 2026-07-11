@@ -1,5 +1,5 @@
 use std::{
-    io,
+    fmt, io,
     path::Path,
     process::{ExitStatus, Stdio},
     time::Duration,
@@ -16,12 +16,17 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::{BinaryValidationError, RenderedXrayConfig, VerifiedXrayBinary};
+use crate::{
+    BinaryValidationError, ConfigValidationError, RenderedXrayConfig, VerifiedXrayBinary,
+    VerifiedXrayConfig,
+};
 
 const MAX_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_OUTPUT_BYTES_PER_STREAM: usize = 1024 * 1024;
 const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
 const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const MANAGED_CHILD_OPERATION: &str = "managed child";
+const MANAGED_REAP_OPERATION: &str = "managed child reap";
 
 /// Explicit process limits used by both runtime probes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +138,7 @@ pub async fn probe_version(
     binary: &VerifiedXrayBinary,
     limits: ExecutionLimits,
 ) -> Result<VersionProbe, RuntimeError> {
-    revalidate(binary).await?;
+    revalidate_binary(binary).await?;
 
     let mut command = Command::new(binary.path());
     command.arg("version");
@@ -173,7 +178,7 @@ pub async fn test_config(
     if config.len() > MAX_CONFIG_BYTES {
         return Err(RuntimeError::ConfigTooLarge);
     }
-    revalidate(binary).await?;
+    revalidate_binary(binary).await?;
     let config_file = write_private_config(config)?;
 
     let mut command = Command::new(binary.path());
@@ -193,6 +198,128 @@ pub async fn test_config(
     })
 }
 
+/// Starts `xray run -config <path>` as a constrained long-running child.
+///
+/// Binary and configuration checksums are revalidated concurrently on blocking
+/// workers immediately before the spawn. The command uses the explicit absolute
+/// binary path directly, clears the environment, nulls all standard streams, and
+/// is configured to be killed if its handle is dropped.
+///
+/// # Errors
+///
+/// Returns a stable, redacted [`RuntimeError`] when revalidation or process
+/// startup fails.
+pub async fn start_managed(
+    binary: &VerifiedXrayBinary,
+    verified_config: &VerifiedXrayConfig,
+) -> Result<ManagedXrayChild, RuntimeError> {
+    tokio::try_join!(
+        revalidate_binary(binary),
+        revalidate_config(verified_config)
+    )?;
+
+    let mut command = Command::new(binary.path());
+    command
+        .arg("run")
+        .arg("-config")
+        .arg(verified_config.path())
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Some(directory) = verified_config.path().parent() {
+        command.current_dir(directory);
+    }
+
+    let child = command
+        .spawn()
+        .map_err(|source| RuntimeError::SpawnFailed {
+            operation: MANAGED_CHILD_OPERATION,
+            source,
+        })?;
+    let pid = child.id().ok_or(RuntimeError::MissingProcessId)?;
+    Ok(ManagedXrayChild { child, pid })
+}
+
+/// A constrained long-running Xray child owned by the caller.
+///
+/// Dropping this value requests forceful termination through Tokio's
+/// `kill_on_drop` behavior. Call [`Self::kill_and_wait`] when deterministic
+/// bounded reaping is required.
+pub struct ManagedXrayChild {
+    child: Child,
+    pid: u32,
+}
+
+impl ManagedXrayChild {
+    /// Returns the process identifier assigned at spawn time.
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Returns the exit status without blocking, if the child has exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable, redacted [`RuntimeError`] if the operating-system status
+    /// check fails.
+    pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, RuntimeError> {
+        self.child
+            .try_wait()
+            .map_err(|source| RuntimeError::ProcessIoFailed {
+                operation: MANAGED_CHILD_OPERATION,
+                source,
+            })
+    }
+
+    /// Forcefully kills the child and waits at most one second to reap it.
+    ///
+    /// This is deliberately not a graceful `SIGTERM` protocol. If the child has
+    /// already exited, its status is returned without sending a signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable, redacted [`RuntimeError`] if kill, wait, or the bounded
+    /// reap fails.
+    pub async fn kill_and_wait(&mut self) -> Result<ExitStatus, RuntimeError> {
+        if let Some(status) = self.try_wait()? {
+            return Ok(status);
+        }
+
+        if let Err(source) = self.child.start_kill() {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            return Err(RuntimeError::ProcessIoFailed {
+                operation: MANAGED_CHILD_OPERATION,
+                source,
+            });
+        }
+
+        timeout(CHILD_REAP_TIMEOUT, self.child.wait())
+            .await
+            .map_err(|_| RuntimeError::TimedOut {
+                operation: MANAGED_REAP_OPERATION,
+                timeout_ms: CHILD_REAP_TIMEOUT.as_millis(),
+            })?
+            .map_err(|source| RuntimeError::ProcessIoFailed {
+                operation: MANAGED_REAP_OPERATION,
+                source,
+            })
+    }
+}
+
+impl fmt::Debug for ManagedXrayChild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedXrayChild")
+            .field("pid", &self.pid)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Stable, redacted failures from bounded Xray subprocess operations.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -205,9 +332,15 @@ pub enum RuntimeError {
     /// Explicit binary validation failed.
     #[error(transparent)]
     BinaryValidation(#[from] BinaryValidationError),
+    /// Explicit configuration-file validation failed.
+    #[error(transparent)]
+    ConfigValidation(#[from] ConfigValidationError),
     /// The blocking checksum task could not be completed.
     #[error("Xray binary verification task failed")]
     VerificationTaskFailed,
+    /// The blocking configuration checksum task could not be completed.
+    #[error("Xray configuration verification task failed")]
+    ConfigVerificationTaskFailed,
     /// A private temporary config could not be prepared.
     #[error("private Xray configuration file could not be prepared")]
     TempConfigFailed {
@@ -224,6 +357,9 @@ pub enum RuntimeError {
         #[source]
         source: io::Error,
     },
+    /// A spawned child did not expose its process identifier.
+    #[error("Xray managed child process identifier was unavailable")]
+    MissingProcessId,
     /// A pipe disappeared unexpectedly after spawn.
     #[error("Xray {operation} output pipe was unavailable")]
     MissingPipe {
@@ -296,12 +432,20 @@ enum ReadFailure {
     Io(io::Error),
 }
 
-async fn revalidate(binary: &VerifiedXrayBinary) -> Result<(), RuntimeError> {
+async fn revalidate_binary(binary: &VerifiedXrayBinary) -> Result<(), RuntimeError> {
     let binary = binary.clone();
     tokio::task::spawn_blocking(move || binary.revalidate())
         .await
         .map_err(|_| RuntimeError::VerificationTaskFailed)?
         .map_err(RuntimeError::BinaryValidation)
+}
+
+async fn revalidate_config(config: &VerifiedXrayConfig) -> Result<(), RuntimeError> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || config.revalidate())
+        .await
+        .map_err(|_| RuntimeError::ConfigVerificationTaskFailed)?
+        .map_err(RuntimeError::ConfigValidation)
 }
 
 fn write_private_config(config: &RenderedXrayConfig) -> Result<NamedTempFile, RuntimeError> {
