@@ -295,8 +295,12 @@ signed only by the compromised key.
   bypassed.
 - Requests include bounded sizes, deadlines, replay-resistant nonces or idempotency keys, and rate
   limits. Authentication is performed before expensive parsing or work where possible.
-- Local UI-to-backend calls use Tauri IPC or loopback with an unguessable session boundary. The
-  renderer is treated as untrusted input and receives no secrets it does not need to display.
+- Local UI-to-application-backend calls use Tauri IPC with an allowlisted command surface. Local
+  backend-to-Node-Host calls use OS IPC with restrictive filesystem or named-pipe ACLs and peer
+  identity checks; the macOS preview uses a 0600 Unix socket inside the 0700 node data directory
+  plus `getpeereid`. Frames, time, concurrency, schemas, and methods are bounded. The current agent
+  method is read-only status and returns no secret or raw error. The renderer remains untrusted
+  input and receives no secret it does not need to display.
 - Logs contain request IDs and stable internal IDs, not bearer tokens, private keys, full profile
   URIs, authorization headers, cookies, or plaintext configuration.
 

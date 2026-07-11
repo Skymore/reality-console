@@ -7,6 +7,9 @@ mod background;
 mod background_macos;
 mod bootstrap;
 mod enrollment;
+mod local_api;
+#[cfg(target_os = "macos")]
+mod local_api_macos;
 mod mapping;
 mod router_protocol;
 mod service;
@@ -360,6 +363,10 @@ pub use bootstrap::{
     bootstrap, bootstrap_and_install_user_service, BootstrapRequest, BootstrapServiceOutcome,
 };
 pub use enrollment::join;
+pub use local_api::{
+    query_local_service_status, LocalServiceError, LocalServiceErrorCode, LocalServicePhase,
+    LocalServiceStatus,
+};
 pub use mapping::{RouterMappingState, RouterMappingStatus};
 pub use service::{run, run_until, SyncLoopOptions};
 pub use sync::sync_once;

@@ -57,8 +57,10 @@ The optional probe-worker contract is implemented and dry-run deployable. Contro
 invoke it in explicit `remote-http` mode. Node Host also has a macOS private-preview user
 `LaunchAgent` lifecycle: setup can enroll and register the background process as one retryable
 operation, service replacement rolls back on failure, and status/removal never expose or delete
-node credentials. This preview path requires a logged-in user and does not prevent sleep; signed
-system packages and the end-to-end VLESS + REALITY publication canary remain operational gaps.
+node credentials. Its same-user, status-only Unix IPC lets the UI read live service, runtime,
+revision, mapping, and stable error state without opening the service-owned database. This preview
+path requires a logged-in user and does not prevent sleep; signed system packages and the
+end-to-end VLESS + REALITY publication canary remain operational gaps.
 
 ## Authoritative Documentation
 
@@ -141,6 +143,10 @@ node-host bootstrap \
 
 # Safe registration state; this is not endpoint reachability status.
 node-host service status
+
+# Live local process/data-plane state; Control still owns approval and endpoint verification.
+node-host service live-status \
+  --data-dir "$HOME/Library/Application Support/Private Network/Node Host/state"
 ```
 
 The backend `BootstrapRequest::from_invitation_json` path keeps the invitation in memory for a

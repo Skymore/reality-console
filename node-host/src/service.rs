@@ -1,13 +1,20 @@
 use crate::activation::{ActivationOptions, XraySupervisor};
+use crate::local_api::{
+    phase_for_runtime, LocalServiceError, LocalServiceErrorCode, LocalServicePhase,
+    LocalServiceStatus, LocalStatusServer,
+};
 use crate::mapping::RouterMappingSupervisor;
 use crate::{
     status_locked, sync::sync_once_locked_with_runtime_probe, DataDirLock, EnrollmentState,
 };
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
+use control_protocol::node::NodeRuntimeState;
 use rand_core::{OsRng, RngCore as _};
 use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
+use uuid::Uuid;
 
 const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
@@ -21,6 +28,12 @@ enum ServiceEvent {
         cycle: Result<()>,
     },
     Cycle(Result<()>),
+}
+
+enum WaitEvent {
+    Deadline,
+    Shutdown(Result<()>),
+    RuntimeFailed,
 }
 
 /// Timing policy for the resilient outbound synchronization loop.
@@ -86,30 +99,92 @@ where
 {
     let options = options.validate()?;
     let _lock = DataDirLock::acquire(data_dir, false)?;
-    if status_locked(data_dir)?.enrollment_state != EnrollmentState::Enrolled {
+    let initial_host = status_locked(data_dir)?;
+    if initial_host.enrollment_state != EnrollmentState::Enrolled {
         bail!("node host must be enrolled before starting its sync service");
     }
     let mut supervisor = XraySupervisor::new(ActivationOptions::default())?;
     let mut router_mapping = RouterMappingSupervisor::new();
+    let service_instance_id = Uuid::new_v4();
+    let initial_status = LocalServiceStatus::from_host(
+        service_instance_id,
+        &initial_host,
+        LocalServicePhase::Starting,
+        NodeRuntimeState::Idle,
+        None,
+    )?;
+    let local_status = LocalStatusServer::start(data_dir, initial_status)?;
     if let Err(recovery_error) = supervisor.recover(data_dir).await {
+        publish_local_status(
+            &local_status,
+            service_instance_id,
+            data_dir,
+            &mut supervisor,
+            Some(LocalServicePhase::Retrying),
+            Some(LocalServiceError::now(
+                LocalServiceErrorCode::XrayRecoveryFailed,
+            )),
+        );
         if let Err(cleanup_error) =
-            shutdown_services(data_dir, &mut router_mapping, &mut supervisor).await
+            shutdown_all(data_dir, &mut router_mapping, &mut supervisor, local_status).await
         {
-            return Err(cleanup_error).context("service cleanup failed after Xray recovery error");
+            return Err(anyhow!(
+                "Xray recovery failed ({recovery_error:#}); service cleanup also failed ({cleanup_error:#})"
+            ));
         }
         return Err(recovery_error);
     }
+    publish_local_status(
+        &local_status,
+        service_instance_id,
+        data_dir,
+        &mut supervisor,
+        None,
+        None,
+    );
 
+    run_service_loop(
+        data_dir,
+        options,
+        shutdown,
+        supervisor,
+        router_mapping,
+        local_status,
+        service_instance_id,
+    )
+    .await
+}
+
+async fn run_service_loop<F>(
+    data_dir: &Path,
+    options: SyncLoopOptions,
+    shutdown: F,
+    mut supervisor: XraySupervisor,
+    mut router_mapping: RouterMappingSupervisor,
+    local_status: LocalStatusServer,
+    service_instance_id: Uuid,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
     tokio::pin!(shutdown);
     let mut backoff = options.initial_backoff;
+    let mut last_error = None;
     loop {
+        publish_local_status(
+            &local_status,
+            service_instance_id,
+            data_dir,
+            &mut supervisor,
+            Some(LocalServicePhase::Syncing),
+            last_error.clone(),
+        );
         let event = {
             let cycle = run_cycle(data_dir, &mut supervisor, &mut router_mapping);
             tokio::pin!(cycle);
             tokio::select! {
                 signal = &mut shutdown => {
-                    // Network mapping side effects are finite but not cancellation-safe.
-                    // Finish the bounded cycle so shutdown can release any committed lease.
+                    // Mapping side effects are finite but not cancellation-safe.
                     let cycle = cycle.await;
                     ServiceEvent::Shutdown { signal, cycle }
                 }
@@ -120,46 +195,170 @@ where
             ServiceEvent::Shutdown { signal, cycle } => {
                 if let Err(error) = cycle {
                     tracing::warn!(error = %error, "node cycle failed while shutdown was pending");
+                    last_error = Some(LocalServiceError::now(
+                        LocalServiceErrorCode::SyncCycleFailed,
+                    ));
                 }
-                shutdown_services(data_dir, &mut router_mapping, &mut supervisor).await?;
-                return signal;
+                return finish_shutdown(
+                    signal,
+                    data_dir,
+                    &mut router_mapping,
+                    &mut supervisor,
+                    local_status,
+                    service_instance_id,
+                    last_error,
+                )
+                .await;
             }
             ServiceEvent::Cycle(result) => result,
         };
-        let base_delay = match result {
-            Ok(()) => {
-                backoff = options.initial_backoff;
-                options.success_interval
+        let (base_delay, cycle_error) = record_cycle_result(result, options, &mut backoff);
+        last_error = cycle_error;
+        publish_local_status(
+            &local_status,
+            service_instance_id,
+            data_dir,
+            &mut supervisor,
+            last_error.as_ref().map(|_| LocalServicePhase::Retrying),
+            last_error.clone(),
+        );
+        match wait_for_next_cycle(
+            data_dir,
+            &mut supervisor,
+            &mut router_mapping,
+            shutdown.as_mut(),
+            base_delay,
+        )
+        .await
+        {
+            WaitEvent::Deadline => {}
+            WaitEvent::RuntimeFailed => {
+                last_error = Some(LocalServiceError::now(
+                    LocalServiceErrorCode::RuntimeHealthFailed,
+                ));
+                publish_local_status(
+                    &local_status,
+                    service_instance_id,
+                    data_dir,
+                    &mut supervisor,
+                    Some(LocalServicePhase::Retrying),
+                    last_error.clone(),
+                );
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "node synchronization failed; retrying");
-                let current = backoff;
-                backoff = backoff.saturating_mul(2).min(options.max_backoff);
-                current
-            }
-        };
-        let deadline = tokio::time::Instant::now() + jitter(base_delay, OsRng.next_u64());
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let wait = (deadline - now).min(RUNTIME_POLL_INTERVAL);
-            tokio::select! {
-                shutdown_result = &mut shutdown => {
-                    shutdown_services(data_dir, &mut router_mapping, &mut supervisor).await?;
-                    return shutdown_result;
-                }
-                () = tokio::time::sleep(wait) => {}
-            }
-            if let Err(error) = supervisor.poll(data_dir).await {
-                if let Err(mapping_error) = router_mapping.reconcile(data_dir, None).await {
-                    tracing::warn!(error = %mapping_error, "router mapping cleanup failed after runtime health failure");
-                }
-                tracing::warn!(error = %error, "managed Xray health check failed; retrying");
-                break;
+            WaitEvent::Shutdown(signal) => {
+                return finish_shutdown(
+                    signal,
+                    data_dir,
+                    &mut router_mapping,
+                    &mut supervisor,
+                    local_status,
+                    service_instance_id,
+                    last_error,
+                )
+                .await;
             }
         }
+    }
+}
+
+fn record_cycle_result(
+    result: Result<()>,
+    options: SyncLoopOptions,
+    backoff: &mut Duration,
+) -> (Duration, Option<LocalServiceError>) {
+    match result {
+        Ok(()) => {
+            *backoff = options.initial_backoff;
+            (options.success_interval, None)
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "node synchronization failed; retrying");
+            let current = *backoff;
+            *backoff = backoff.saturating_mul(2).min(options.max_backoff);
+            (
+                current,
+                Some(LocalServiceError::now(
+                    LocalServiceErrorCode::SyncCycleFailed,
+                )),
+            )
+        }
+    }
+}
+
+async fn wait_for_next_cycle<F>(
+    data_dir: &Path,
+    supervisor: &mut XraySupervisor,
+    router_mapping: &mut RouterMappingSupervisor,
+    mut shutdown: Pin<&mut F>,
+    base_delay: Duration,
+) -> WaitEvent
+where
+    F: Future<Output = Result<()>>,
+{
+    let deadline = tokio::time::Instant::now() + jitter(base_delay, OsRng.next_u64());
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return WaitEvent::Deadline;
+        }
+        let wait = (deadline - now).min(RUNTIME_POLL_INTERVAL);
+        tokio::select! {
+            shutdown_result = shutdown.as_mut() => return WaitEvent::Shutdown(shutdown_result),
+            () = tokio::time::sleep(wait) => {}
+        }
+        if let Err(error) = supervisor.poll(data_dir).await {
+            if let Err(mapping_error) = router_mapping.reconcile(data_dir, None).await {
+                tracing::warn!(error = %mapping_error, "router mapping cleanup failed after runtime health failure");
+            }
+            tracing::warn!(error = %error, "managed Xray health check failed; retrying");
+            return WaitEvent::RuntimeFailed;
+        }
+    }
+}
+
+async fn finish_shutdown(
+    signal: Result<()>,
+    data_dir: &Path,
+    router_mapping: &mut RouterMappingSupervisor,
+    supervisor: &mut XraySupervisor,
+    local_status: LocalStatusServer,
+    service_instance_id: Uuid,
+    last_error: Option<LocalServiceError>,
+) -> Result<()> {
+    publish_local_status(
+        &local_status,
+        service_instance_id,
+        data_dir,
+        supervisor,
+        Some(LocalServicePhase::Stopping),
+        last_error,
+    );
+    shutdown_all(data_dir, router_mapping, supervisor, local_status).await?;
+    signal
+}
+
+fn publish_local_status(
+    local_status: &LocalStatusServer,
+    service_instance_id: Uuid,
+    data_dir: &Path,
+    supervisor: &mut XraySupervisor,
+    phase: Option<LocalServicePhase>,
+    last_error: Option<LocalServiceError>,
+) {
+    let result = (|| -> Result<()> {
+        let runtime_state = supervisor.observe_runtime_state()?;
+        let host = status_locked(data_dir)?;
+        let phase = phase.unwrap_or_else(|| phase_for_runtime(runtime_state));
+        local_status.publish(LocalServiceStatus::from_host(
+            service_instance_id,
+            &host,
+            phase,
+            runtime_state,
+            last_error,
+        )?)
+    })();
+    if let Err(error) = result {
+        tracing::warn!(error = %error, "failed to publish local Node Host status");
     }
 }
 
@@ -194,6 +393,24 @@ async fn shutdown_services(
         return Err(mapping_error).context("router mapping shutdown failed");
     }
     runtime_result
+}
+
+async fn shutdown_all(
+    data_dir: &Path,
+    router_mapping: &mut RouterMappingSupervisor,
+    supervisor: &mut XraySupervisor,
+    local_status: LocalStatusServer,
+) -> Result<()> {
+    let service_result = shutdown_services(data_dir, router_mapping, supervisor).await;
+    let local_status_result = local_status.shutdown().await;
+    match (service_result, local_status_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(service_error), Ok(())) => Err(service_error),
+        (Ok(()), Err(status_error)) => Err(status_error),
+        (Err(service_error), Err(status_error)) => Err(anyhow!(
+            "managed service cleanup failed ({service_error:#}); local status cleanup also failed ({status_error:#})"
+        )),
+    }
 }
 
 fn jitter(base: Duration, random: u64) -> Duration {

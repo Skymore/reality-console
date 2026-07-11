@@ -24,6 +24,8 @@ use control_protocol::secret::Secret;
 use ed25519_dalek::{Signer as _, SigningKey};
 #[cfg(unix)]
 use node_host::configure_xray;
+#[cfg(target_os = "macos")]
+use node_host::query_local_service_status;
 use node_host::{initialize, run_until, status, sync_once, EnrollmentState, SyncLoopOptions};
 use rusqlite::{params, Connection};
 use serde_json::json;
@@ -964,6 +966,20 @@ async fn service_loop_repeats_sync_and_releases_the_data_lock_on_shutdown() {
         .await
     };
     let observe_lock = async {
+        #[cfg(target_os = "macos")]
+        {
+            let mut observed_local_status = false;
+            for _ in 0..40 {
+                if let Ok(local) = query_local_service_status(&data_dir).await {
+                    assert_eq!(local.runtime_state, NodeRuntimeState::Idle);
+                    assert!(!local.xray_configured);
+                    observed_local_status = true;
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+            assert!(observed_local_status);
+        }
         let mut observed_lifetime_lock = false;
         for _ in 0..20 {
             if status(&data_dir).is_err_and(|error| error.to_string().contains("already in use")) {
@@ -992,6 +1008,8 @@ async fn service_loop_repeats_sync_and_releases_the_data_lock_on_shutdown() {
     assert!(generations.len() >= 2);
     assert!(generations.windows(2).all(|pair| pair[0] < pair[1]));
     status(&data_dir).expect("shutdown must release the exclusive data-directory lock");
+    #[cfg(target_os = "macos")]
+    assert!(query_local_service_status(&data_dir).await.is_err());
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

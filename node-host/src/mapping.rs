@@ -7,7 +7,7 @@ use anyhow::{bail, Context as _, Result};
 use control_protocol::id::{EndpointId, NodeId, Revision, Timestamp};
 use control_protocol::node::{EndpointCandidate, EndpointMode, EndpointSource};
 use rusqlite::{params, Connection, OptionalExtension as _, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr as _;
@@ -32,7 +32,7 @@ pub(crate) struct MappingTarget {
 }
 
 /// Safe provider-facing router-mapping lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RouterMappingState {
     /// Automatic router changes were not enabled by the provider.
@@ -50,8 +50,8 @@ pub enum RouterMappingState {
 }
 
 /// Non-secret mapping status suitable for the local UI and CLI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RouterMappingStatus {
     /// Whether the provider enabled automatic finite router mapping.
     pub enabled: bool,

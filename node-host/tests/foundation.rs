@@ -148,6 +148,12 @@ fn cli_exposes_single_cycle_sync_command() {
         .stdout(predicate::str::contains("configure-xray"))
         .stdout(predicate::str::contains("run"))
         .stdout(predicate::str::contains("service"));
+    Command::cargo_bin("node-host")
+        .expect("binary")
+        .args(["service", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("live-status"));
 }
 
 #[test]

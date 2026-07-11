@@ -1,10 +1,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use control_protocol::node::NodeRuntimeState;
 use node_host::{
     bootstrap, bootstrap_and_install_user_service, configure_xray, initialize,
-    install_user_service, join, remove_user_service, run, status, sync_once, user_service_status,
-    BackgroundServiceStatus, BootstrapRequest, HostStatus, SyncLoopOptions,
-    UserServiceInstallRequest,
+    install_user_service, join, query_local_service_status, remove_user_service, run, status,
+    sync_once, user_service_status, BackgroundServiceStatus, BootstrapRequest, HostStatus,
+    LocalServiceStatus, SyncLoopOptions, UserServiceInstallRequest,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -140,6 +141,12 @@ enum ServiceCommand {
     },
     /// Print safe launchd registration state.
     Status,
+    /// Query live service and data-plane state through same-user local IPC.
+    LiveStatus {
+        /// Persistent state directory for the enrolled Node Host.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
     /// Stop and unregister the service while retaining identity and state.
     Remove,
 }
@@ -251,10 +258,51 @@ async fn handle_service_command(command: ServiceCommand) -> Result<()> {
             .await?
         }
         ServiceCommand::Status => user_service_status().await?,
+        ServiceCommand::LiveStatus { data_dir } => {
+            let status = query_local_service_status(&data_dir).await?;
+            print_local_service_status(&status);
+            return Ok(());
+        }
         ServiceCommand::Remove => remove_user_service().await?,
     };
     print_service_status(&service);
     Ok(())
+}
+
+fn print_local_service_status(status: &LocalServiceStatus) {
+    println!("local_schema_version: {}", status.schema_version);
+    println!("service_instance_id: {}", status.service_instance_id);
+    println!("observed_at: {}", status.observed_at);
+    println!("service_phase: {}", status.phase);
+    println!("node_id: {}", status.node_id);
+    println!(
+        "runtime_state: {}",
+        runtime_state_name(status.runtime_state)
+    );
+    match status.last_sync_at {
+        Some(timestamp) => println!("last_sync_at: {timestamp}"),
+        None => println!("last_sync_at: none"),
+    }
+    match status.applied_revision {
+        Some(revision) => println!("applied_revision: {}", revision.get()),
+        None => println!("applied_revision: none"),
+    }
+    match &status.last_error {
+        Some(error) => println!("last_error: {} at {}", error.code, error.occurred_at),
+        None => println!("last_error: none"),
+    }
+}
+
+const fn runtime_state_name(state: NodeRuntimeState) -> &'static str {
+    match state {
+        NodeRuntimeState::Pending => "pending",
+        NodeRuntimeState::Idle => "idle",
+        NodeRuntimeState::Serving => "serving",
+        NodeRuntimeState::ProviderPaused => "providerPaused",
+        NodeRuntimeState::Degraded => "degraded",
+        NodeRuntimeState::Quarantined => "quarantined",
+        NodeRuntimeState::Stopped => "stopped",
+    }
 }
 
 fn print_service_status(status: &BackgroundServiceStatus) {

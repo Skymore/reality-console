@@ -68,7 +68,8 @@ node's Internet exit IP. Cloudflare Tunnel is limited to HTTP control APIs.
   and the Xray child process.
 - Polls desired state with conditional requests and reports state independently.
 - Has a small owner UI that communicates with the local service; the UI is not required to remain
-  open.
+  open. The macOS preview's implemented status channel is a same-UID, bounded, read-only Unix
+  socket; controller approval and endpoint verification remain separate Control-owned state.
 
 ### Connect
 

@@ -121,7 +121,8 @@ The node may open only these surfaces:
 - The admission gate's configured public TCP data port. Xray's corresponding inbound binds to a
   distinct unprivileged loopback port so direct and relayed streams cross the same local
   enforcement boundary without competing for one socket.
-- A loopback-only local IPC endpoint for setup and status.
+- A same-host OS IPC endpoint for setup and status. The macOS preview uses an owner-only Unix
+  domain socket rather than a TCP listener.
 - Outbound TLS connections to the controller, reachability service, update service, and optional
   relay.
 - Local-LAN discovery messages to a router for PCP, NAT-PMP, and UPnP while mapping is enabled.
@@ -269,6 +270,23 @@ command. Paths and ownership are checked, launchctl calls have finite timeouts, 
 changes are locked, and a failed replacement restores and reloads the previous definition. The
 status operation distinguishes definition presence from launchd load state; neither means the node
 has passed external reachability verification.
+
+While `run` owns the exclusive data-directory lock, the preview owner UI reads live state through
+the versioned `query_local_service_status` API instead of opening SQLite. Its Unix socket is inside
+the 0700 node data directory, has mode 0600, and authenticates both sides with macOS peer UID
+credentials. One connection carries one length-prefixed JSON `status` request; request and response
+sizes, connection concurrency, I/O time, and shutdown time are bounded. Unknown schemas, methods,
+fields, oversized frames, unsafe socket ownership, and symlinks fail closed. The response contains
+only the service instance ID, observation time, service/runtime phases, node ID, revision cursors,
+safe activation state, router-mapping status, and categorized error code. It never contains raw
+errors, paths, hashes, invitation data, credentials, generated Xray JSON, or private key material.
+`service live-status` exposes the same contract for diagnostics.
+
+Local IPC success proves that the service process is responsive; it does not prove controller
+approval or Internet reachability. Those remain Control-owned states and must be overlaid by the
+owner UI rather than inferred from `loaded`, `serving`, or an active router lease. The current IPC
+surface is intentionally read-only. Pause, resume, limits, diagnostics, unpair, and uninstall need
+separately versioned methods with local authorization and idempotency before they are exposed.
 
 This preview service is intentionally user-scoped: it survives closing the setup UI and starts at
 that user's next login, but it requires an interactive login session and stops at logout. It makes
