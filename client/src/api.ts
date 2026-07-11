@@ -35,10 +35,42 @@ export type InvitationPreview = {
   fingerprint: string
 }
 
+export type StoredProfile = {
+  id: string
+  name: string
+  serverAddress: string
+  serverPort: number
+  serverName: string
+  flow: string
+  fingerprint: string
+  createdAt: number
+  credentialAvailable: boolean
+}
+
 export function getClientState() {
   return invoke<ClientState>("client_get_state")
 }
 
 export function previewInvitation(invitation: string) {
   return invoke<InvitationPreview>("client_preview_invitation", { invitation })
+}
+
+export function listProfiles() {
+  return invoke<StoredProfile[]>("client_list_profiles")
+}
+
+export function importProfile(invitation: string, name?: string) {
+  return invoke<StoredProfile>("client_import_profile", { invitation, name })
+}
+
+export function renameProfile(profileId: string, name: string) {
+  return invoke<StoredProfile>("client_rename_profile", { profileId, name })
+}
+
+export function deleteProfile(profileId: string) {
+  return invoke<void>("client_delete_profile", { profileId })
+}
+
+export function previewProfile(profileId: string) {
+  return invoke<InvitationPreview>("client_preview_profile", { profileId })
 }
