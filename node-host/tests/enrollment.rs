@@ -16,7 +16,7 @@ use control_protocol::id::{
 };
 use control_protocol::node::{
     CreateNodeInvitationResponse, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
-    NodeCredential, PairingPurpose,
+    NodeCapability, NodeCredential, PairingPurpose,
 };
 use control_protocol::secret::Secret;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -162,6 +162,9 @@ async fn enroll(
     }
     if request.invitation_secret != state.invitation.invitation_secret {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    if request.capabilities != vec![NodeCapability::Xray, NodeCapability::DirectTcp] {
+        return StatusCode::BAD_REQUEST.into_response();
     }
     let invitation = EnrollmentInvitation {
         invitation_id: state.invitation.invitation_id,

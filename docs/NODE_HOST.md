@@ -228,9 +228,11 @@ create a separate owner-only REALITY X25519 seed; SQLite stores its public key a
 but never its private bytes. This command does not generate desired config or start Xray.
 
 `sync-once` performs outbound signed result retries, one signed heartbeat, and one signed
-desired-state fetch. It records heartbeat and complete-cycle timestamps locally and uses a fresh
-nonce for every request. A `200` response is accepted only after closed-schema identity,
-monotonicity, and pinned controller-signature verification. The immutable envelope and its digests
+desired-state fetch. Before heartbeat I/O it durably allocates a positive monotonic generation;
+failed attempts may leave gaps but restart and retry can never reuse a generation for different
+state. This sequence is independent from telemetry. It records heartbeat and complete-cycle
+timestamps locally and uses a fresh nonce for every request. A `200` response is accepted only after
+closed-schema identity, monotonicity, and pinned controller-signature verification. The immutable envelope and its digests
 are committed before a signed `received` result is sent; an interrupted result remains queued and
 is retried before the next heartbeat. When a pinned runtime is available, Node Host checks the
 minimum agent version, renders typed deterministic Xray JSON with the managed inbound bound only to
@@ -944,9 +946,11 @@ nodes
 node_desired_snapshots
   node_id, revision, schema_version, snapshot_hash, signed_payload, created_at
 
-node_endpoints
-  node_id, kind, host, port, applied_revision, verification_state,
-  last_probe_at, last_success_at, latency_ms
+node_endpoint_candidates
+  node_id, endpoint_id, kind, source, host, port, applied_revision, lease, withdrawn_at
+
+node_endpoint_verifications
+  node_id, endpoint_id, status, last_probe_at, last_success_at, latency_ms, expiry
 
 node_consent_receipts
   node_id, receipt_id, disclosure_version, capabilities, effective_limits, accepted_at

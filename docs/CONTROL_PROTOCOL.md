@@ -140,6 +140,7 @@ non-canonical header values before signature verification.
 
 ```json
 {
+  "heartbeatGeneration": 184,
   "agentVersion": "0.1.0",
   "xrayVersion": "26.3.27",
   "state": "serving",
@@ -149,7 +150,16 @@ non-canonical header values before signature verification.
   "appliedRevision": 12,
   "providerPaused": false,
   "endpoints": [
-    {"mode": "direct", "address": "node.example.com", "port": 443, "status": "verified"}
+    {
+      "endpointId": "6e005b7a-531b-4e92-a11d-39f47d12e461",
+      "mode": "direct",
+      "source": "pcp",
+      "address": "node.example.com",
+      "port": 443,
+      "appliedRevision": 12,
+      "observedAt": "2026-07-11T20:00:00Z",
+      "expiresAt": "2026-07-11T21:00:00Z"
+    }
   ],
   "telemetryCursor": 820
 }
@@ -158,8 +168,21 @@ non-canonical header values before signature verification.
 Heartbeat is a current-state report, not a command channel. The response may include polling and
 minimum-version hints but not arbitrary executable instructions.
 
+`heartbeatGeneration` is a positive, durable sequence allocated before network I/O and is
+independent from `telemetryCursor`. Control accepts only a generation newer than the durable one.
+An older generation returns `state_stale`; an exact retry of the same generation and canonical
+snapshot is an idempotent success; reusing one generation for different state returns
+`state_conflict`. Gaps after failed requests or crashes are valid.
+
+Heartbeat endpoints are unverified candidates, not probe results. Each candidate identity binds
+one exact mode, source, address, port, applied revision, observation time, and optional manual or
+required finite mapping/relay lease. A withdrawn identity cannot be reused for changed endpoint
+state. Nodes never send `status`; the closed candidate schema rejects a forged `verified` field.
+Only controller-owned external probe state can make a candidate eligible for a profile bundle.
+
 The initial implementation returns `204 No Content` after durably accepting the heartbeat. A
-heartbeat never approves a pending node, and revision plus telemetry cursors cannot move backward.
+heartbeat never approves a pending node, and revision, heartbeat, plus telemetry cursors cannot
+move backward.
 
 ### Operator node lifecycle
 

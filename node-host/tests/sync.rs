@@ -414,7 +414,7 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     assert!(synced.last_heartbeat_at.is_some());
     assert!(synced.last_sync_at.is_some());
     assert_eq!(synced.desired_revision_cursor, 0);
-    assert_eq!(synced.schema_version, 7);
+    assert_eq!(synced.schema_version, 8);
 
     let captured = controller.captured();
     assert_eq!(captured.len(), 2);
@@ -424,6 +424,7 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
         format!("/v1/nodes/{}/heartbeat", registration.node)
     );
     let heartbeat: NodeHeartbeat = serde_json::from_slice(&captured[0].body).unwrap();
+    assert_eq!(heartbeat.heartbeat_generation.get(), 1);
     assert_eq!(heartbeat.state, NodeRuntimeState::Idle);
     assert!(heartbeat.xray_version.is_none());
     assert!(heartbeat.endpoints.is_empty());
@@ -486,17 +487,19 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     .is_err());
 
     let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
-    let persisted: (Option<i64>, Option<i64>, i64) = connection
+    let persisted: (Option<i64>, Option<i64>, i64, i64) = connection
         .query_row(
-            "SELECT last_heartbeat_at, last_sync_at, desired_revision_cursor
+            "SELECT last_heartbeat_at, last_sync_at, desired_revision_cursor,
+                    heartbeat_generation
              FROM control_sync_state WHERE singleton = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
     assert!(persisted.0.is_some());
     assert!(persisted.1.is_some());
     assert_eq!(persisted.2, 0);
+    assert_eq!(persisted.3, 1);
     drop(connection);
 
     let database = fs::read(data_dir.join("node-host.sqlite3")).unwrap();
@@ -562,6 +565,18 @@ async fn controller_error_body_is_redacted() {
     let rendered = format!("{error:#}");
     assert!(rendered.contains("authentication_failed"));
     assert!(!rendered.contains(SECRET_RESPONSE_TEXT));
+    sync_once(&data_dir).await.unwrap_err();
+    let generations: Vec<i64> = controller
+        .captured()
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<NodeHeartbeat>(&request.body)
+                .unwrap()
+                .heartbeat_generation
+                .get()
+        })
+        .collect();
+    assert_eq!(generations, vec![1, 2]);
     let current = status(&data_dir).unwrap();
     assert!(current.last_heartbeat_at.is_none());
     assert!(current.last_sync_at.is_none());
@@ -962,7 +977,20 @@ async fn service_loop_repeats_sync_and_releases_the_data_lock_on_shutdown() {
     let (service_result, ()) = tokio::join!(service, observe_lock);
     service_result.unwrap();
 
-    assert!(controller.captured().len() >= 4);
+    let captured = controller.captured();
+    assert!(captured.len() >= 4);
+    let generations: Vec<i64> = captured
+        .iter()
+        .filter(|request| request.path_and_query.ends_with("/heartbeat"))
+        .map(|request| {
+            serde_json::from_slice::<NodeHeartbeat>(&request.body)
+                .unwrap()
+                .heartbeat_generation
+                .get()
+        })
+        .collect();
+    assert!(generations.len() >= 2);
+    assert!(generations.windows(2).all(|pair| pair[0] < pair[1]));
     status(&data_dir).expect("shutdown must release the exclusive data-directory lock");
 }
 

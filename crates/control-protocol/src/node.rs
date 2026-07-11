@@ -3,8 +3,8 @@
 use crate::crypto::{Ed25519PublicKey, Ed25519Signature, Nonce, Sha256Digest, X25519PublicKey};
 use crate::error::ErrorCode;
 use crate::id::{
-    ControllerInstanceId, CredentialId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision,
-    SequenceNumber, SigningKeyId, Timestamp, UserId,
+    ControllerInstanceId, CredentialId, EndpointId, NetworkId, NodeId, NodeInvitationId, NodeKeyId,
+    Revision, SequenceNumber, SigningKeyId, Timestamp, UserId,
 };
 use crate::secret::Secret;
 use crate::validation::{ProtocolValidationError, ValidationCode};
@@ -265,6 +265,22 @@ pub enum EndpointMode {
     Relay,
 }
 
+/// Node-observed origin of an endpoint candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EndpointSource {
+    /// Existing provider endpoint or explicit router forwarding.
+    Manual,
+    /// Port Control Protocol mapping.
+    Pcp,
+    /// NAT Port Mapping Protocol mapping.
+    NatPmp,
+    /// `UPnP` Internet Gateway Device mapping.
+    Upnp,
+    /// Controller-assigned opaque raw-TCP relay.
+    Relay,
+}
+
 /// Controller-observed endpoint verification state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -279,21 +295,29 @@ pub enum EndpointStatus {
     Withdrawn,
 }
 
-/// Safe endpoint state reported by a node heartbeat.
+/// Unverified endpoint candidate reported by a node heartbeat.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NodeEndpointStatus {
+pub struct EndpointCandidate {
+    /// Stable identity for this exact candidate and lease generation.
+    pub endpoint_id: EndpointId,
     /// Direct or relay path.
     pub mode: EndpointMode,
+    /// How the node obtained this candidate.
+    pub source: EndpointSource,
     /// Hostname or IP address, never a general URL.
     pub address: String,
     /// TCP port.
     pub port: u16,
-    /// Controller probe state last observed by the node.
-    pub status: EndpointStatus,
+    /// Applied Xray revision served by this candidate.
+    pub applied_revision: Revision,
+    /// Time the node observed or created this candidate.
+    pub observed_at: Timestamp,
+    /// Mapping or relay lease expiry. Manual endpoints may omit it.
+    pub expires_at: Option<Timestamp>,
 }
 
-impl NodeEndpointStatus {
+impl EndpointCandidate {
     fn validate(&self) -> Result<(), ProtocolValidationError> {
         validate_short_text(&self.address, 253, "endpoints.address")?;
         if self.address.contains('/') || self.address.contains(char::is_whitespace) {
@@ -308,6 +332,40 @@ impl NodeEndpointStatus {
                 ValidationCode::OutOfRange,
                 "endpoints.port",
                 "endpoint port must be non-zero",
+            ));
+        }
+        let source_matches_mode = matches!(
+            (self.mode, self.source),
+            (
+                EndpointMode::Direct,
+                EndpointSource::Manual
+                    | EndpointSource::Pcp
+                    | EndpointSource::NatPmp
+                    | EndpointSource::Upnp
+            ) | (EndpointMode::Relay, EndpointSource::Relay)
+        );
+        if !source_matches_mode {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "endpoints.source",
+                "endpoint source must agree with direct or relay mode",
+            ));
+        }
+        if self
+            .expires_at
+            .is_some_and(|expiry| expiry <= self.observed_at)
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "endpoints.expiresAt",
+                "endpoint expiry must be later than its observation time",
+            ));
+        }
+        if self.source != EndpointSource::Manual && self.expires_at.is_none() {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::MissingField,
+                "endpoints.expiresAt",
+                "mapped and relayed endpoint candidates require a finite expiry",
             ));
         }
         Ok(())
@@ -358,6 +416,8 @@ impl RevisionProgress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeHeartbeat {
+    /// Durable, monotonically increasing identity of this complete snapshot.
+    pub heartbeat_generation: SequenceNumber,
     /// Node Host semantic version.
     pub agent_version: String,
     /// Running Xray version, when installed.
@@ -369,8 +429,8 @@ pub struct NodeHeartbeat {
     pub revisions: RevisionProgress,
     /// Provider-local pause always takes effect without controller access.
     pub provider_paused: bool,
-    /// Bounded current endpoint reports.
-    pub endpoints: Vec<NodeEndpointStatus>,
+    /// Bounded unverified endpoint candidates.
+    pub endpoints: Vec<EndpointCandidate>,
     /// Highest telemetry sequence retained or acknowledged locally.
     pub telemetry_cursor: SequenceNumber,
 }
@@ -383,6 +443,13 @@ impl NodeHeartbeat {
     /// Returns an error for invalid versions, inconsistent revision progress,
     /// pause-state disagreement, too many endpoints, or an invalid endpoint.
     pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.heartbeat_generation.get() == 0 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "heartbeatGeneration",
+                "heartbeat generation must be positive",
+            ));
+        }
         validate_short_text(&self.agent_version, 64, "agentVersion")?;
         if let Some(version) = &self.xray_version {
             validate_short_text(version, 64, "xrayVersion")?;
@@ -402,8 +469,57 @@ impl NodeHeartbeat {
                 "heartbeat endpoint count exceeds the protocol bound",
             ));
         }
+        if self
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != self.endpoints.len()
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "endpoints",
+                "endpoint candidate identities must be unique",
+            ));
+        }
+        if self
+            .endpoints
+            .iter()
+            .map(|endpoint| {
+                (
+                    endpoint.mode,
+                    endpoint.address.as_str(),
+                    endpoint.port,
+                    endpoint.applied_revision,
+                )
+            })
+            .collect::<HashSet<_>>()
+            .len()
+            != self.endpoints.len()
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "endpoints",
+                "endpoint candidates must not repeat an address for one revision",
+            ));
+        }
+        if !self.endpoints.is_empty() && self.state != NodeRuntimeState::Serving {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "endpoints",
+                "only a serving node may report endpoint candidates",
+            ));
+        }
         for endpoint in &self.endpoints {
             endpoint.validate()?;
+            if Some(endpoint.applied_revision) != self.revisions.applied_revision {
+                return Err(ProtocolValidationError::new(
+                    ValidationCode::InconsistentState,
+                    "endpoints.appliedRevision",
+                    "endpoint candidate must match the heartbeat applied revision",
+                ));
+            }
         }
         Ok(())
     }
@@ -884,14 +1000,15 @@ fn validate_short_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        DesiredStateDocument, DesiredUser, DesiredXrayState, RevisionProgress, RevisionResult,
+        DesiredStateDocument, DesiredUser, DesiredXrayState, EndpointCandidate, EndpointMode,
+        EndpointSource, NodeHeartbeat, NodeRuntimeState, RevisionProgress, RevisionResult,
         RevisionResultState,
     };
     use crate::crypto::Sha256Digest;
     use crate::error::ErrorCode;
     use crate::id::{
-        ControllerInstanceId, CredentialId, NetworkId, NodeId, Revision, SigningKeyId, Timestamp,
-        UserId,
+        ControllerInstanceId, CredentialId, EndpointId, NetworkId, NodeId, Revision,
+        SequenceNumber, SigningKeyId, Timestamp, UserId,
     };
     use crate::secret::Secret;
 
@@ -951,6 +1068,75 @@ mod tests {
             signing_key_id: SigningKeyId::new(),
             controller_instance_id: ControllerInstanceId::new(),
         }
+    }
+
+    fn heartbeat_with_candidate() -> NodeHeartbeat {
+        let revision = Revision::new(7).unwrap();
+        NodeHeartbeat {
+            heartbeat_generation: SequenceNumber::new(1).unwrap(),
+            agent_version: "0.1.0".to_string(),
+            xray_version: Some("26.7.11".to_string()),
+            state: NodeRuntimeState::Serving,
+            revisions: RevisionProgress {
+                desired_revision: Some(revision),
+                received_revision: Some(revision),
+                validated_revision: Some(revision),
+                applied_revision: Some(revision),
+            },
+            provider_paused: false,
+            endpoints: vec![EndpointCandidate {
+                endpoint_id: EndpointId::new(),
+                mode: EndpointMode::Direct,
+                source: EndpointSource::Pcp,
+                address: "1.1.1.1".to_string(),
+                port: 44_321,
+                applied_revision: revision,
+                observed_at: timestamp("2026-07-11T20:00:00Z"),
+                expires_at: Some(timestamp("2026-07-11T21:00:00Z")),
+            }],
+            telemetry_cursor: SequenceNumber::new(0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn heartbeat_endpoints_are_unverified_revision_bound_candidates() {
+        let heartbeat = heartbeat_with_candidate();
+        assert!(heartbeat.validate().is_ok());
+        let value = serde_json::to_value(&heartbeat).unwrap();
+        assert!(value["endpoints"][0].get("status").is_none());
+        assert_eq!(value["endpoints"][0]["source"], "pcp");
+        let mut forged = value["endpoints"][0].clone();
+        forged["status"] = serde_json::json!("verified");
+        assert!(serde_json::from_value::<EndpointCandidate>(forged).is_err());
+
+        let mut mismatched = heartbeat.clone();
+        mismatched.endpoints[0].applied_revision = Revision::new(6).unwrap();
+        assert!(mismatched.validate().is_err());
+
+        let mut duplicate = heartbeat.clone();
+        duplicate.endpoints.push(duplicate.endpoints[0].clone());
+        assert!(duplicate.validate().is_err());
+
+        let mut duplicate_address = heartbeat.clone();
+        let mut second_identity = duplicate_address.endpoints[0].clone();
+        second_identity.endpoint_id = EndpointId::new();
+        duplicate_address.endpoints.push(second_identity);
+        assert!(duplicate_address.validate().is_err());
+
+        let mut invalid_source = heartbeat.clone();
+        invalid_source.endpoints[0].source = EndpointSource::Relay;
+        assert!(invalid_source.validate().is_err());
+
+        let mut no_lease = heartbeat;
+        no_lease.endpoints[0].expires_at = None;
+        assert!(no_lease.validate().is_err());
+    }
+
+    #[test]
+    fn heartbeat_generation_must_be_positive() {
+        let mut heartbeat = heartbeat_with_candidate();
+        heartbeat.heartbeat_generation = SequenceNumber::new(0).unwrap();
+        assert!(heartbeat.validate().is_err());
     }
 
     #[test]

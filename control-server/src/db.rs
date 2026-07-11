@@ -16,9 +16,9 @@ use control_protocol::id::{
     Timestamp,
 };
 use control_protocol::node::{
-    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
-    EnrollNodeResponse, NodeAuthenticationMode, NodeCapability, NodeCredential, NodeHeartbeat,
-    PairingPurpose, RevisionResult, RevisionResultState, SignedDesiredState,
+    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate,
+    EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode, NodeCapability, NodeCredential,
+    NodeHeartbeat, PairingPurpose, RevisionResult, RevisionResultState, SignedDesiredState,
 };
 use control_protocol::request_auth::{
     verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
@@ -39,7 +39,7 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
@@ -444,6 +444,94 @@ BEGIN
 END;
 ";
 
+const MIGRATION_6_SQL: &str = r"
+-- Version 3 allowed a node heartbeat to assert endpoint verification. Those
+-- rows are not controller evidence and must not cross the trust upgrade.
+DROP TABLE node_reported_endpoints;
+
+ALTER TABLE nodes ADD COLUMN last_heartbeat_generation INTEGER NOT NULL DEFAULT 0
+    CHECK(last_heartbeat_generation >= 0);
+
+ALTER TABLE nodes ADD COLUMN last_heartbeat_sha256 BLOB
+    CHECK(last_heartbeat_sha256 IS NULL OR length(last_heartbeat_sha256) = 32);
+
+CREATE TABLE node_endpoint_candidates (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL CHECK(length(endpoint_id) = 36),
+    mode TEXT NOT NULL CHECK(mode IN ('direct', 'relay')),
+    source TEXT NOT NULL CHECK(source IN ('manual', 'pcp', 'natPmp', 'upnp', 'relay')),
+    address TEXT NOT NULL CHECK(length(address) BETWEEN 1 AND 253),
+    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+    applied_revision INTEGER NOT NULL CHECK(applied_revision > 0),
+    observed_at INTEGER NOT NULL,
+    expires_at INTEGER,
+    last_report_generation INTEGER NOT NULL CHECK(last_report_generation > 0),
+    first_reported_at INTEGER NOT NULL,
+    last_reported_at INTEGER NOT NULL,
+    withdrawn_at INTEGER,
+    PRIMARY KEY(network_id, node_id, endpoint_id),
+    CHECK(
+        (mode = 'direct' AND source IN ('manual', 'pcp', 'natPmp', 'upnp'))
+        OR (mode = 'relay' AND source = 'relay')
+    ),
+    CHECK(source = 'manual' OR expires_at IS NOT NULL),
+    CHECK(expires_at IS NULL OR expires_at > observed_at),
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE CASCADE,
+    FOREIGN KEY(network_id, node_id, applied_revision)
+        REFERENCES node_revision_targets(network_id, node_id, revision)
+) STRICT, WITHOUT ROWID;
+
+CREATE UNIQUE INDEX node_endpoint_candidates_current_address
+    ON node_endpoint_candidates(network_id, node_id, mode, address, port, applied_revision)
+    WHERE withdrawn_at IS NULL;
+
+CREATE INDEX node_endpoint_candidates_current_node
+    ON node_endpoint_candidates(network_id, node_id, last_reported_at DESC)
+    WHERE withdrawn_at IS NULL;
+
+CREATE TABLE node_endpoint_verifications (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'verified', 'failed', 'withdrawn')),
+    probe_attempts INTEGER NOT NULL DEFAULT 0 CHECK(probe_attempts >= 0),
+    last_probe_at INTEGER,
+    last_success_at INTEGER,
+    latency_ms INTEGER CHECK(latency_ms IS NULL OR latency_ms >= 0),
+    error_code TEXT,
+    verification_expires_at INTEGER,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id, endpoint_id),
+    CHECK(last_success_at IS NULL OR (
+        last_probe_at IS NOT NULL AND last_success_at <= last_probe_at
+    )),
+    CHECK(verification_expires_at IS NULL OR (
+        last_success_at IS NOT NULL AND verification_expires_at > last_success_at
+    )),
+    CHECK(
+        (status = 'pending' AND probe_attempts = 0
+            AND last_probe_at IS NULL AND last_success_at IS NULL
+            AND latency_ms IS NULL AND error_code IS NULL
+            AND verification_expires_at IS NULL)
+        OR (status = 'verified' AND probe_attempts > 0
+            AND last_probe_at IS NOT NULL AND last_success_at IS NOT NULL
+            AND latency_ms IS NOT NULL AND error_code IS NULL
+            AND verification_expires_at IS NOT NULL)
+        OR (status = 'failed' AND probe_attempts > 0
+            AND last_probe_at IS NOT NULL AND error_code IS NOT NULL)
+        OR status = 'withdrawn'
+    ),
+    FOREIGN KEY(network_id, node_id, endpoint_id)
+        REFERENCES node_endpoint_candidates(network_id, node_id, endpoint_id)
+        ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX node_endpoint_verifications_status
+    ON node_endpoint_verifications(network_id, status, updated_at);
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -475,6 +563,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "desired_state_schema_v2",
         sql: MIGRATION_5_SQL,
+    },
+    Migration {
+        version: 6,
+        name: "controller_owned_endpoint_verification",
+        sql: MIGRATION_6_SQL,
     },
 ];
 
@@ -888,17 +981,57 @@ fn record_heartbeat(
     heartbeat: &NodeHeartbeat,
 ) -> Result<(), DatabaseError> {
     heartbeat.validate()?;
+    let heartbeat_json = serde_json::to_vec(heartbeat)?;
+    let heartbeat_digest: [u8; 32] = Sha256::digest(&heartbeat_json).into();
     let now = unix_timestamp()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let network = load_network(&transaction)?;
+    let previous = transaction
+        .query_row(
+            "SELECT status, last_heartbeat_generation, last_heartbeat_sha256
+             FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, previous_generation, previous_digest)) = previous else {
+        return Err(DatabaseError::NodeRevoked);
+    };
+    if !matches!(status.as_str(), "pending" | "active") {
+        return Err(DatabaseError::NodeRevoked);
+    }
+    match heartbeat
+        .heartbeat_generation
+        .get()
+        .cmp(&previous_generation)
+    {
+        std::cmp::Ordering::Less => return Err(DatabaseError::NodeHeartbeatStale),
+        std::cmp::Ordering::Equal => {
+            if previous_digest.as_deref() == Some(&heartbeat_digest[..]) {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(DatabaseError::NodeHeartbeatConflict);
+        }
+        std::cmp::Ordering::Greater => {}
+    }
     validate_reported_progress(&transaction, &network.network_id, node_id, heartbeat)?;
     let updated = transaction.execute(
         "UPDATE nodes
          SET agent_version = ?1, xray_version = ?2, runtime_state = ?3,
              provider_paused = ?4, last_seen_at = ?5,
              reported_desired_revision = ?6,
-             telemetry_cursor = ?7, updated_at = ?5
-         WHERE network_id = ?8 AND node_id = ?9 AND status IN ('pending', 'active')",
+             telemetry_cursor = ?7,
+             last_heartbeat_generation = ?8,
+             last_heartbeat_sha256 = ?9,
+             updated_at = ?5
+         WHERE network_id = ?10 AND node_id = ?11 AND status IN ('pending', 'active')",
         params![
             heartbeat.agent_version,
             heartbeat.xray_version,
@@ -910,6 +1043,8 @@ fn record_heartbeat(
                 .desired_revision
                 .map(control_protocol::id::Revision::get),
             heartbeat.telemetry_cursor.get(),
+            heartbeat.heartbeat_generation.get(),
+            &heartbeat_digest[..],
             network.network_id,
             node_id.to_string(),
         ],
@@ -917,28 +1052,202 @@ fn record_heartbeat(
     if updated != 1 {
         return Err(DatabaseError::NodeRevoked);
     }
-
-    transaction.execute(
-        "DELETE FROM node_reported_endpoints WHERE network_id = ?1 AND node_id = ?2",
-        params![network.network_id, node_id.to_string()],
+    record_endpoint_candidates(
+        &transaction,
+        &network.network_id,
+        node_id,
+        heartbeat,
+        heartbeat.heartbeat_generation.get(),
+        now,
     )?;
-    for endpoint in &heartbeat.endpoints {
-        transaction.execute(
-            "INSERT INTO node_reported_endpoints(
-                network_id, node_id, mode, address, port, status, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            params![
-                network.network_id,
-                node_id.to_string(),
-                enum_wire(&endpoint.mode)?,
-                endpoint.address,
-                i64::from(endpoint.port),
-                enum_wire(&endpoint.status)?,
-                now,
-            ],
+    transaction.commit()?;
+    Ok(())
+}
+
+fn record_endpoint_candidates(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    heartbeat: &NodeHeartbeat,
+    report_generation: i64,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let node_id = node_id.to_string();
+    let mut new_candidates = Vec::new();
+    for candidate in &heartbeat.endpoints {
+        let prepared = PreparedEndpointCandidate::new(candidate)?;
+        if !refresh_endpoint_candidate(
+            transaction,
+            network_id,
+            &node_id,
+            &prepared,
+            report_generation,
+            now,
+        )? {
+            new_candidates.push(prepared);
+        }
+    }
+
+    withdraw_missing_candidates(transaction, network_id, &node_id, report_generation, now)?;
+
+    for candidate in new_candidates {
+        insert_endpoint_candidate(
+            transaction,
+            network_id,
+            &node_id,
+            &candidate,
+            report_generation,
+            now,
         )?;
     }
-    transaction.commit()?;
+    Ok(())
+}
+
+struct PreparedEndpointCandidate<'a> {
+    candidate: &'a EndpointCandidate,
+    mode: String,
+    source: String,
+    observed_at: i64,
+    expires_at: Option<i64>,
+}
+
+impl<'a> PreparedEndpointCandidate<'a> {
+    fn new(candidate: &'a EndpointCandidate) -> Result<Self, DatabaseError> {
+        Ok(Self {
+            candidate,
+            mode: enum_wire(&candidate.mode)?,
+            source: enum_wire(&candidate.source)?,
+            observed_at: candidate.observed_at.as_datetime().unix_timestamp(),
+            expires_at: candidate
+                .expires_at
+                .map(|value| value.as_datetime().unix_timestamp()),
+        })
+    }
+}
+
+fn refresh_endpoint_candidate(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: &str,
+    prepared: &PreparedEndpointCandidate<'_>,
+    report_generation: i64,
+    now: i64,
+) -> Result<bool, DatabaseError> {
+    let candidate = prepared.candidate;
+    let stored = transaction
+        .query_row(
+            "SELECT mode, source, address, port, applied_revision,
+                    observed_at, expires_at, withdrawn_at
+             FROM node_endpoint_candidates
+             WHERE network_id = ?1 AND node_id = ?2 AND endpoint_id = ?3",
+            params![network_id, node_id, candidate.endpoint_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    let unchanged = stored.0 == prepared.mode
+        && stored.1 == prepared.source
+        && stored.2 == candidate.address
+        && stored.3 == i64::from(candidate.port)
+        && stored.4 == candidate.applied_revision.get()
+        && stored.5 == prepared.observed_at
+        && stored.6 == prepared.expires_at
+        && stored.7.is_none();
+    if !unchanged {
+        return Err(DatabaseError::EndpointCandidateConflict);
+    }
+    transaction.execute(
+        "UPDATE node_endpoint_candidates
+         SET last_report_generation = ?1, last_reported_at = ?2
+         WHERE network_id = ?3 AND node_id = ?4 AND endpoint_id = ?5
+           AND withdrawn_at IS NULL",
+        params![
+            report_generation,
+            now,
+            network_id,
+            node_id,
+            candidate.endpoint_id.to_string(),
+        ],
+    )?;
+    Ok(true)
+}
+
+fn withdraw_missing_candidates(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: &str,
+    report_generation: i64,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "UPDATE node_endpoint_candidates
+         SET withdrawn_at = ?1
+         WHERE network_id = ?2 AND node_id = ?3 AND withdrawn_at IS NULL
+           AND last_report_generation < ?4",
+        params![now, network_id, node_id, report_generation],
+    )?;
+    transaction.execute(
+        "UPDATE node_endpoint_verifications
+         SET status = 'withdrawn', updated_at = ?1
+         WHERE network_id = ?2 AND node_id = ?3 AND status != 'withdrawn'
+           AND endpoint_id IN (
+               SELECT endpoint_id FROM node_endpoint_candidates
+               WHERE network_id = ?2 AND node_id = ?3 AND withdrawn_at IS NOT NULL
+           )",
+        params![now, network_id, node_id],
+    )?;
+    Ok(())
+}
+
+fn insert_endpoint_candidate(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: &str,
+    prepared: &PreparedEndpointCandidate<'_>,
+    report_generation: i64,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let candidate = prepared.candidate;
+    transaction.execute(
+        "INSERT INTO node_endpoint_candidates(
+            network_id, node_id, endpoint_id, mode, source, address, port,
+            applied_revision, observed_at, expires_at, last_report_generation,
+            first_reported_at, last_reported_at, withdrawn_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, NULL)",
+        params![
+            network_id,
+            node_id,
+            candidate.endpoint_id.to_string(),
+            prepared.mode,
+            prepared.source,
+            candidate.address,
+            i64::from(candidate.port),
+            candidate.applied_revision.get(),
+            prepared.observed_at,
+            prepared.expires_at,
+            report_generation,
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO node_endpoint_verifications(
+            network_id, node_id, endpoint_id, status, probe_attempts, updated_at
+         ) VALUES (?1, ?2, ?3, 'pending', 0, ?4)",
+        params![network_id, node_id, candidate.endpoint_id.to_string(), now],
+    )?;
     Ok(())
 }
 
@@ -2755,8 +3064,14 @@ pub enum DatabaseError {
     NodeRequestNonceReplayed,
     #[error("the node reported progress older than its durable progress")]
     NodeProgressRegressed,
+    #[error("the node heartbeat is older than its durable heartbeat generation")]
+    NodeHeartbeatStale,
+    #[error("the node reused a heartbeat generation for a different snapshot")]
+    NodeHeartbeatConflict,
     #[error("the node reported progress not supported by the revision journal")]
     NodeProgressConflict,
+    #[error("the node reused an endpoint candidate identity with different or withdrawn state")]
+    EndpointCandidateConflict,
     #[error("the node request signature is invalid")]
     InvalidNodeRequestSignature,
     #[error("the node was not found")]
@@ -2875,6 +3190,14 @@ mod tests {
                     'serving', 0, 1, 7, 7, 7, 7, 9
                  )",
                 params![node_id, network_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO node_reported_endpoints(
+                    network_id, node_id, mode, address, port, status, created_at, updated_at
+                 ) VALUES (?1, ?2, 'direct', 'legacy.example.test', 443, 'verified', 1, 1)",
+                params![network_id, node_id],
             )
             .unwrap();
         node_id
@@ -3069,6 +3392,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(schema, (SCHEMA_VERSION, SCHEMA_VERSION, 3));
+        let endpoint_state: (i64, i64, i64) = guard
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'table' AND name = 'node_reported_endpoints'),
+                    (SELECT COUNT(*) FROM node_endpoint_candidates),
+                    (SELECT COUNT(*) FROM node_endpoint_verifications)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(endpoint_state, (0, 0, 0));
         let immutable_triggers: i64 = guard
             .connection
             .query_row(

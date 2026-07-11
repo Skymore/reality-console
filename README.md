@@ -27,8 +27,11 @@ and acknowledge `received` plus `validated` or `rejected` without activating Xra
 exposes redacted node summaries plus
 explicit approve, disable, and revoke operations; it can publish immutable signed revisions and
 record monotonic receive/validate/apply/rollback results. Enrollment and heartbeat never activate
-a node implicitly or overwrite controller-owned desired state. Node Host also has a resilient
-outbound sync loop with jitter, bounded retry backoff, and graceful process shutdown. Its installer
+a node implicitly or overwrite controller-owned desired state. Heartbeat endpoints are retained as
+revision-bound candidates only; Control owns a separate verification record that starts `pending`
+and legacy node-asserted `verified` rows are discarded. Durable heartbeat generations make exact
+retries idempotent and prevent delayed snapshots from withdrawing newer candidates. Node Host also
+has a resilient outbound sync loop with jitter, bounded retry backoff, and graceful process shutdown. Its installer
 integration can verify and pin an explicit Xray binary, probe its version, and create a separate
 owner-only REALITY identity without starting the process. Candidate files are immutable,
 owner-only, digest-checked on restart, and never replace a known-good configuration during

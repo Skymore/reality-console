@@ -169,6 +169,8 @@ forbid changing a consumed invitation back to unused.
 | `capabilities_json` | Canonical array of recognized capability strings |
 | `provider_paused` | Last observed provider-owned pause state |
 | `last_seen_at` | Nullable last authenticated heartbeat time |
+| `last_heartbeat_generation` | Last accepted positive Node Host snapshot generation |
+| `last_heartbeat_sha256` | Canonical 32-byte digest used to recognize exact retries |
 | `created_at`, `approved_at`, `revoked_at`, `removed_at` | Lifecycle timestamps |
 
 Node enrollment consumes the invitation, inserts `nodes`, inserts the first authentication
@@ -186,23 +188,34 @@ key with `request_timestamp` and `expires_at`. It is inserted before an authenti
 accepted, rejects replay across HTTP tunnels, and is retained for at least the allowed clock-skew
 window.
 
-`node_endpoints`
+`node_endpoint_candidates`
 
 | Column | Constraint and meaning |
 | --- | --- |
-| `network_id`, `endpoint_id` | Composite primary key |
-| `node_id` | Required node foreign key |
+| `network_id`, `node_id`, `endpoint_id` | Composite primary key |
 | `mode` | `direct` or `relay` |
-| `source` | `public`, `manual_mapping`, `upnp`, `nat_pmp`, `pcp`, or `relay_assignment` |
+| `source` | `manual`, `pcp`, `natPmp`, `upnp`, or `relay` and must agree with mode |
 | `address`, `port` | Bounded host/IP and port `1..65535` |
-| `status` | `candidate`, `probing`, `verified`, `failed`, or `withdrawn` |
-| `verified_at`, `verification_expires_at`, `last_failure_code` | Controller-side probe result |
-| `created_at`, `updated_at` | Lifecycle timestamps |
+| `applied_revision` | Required foreign key to this node's immutable revision target |
+| `observed_at`, `expires_at` | Node observation and finite mapping/relay lease; manual may omit expiry |
+| `last_report_generation` | Binds presence to one complete authenticated heartbeat snapshot |
+| `first_reported_at`, `last_reported_at`, `withdrawn_at` | Candidate lifecycle timestamps |
 
-Only one non-withdrawn row may exist for the same `(network_id, node_id, mode, address, port)`.
-`endpoint_probe_attempts` stores an append-only `(network_id, probe_id)` record with `endpoint_id`,
-keyed `challenge_hash`, `started_at`, `completed_at`, `result`, and stable `error_code`. Challenges
-expire and are never returned by read APIs.
+Candidate rows never contain node-authored verification state. The heartbeat transaction first
+fences stale or conflicting durable `heartbeatGeneration` values, then uses the accepted generation
+to refresh exact current candidates and mark omitted candidates withdrawn without deleting history.
+An exact retry is a no-op and cannot mutate controller-owned verification. Reusing an endpoint ID
+with changed fields, or resurrecting a withdrawn ID, is a state conflict. Only one non-withdrawn row
+may exist for the same `(network_id, node_id, mode, address, port, applied_revision)`. The schema-6 migration discards
+legacy `node_reported_endpoints` because those rows allowed a node to assert `verified`.
+
+`node_endpoint_verifications` is controller-owned and keyed by the same candidate identity. It
+stores `status` (`pending`, `verified`, `failed`, or `withdrawn`), probe count, last probe/success,
+latency, stable error code, verification expiry, and update time. Candidate insertion creates only
+`pending`; candidate withdrawal forces `withdrawn`. A later `endpoint_probe_attempts` table stores
+append-only `(network_id, probe_id)` evidence with `endpoint_id`, keyed challenge hash,
+started/completed times, result, and stable error code. Challenges expire and are never returned by
+read APIs.
 
 A node is shareable only when it is approved/active, not revoked, not provider-paused, has a current
 verified endpoint, and has an applied configuration compatible with the profile being generated.
@@ -486,7 +499,7 @@ unbounded delete.
 | Raw traffic samples | 90 days | Daily aggregate must exist before purge |
 | Daily usage aggregates | 365 days | Preserve longer when required by an active quota period/export |
 | Audit events | 365 days | Security/recovery events may be explicitly pinned |
-| Endpoint probe attempts | 30 days | Current endpoint verification remains in `node_endpoints` |
+| Endpoint probe attempts | 30 days | Current state remains in `node_endpoint_verifications` |
 | Telemetry batch receipts | 30 days | Cursor is retained for the life of the node tombstone |
 | Idempotency records | 24 hours | Never shorter than supported retry window |
 | Expired/revoked sessions and one-time tokens | 30 days after terminal time | Hash only; audit history remains |

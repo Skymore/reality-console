@@ -11,12 +11,12 @@ use control_protocol::enrollment::{
 };
 use control_protocol::error::ErrorCode;
 use control_protocol::id::{
-    ControllerInstanceId, CredentialId, NodeId, NodeKeyId, Revision, SequenceNumber, Timestamp,
-    UserId,
+    ControllerInstanceId, CredentialId, EndpointId, NodeId, NodeKeyId, Revision, SequenceNumber,
+    Timestamp, UserId,
 };
 use control_protocol::node::{
-    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointMode, EndpointStatus,
-    EnrollNodeRequest, EnrollNodeResponse, NodeCapability, NodeEndpointStatus, NodeHeartbeat,
+    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate, EndpointMode,
+    EndpointSource, EnrollNodeRequest, EnrollNodeResponse, NodeCapability, NodeHeartbeat,
     NodeRuntimeState, ProviderConsent, RevisionProgress, RevisionResult, RevisionResultState,
     SignedDesiredState,
 };
@@ -318,6 +318,7 @@ fn nonce(byte: u8) -> Nonce {
 
 fn heartbeat() -> NodeHeartbeat {
     NodeHeartbeat {
+        heartbeat_generation: SequenceNumber::new(1).unwrap(),
         agent_version: "0.2.0".to_string(),
         xray_version: Some("26.7.11".to_string()),
         state: NodeRuntimeState::Serving,
@@ -328,14 +329,54 @@ fn heartbeat() -> NodeHeartbeat {
             applied_revision: None,
         },
         provider_paused: false,
-        endpoints: vec![NodeEndpointStatus {
-            mode: EndpointMode::Direct,
-            address: "node.example.test".to_string(),
-            port: 443,
-            status: EndpointStatus::Verified,
-        }],
+        endpoints: Vec::new(),
         telemetry_cursor: SequenceNumber::new(9).unwrap(),
     }
+}
+
+fn endpoint_candidate(
+    revision: Revision,
+    mode: EndpointMode,
+    source: EndpointSource,
+    address: &str,
+    port: u16,
+) -> EndpointCandidate {
+    EndpointCandidate {
+        endpoint_id: EndpointId::new(),
+        mode,
+        source,
+        address: address.to_string(),
+        port,
+        applied_revision: revision,
+        observed_at: "2026-07-11T20:00:00Z".parse().unwrap(),
+        expires_at: (source != EndpointSource::Manual)
+            .then(|| "2026-07-11T21:00:00Z".parse().unwrap()),
+    }
+}
+
+async fn setup_applied_heartbeat(app: &TestApp) -> (SignedNode, NodeHeartbeat) {
+    let node = enroll_signed_node(app).await;
+    approve_node(app, node.node_id).await;
+    let response = publish_desired(app, node.node_id, &desired_state_body()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let desired: SignedDesiredState = serde_json::from_value(json(response).await).unwrap();
+    let revision = desired.document.revision;
+    report_applied_revision(app, &node, revision, 7, [20, 21, 22]).await;
+    let mut current = heartbeat();
+    current.revisions = RevisionProgress {
+        desired_revision: Some(revision),
+        received_revision: Some(revision),
+        validated_revision: Some(revision),
+        applied_revision: Some(revision),
+    };
+    current.endpoints = vec![endpoint_candidate(
+        revision,
+        EndpointMode::Direct,
+        EndpointSource::Manual,
+        "node.example.test",
+        443,
+    )];
+    (node, current)
 }
 
 fn desired_state_body() -> Value {
@@ -1122,27 +1163,18 @@ async fn malformed_and_chunked_oversized_json_use_stable_errors() {
 }
 
 #[tokio::test]
-async fn authenticated_heartbeat_persists_state_and_replaces_endpoints() {
+async fn authenticated_heartbeat_persists_only_pending_endpoint_candidates() {
     let app = TestApp::new();
-    let node = enroll_signed_node(&app).await;
-    let path = format!("/v1/nodes/{}/heartbeat", node.node_id);
-    let body = serde_json::to_vec(&heartbeat()).unwrap();
-    let request = signed_node_request(
-        &node,
-        "POST",
-        &path,
-        body,
-        Timestamp::from_datetime(OffsetDateTime::now_utc()),
-        &nonce(20),
-    );
-    let response = app.router.clone().oneshot(request).await.unwrap();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    let response = post_heartbeat(&app, &node, &current, 23).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
-    let stored: (String, String, String, Option<i64>, i64, i64) = connection
+    let stored: (String, String, String, Option<i64>, i64, i64, i64, i64) = connection
         .query_row(
             "SELECT status, agent_version, xray_version, applied_revision,
-                    telemetry_cursor, provider_paused
+                    telemetry_cursor, provider_paused, last_heartbeat_generation,
+                    length(last_heartbeat_sha256)
              FROM nodes WHERE node_id = ?1",
             [node.node_id.to_string()],
             |row| {
@@ -1153,6 +1185,8 @@ async fn authenticated_heartbeat_persists_state_and_replaces_endpoints() {
                     row.get(3)?,
                     row.get(4)?,
                     row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
@@ -1160,49 +1194,113 @@ async fn authenticated_heartbeat_persists_state_and_replaces_endpoints() {
     assert_eq!(
         stored,
         (
-            "pending".into(),
+            "active".into(),
             "0.2.0".into(),
             "26.7.11".into(),
-            None,
+            current.revisions.applied_revision.map(Revision::get),
             9,
-            0
+            0,
+            1,
+            32
         )
     );
     let endpoints: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM node_reported_endpoints WHERE node_id = ?1",
+            "SELECT COUNT(*) FROM node_endpoint_candidates
+             WHERE node_id = ?1 AND withdrawn_at IS NULL",
             [node.node_id.to_string()],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(endpoints, 1);
+    let verification: String = connection
+        .query_row(
+            "SELECT status FROM node_endpoint_verifications WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(verification, "pending");
+    assert!(connection
+        .execute(
+            "UPDATE node_endpoint_verifications SET status = 'verified' WHERE node_id = ?1",
+            [node.node_id.to_string()],
+        )
+        .is_err());
+    connection
+        .execute(
+            "UPDATE node_endpoint_verifications
+             SET status = 'verified', probe_attempts = 1,
+                 last_probe_at = 20, last_success_at = 20, latency_ms = 8,
+                 verification_expires_at = 30, updated_at = 20
+             WHERE node_id = ?1",
+            [node.node_id.to_string()],
+        )
+        .unwrap();
     drop(connection);
 
-    let mut next_heartbeat = heartbeat();
-    next_heartbeat.endpoints = vec![NodeEndpointStatus {
-        mode: EndpointMode::Relay,
-        address: "relay.example.test".to_string(),
-        port: 8443,
-        status: EndpointStatus::Pending,
-    }];
-    let body = serde_json::to_vec(&next_heartbeat).unwrap();
-    let request = signed_node_request(
-        &node,
-        "POST",
-        &path,
-        body,
-        Timestamp::from_datetime(OffsetDateTime::now_utc()),
-        &nonce(29),
-    );
     assert_eq!(
-        app.router.clone().oneshot(request).await.unwrap().status(),
+        post_heartbeat(&app, &node, &current, 24).await.status(),
         StatusCode::NO_CONTENT
     );
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let preserved: String = connection
+        .query_row(
+            "SELECT status FROM node_endpoint_verifications WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(preserved, "verified");
+}
+
+#[tokio::test]
+async fn heartbeat_withdraws_missing_candidates_and_rejects_identity_reuse() {
+    let app = TestApp::new();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    assert_eq!(
+        post_heartbeat(&app, &node, &current, 23).await.status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let revision = current.revisions.applied_revision.unwrap();
+    let mut next_heartbeat = current.clone();
+    next_heartbeat.heartbeat_generation = SequenceNumber::new(2).unwrap();
+    let relay_candidate = endpoint_candidate(
+        revision,
+        EndpointMode::Relay,
+        EndpointSource::Relay,
+        "relay.example.test",
+        8443,
+    );
+    next_heartbeat.endpoints = vec![relay_candidate];
+    assert_eq!(
+        post_heartbeat(&app, &node, &next_heartbeat, 29)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post_heartbeat(&app, &node, &next_heartbeat, 30)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let stale = post_heartbeat(&app, &node, &current, 31).await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(json(stale).await["error"]["code"], "state_stale");
+
+    let mut reused_generation = next_heartbeat.clone();
+    reused_generation.agent_version = "0.2.1".to_string();
+    let conflict = post_heartbeat(&app, &node, &reused_generation, 32).await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(json(conflict).await["error"]["code"], "state_conflict");
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
     let endpoints: Vec<(String, String, i64)> = connection
         .prepare(
-            "SELECT mode, address, port FROM node_reported_endpoints
-             WHERE node_id = ?1 ORDER BY address",
+            "SELECT mode, address, port FROM node_endpoint_candidates
+             WHERE node_id = ?1 AND withdrawn_at IS NULL ORDER BY address",
         )
         .unwrap()
         .query_map([node.node_id.to_string()], |row| {
@@ -1215,6 +1313,25 @@ async fn authenticated_heartbeat_persists_state_and_replaces_endpoints() {
         endpoints,
         vec![("relay".into(), "relay.example.test".into(), 8443)]
     );
+    let verification_states: Vec<String> = connection
+        .prepare(
+            "SELECT status FROM node_endpoint_verifications
+             WHERE node_id = ?1 ORDER BY status",
+        )
+        .unwrap()
+        .query_map([node.node_id.to_string()], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(verification_states, vec!["pending", "withdrawn"]);
+    drop(connection);
+
+    let mut conflicting_heartbeat = next_heartbeat;
+    conflicting_heartbeat.heartbeat_generation = SequenceNumber::new(3).unwrap();
+    conflicting_heartbeat.endpoints[0].address = "changed.example.test".to_string();
+    let conflict = post_heartbeat(&app, &node, &conflicting_heartbeat, 33).await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(json(conflict).await["error"]["code"], "state_conflict");
 }
 
 #[tokio::test]
@@ -1236,6 +1353,7 @@ async fn heartbeat_cannot_approve_a_node_or_regress_durable_progress() {
     );
 
     let mut regressed = heartbeat();
+    regressed.heartbeat_generation = SequenceNumber::new(2).unwrap();
     regressed.telemetry_cursor = SequenceNumber::new(8).unwrap();
     let request = signed_node_request(
         &node,
@@ -1919,6 +2037,7 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
     );
 
     let mut forged = heartbeat();
+    forged.heartbeat_generation = SequenceNumber::new(2).unwrap();
     forged.revisions = RevisionProgress {
         desired_revision: Some(first.document.revision),
         received_revision: Some(first.document.revision),
@@ -1930,6 +2049,7 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
     assert_eq!(json(response).await["error"]["code"], "state_conflict");
 
     let mut fetched_only = heartbeat();
+    fetched_only.heartbeat_generation = SequenceNumber::new(3).unwrap();
     fetched_only.revisions.desired_revision = Some(first.document.revision);
     assert_eq!(
         post_heartbeat(&app, &node, &fetched_only, 102)
@@ -1948,6 +2068,7 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
     let second_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
     let second: SignedDesiredState = serde_json::from_value(json(second_response).await).unwrap();
     let mut old_progress = heartbeat();
+    old_progress.heartbeat_generation = SequenceNumber::new(4).unwrap();
     old_progress.revisions = RevisionProgress {
         desired_revision: Some(first.document.revision),
         received_revision: Some(first.document.revision),
@@ -1962,6 +2083,7 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
     );
 
     let mut forged_second = old_progress;
+    forged_second.heartbeat_generation = SequenceNumber::new(5).unwrap();
     forged_second.revisions.desired_revision = Some(second.document.revision);
     forged_second.revisions.received_revision = Some(second.document.revision);
     let response = post_heartbeat(&app, &node, &forged_second, 105).await;
@@ -2017,5 +2139,5 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (5, 5, 1, 1, 1));
+    assert_eq!(durable, (6, 6, 1, 1, 1));
 }

@@ -203,7 +203,7 @@ impl<'de> Deserialize<'de> for BundleGeneration {
     }
 }
 
-/// A non-negative telemetry sequence number.
+/// A non-negative monotonic sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SequenceNumber(i64);

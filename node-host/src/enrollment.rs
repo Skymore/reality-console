@@ -195,7 +195,7 @@ fn build_enrollment_request(
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         platform: platform_name(),
         display_name: display_name.to_string(),
-        capabilities: vec![NodeCapability::Xray],
+        capabilities: vec![NodeCapability::Xray, NodeCapability::DirectTcp],
         identity_public_key: identity.ed25519_public()?,
         encryption_public_key: identity.x25519_public()?,
         nonce,

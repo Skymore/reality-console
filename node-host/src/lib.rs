@@ -37,7 +37,7 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
@@ -46,6 +46,7 @@ const MIGRATION_4_NAME: &str = "node_desired_state_receipt";
 const MIGRATION_5_NAME: &str = "node_xray_runtime_configuration";
 const MIGRATION_6_NAME: &str = "node_rendered_xray_configs";
 const MIGRATION_7_NAME: &str = "node_xray_activation_state";
+const MIGRATION_8_NAME: &str = "node_heartbeat_generation";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -252,6 +253,12 @@ const MIGRATION_7: &str = "
     END;
 ";
 
+const MIGRATION_8: &str = "
+    ALTER TABLE control_sync_state
+    ADD COLUMN heartbeat_generation INTEGER NOT NULL DEFAULT 0
+        CHECK (heartbeat_generation >= 0);
+";
+
 pub use bootstrap::{bootstrap, BootstrapRequest};
 pub use enrollment::join;
 pub use service::{run, run_until, SyncLoopOptions};
@@ -444,6 +451,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 5, MIGRATION_5_NAME, MIGRATION_5)?;
     apply_migration(&transaction, 6, MIGRATION_6_NAME, MIGRATION_6)?;
     apply_migration(&transaction, 7, MIGRATION_7_NAME, MIGRATION_7)?;
+    apply_migration(&transaction, 8, MIGRATION_8_NAME, MIGRATION_8)?;
     transaction.commit()?;
     Ok(())
 }
@@ -509,6 +517,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (5, MIGRATION_5_NAME, MIGRATION_5),
         (6, MIGRATION_6_NAME, MIGRATION_6),
         (7, MIGRATION_7_NAME, MIGRATION_7),
+        (8, MIGRATION_8_NAME, MIGRATION_8),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");

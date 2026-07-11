@@ -108,7 +108,8 @@ users
 devices
 node_invitations
 nodes
-node_endpoints
+node_endpoint_candidates
+node_endpoint_verifications
 user_node_assignments
 user_node_credentials
 config_revisions

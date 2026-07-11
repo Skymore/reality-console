@@ -306,8 +306,12 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::NodeRevoked => ApiError::node_revoked(request_id),
         DatabaseError::NodeRequestClockSkew => ApiError::clock_skew(request_id),
         DatabaseError::NodeRequestNonceReplayed => ApiError::nonce_replayed(request_id),
-        DatabaseError::NodeProgressRegressed => ApiError::state_stale(request_id),
+        DatabaseError::NodeProgressRegressed | DatabaseError::NodeHeartbeatStale => {
+            ApiError::state_stale(request_id)
+        }
         DatabaseError::NodeProgressConflict
+        | DatabaseError::NodeHeartbeatConflict
+        | DatabaseError::EndpointCandidateConflict
         | DatabaseError::DesiredStatePublicationConflict { .. } => {
             ApiError::state_conflict(request_id)
         }

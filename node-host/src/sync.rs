@@ -203,7 +203,15 @@ async fn send_heartbeat(
     desired_revision_cursor: i64,
     runtime_state: NodeRuntimeState,
 ) -> Result<()> {
-    let heartbeat = current_heartbeat(connection, desired_revision_cursor, runtime_state)?;
+    // Allocate before I/O. A failed attempt may leave a gap, but a generation
+    // can never identify two different snapshots after a crash or retry.
+    let heartbeat_generation = allocate_heartbeat_generation(connection)?;
+    let heartbeat = current_heartbeat(
+        connection,
+        desired_revision_cursor,
+        runtime_state,
+        heartbeat_generation,
+    )?;
     let heartbeat_body =
         serde_json::to_vec(&heartbeat).context("failed to serialize node heartbeat")?;
     let heartbeat_target = format!("/v1/nodes/{}/heartbeat", registration.node);
@@ -294,6 +302,7 @@ fn current_heartbeat(
     connection: &Connection,
     desired_revision_cursor: i64,
     runtime_state: NodeRuntimeState,
+    heartbeat_generation: SequenceNumber,
 ) -> Result<NodeHeartbeat> {
     let (received_revision_value, validated_revision_value): (i64, i64) = connection.query_row(
         "SELECT
@@ -320,6 +329,7 @@ fn current_heartbeat(
     )?;
     let applied_revision = optional_revision(applied_revision_value, "applied")?;
     let heartbeat = NodeHeartbeat {
+        heartbeat_generation,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         xray_version: crate::xray::configured_xray_version(connection)?,
         state: runtime_state,
@@ -337,6 +347,24 @@ fn current_heartbeat(
         .validate()
         .context("generated node heartbeat is invalid")?;
     Ok(heartbeat)
+}
+
+fn allocate_heartbeat_generation(connection: &Connection) -> Result<SequenceNumber> {
+    let updated = connection.execute(
+        "UPDATE control_sync_state
+         SET heartbeat_generation = heartbeat_generation + 1
+         WHERE singleton = 1 AND heartbeat_generation < 9223372036854775807",
+        [],
+    )?;
+    if updated != 1 {
+        bail!("heartbeat generation is exhausted or sync state is missing");
+    }
+    let value: i64 = connection.query_row(
+        "SELECT heartbeat_generation FROM control_sync_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    SequenceNumber::new(value).context("stored heartbeat generation is invalid")
 }
 
 fn optional_revision(value: i64, label: &str) -> Result<Option<Revision>> {
@@ -754,7 +782,7 @@ mod tests {
     use super::{
         current_heartbeat, load_unreported_results, ReportScope, MAX_PENDING_REPORTS_PER_SYNC,
     };
-    use control_protocol::id::Revision;
+    use control_protocol::id::{Revision, SequenceNumber};
     use control_protocol::node::NodeRuntimeState;
     use rusqlite::{params, Connection};
 
@@ -831,9 +859,16 @@ mod tests {
             )
             .unwrap();
 
-        let heartbeat = current_heartbeat(&connection, 1, NodeRuntimeState::Serving).unwrap();
+        let heartbeat = current_heartbeat(
+            &connection,
+            1,
+            NodeRuntimeState::Serving,
+            SequenceNumber::new(7).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(heartbeat.state, NodeRuntimeState::Serving);
+        assert_eq!(heartbeat.heartbeat_generation.get(), 7);
         assert_eq!(heartbeat.revisions.desired_revision.unwrap().get(), 1);
         assert_eq!(heartbeat.revisions.received_revision.unwrap().get(), 1);
         assert_eq!(heartbeat.revisions.validated_revision.unwrap().get(), 1);
