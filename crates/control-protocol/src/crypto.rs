@@ -91,6 +91,20 @@ fixed_base64url!(/// An Ed25519 signature encoded as 64 unpadded base64url bytes
 pub struct Sha256Digest(String);
 
 impl Sha256Digest {
+    /// Creates the canonical wire representation from raw SHA-256 bytes.
+    #[must_use]
+    pub fn from_bytes(value: [u8; 32]) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut encoded = String::with_capacity(71);
+        encoded.push_str("sha256:");
+        for byte in value {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        Self(encoded)
+    }
+
     /// Returns the canonical digest string.
     #[must_use]
     pub fn as_str(&self) -> &str {
