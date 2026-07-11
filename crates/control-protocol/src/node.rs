@@ -1,0 +1,853 @@
+//! Node invitation, enrollment, heartbeat, and desired-state contracts.
+
+use crate::crypto::{Ed25519PublicKey, Ed25519Signature, Nonce, Sha256Digest, X25519PublicKey};
+use crate::error::ErrorCode;
+use crate::id::{
+    ControllerInstanceId, CredentialId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision,
+    SequenceNumber, SigningKeyId, Timestamp, UserId,
+};
+use crate::secret::Secret;
+use crate::validation::{ProtocolValidationError, ValidationCode};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+/// Maximum lifetime accepted for a node invitation.
+pub const MAX_NODE_INVITATION_LIFETIME_SECONDS: u32 = 3_600;
+
+/// Admin request to create a one-time node invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateNodeInvitationRequest {
+    /// Operator-facing intended node name.
+    pub display_name: String,
+    /// Requested validity period in seconds.
+    pub expires_in_seconds: u32,
+}
+
+impl CreateNodeInvitationRequest {
+    /// Validates bounded invitation metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the display name is invalid or the requested
+    /// lifetime is outside the protocol bound.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_display_name(&self.display_name, "displayName")?;
+        if !(1..=MAX_NODE_INVITATION_LIFETIME_SECONDS).contains(&self.expires_in_seconds) {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "expiresInSeconds",
+                "invitation lifetime must be between 1 and 3600 seconds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One-time node invitation returned only at creation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateNodeInvitationResponse {
+    /// Stable invitation identity.
+    pub invitation_id: NodeInvitationId,
+    /// Pairing purpose, preventing cross-purpose use.
+    pub purpose: PairingPurpose,
+    /// Absolute invitation expiry.
+    pub expires_at: Timestamp,
+    /// High-entropy single-use enrollment secret.
+    pub invitation_secret: Secret<String>,
+    /// Controller origin pinned into the enrollment transcript.
+    pub controller_origin: String,
+    /// Controller TLS or enrollment-key fingerprint.
+    pub controller_fingerprint: Sha256Digest,
+}
+
+/// Closed pairing purposes; credentials are never interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PairingPurpose {
+    /// Enroll a Node Host installation.
+    NodeEnrollment,
+    /// Activate a member Connect device.
+    DeviceActivation,
+    /// Enroll an administrator device.
+    AdminDeviceEnrollment,
+}
+
+/// Closed capabilities a node may advertise during enrollment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeCapability {
+    /// Manage the pinned Xray sidecar.
+    Xray,
+    /// Expose a direct raw TCP endpoint.
+    DirectTcp,
+    /// Request consent-gated `UPnP` mapping.
+    Upnp,
+    /// Request consent-gated NAT-PMP mapping.
+    NatPmp,
+    /// Request consent-gated PCP mapping.
+    Pcp,
+    /// Use an assigned raw TCP relay.
+    RelayTcp,
+}
+
+/// Request that atomically consumes a node invitation and binds public keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnrollNodeRequest {
+    /// High-entropy single-use invitation value.
+    pub invitation_secret: Secret<String>,
+    /// Node Host semantic version.
+    pub agent_version: String,
+    /// Closed deployment platform identifier such as `macos-arm64`.
+    pub platform: String,
+    /// Provider-selected node name.
+    pub display_name: String,
+    /// Closed set of locally supported features.
+    pub capabilities: Vec<NodeCapability>,
+    /// Locally generated Ed25519 request-signing identity.
+    pub identity_public_key: Ed25519PublicKey,
+    /// Locally generated X25519 recipient-encryption identity.
+    pub encryption_public_key: X25519PublicKey,
+    /// Fresh client nonce included in the enrollment transcript.
+    pub nonce: Nonce,
+    /// Signature over the complete enrollment transcript.
+    pub proof: Ed25519Signature,
+    /// Versioned consent statement accepted by the node provider.
+    pub provider_consent: ProviderConsent,
+}
+
+impl EnrollNodeRequest {
+    /// Validates bounded enrollment metadata before cryptographic verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty invitation, invalid bounded metadata,
+    /// duplicate capabilities, or incomplete provider consent.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.invitation_secret.expose_secret().is_empty() {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::MissingField,
+                "invitationSecret",
+                "invitation secret is required",
+            ));
+        }
+        validate_short_text(&self.agent_version, 64, "agentVersion")?;
+        validate_short_text(&self.platform, 64, "platform")?;
+        validate_display_name(&self.display_name, "displayName")?;
+        if self.capabilities.is_empty() {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::MissingField,
+                "capabilities",
+                "at least one capability is required",
+            ));
+        }
+        if self.capabilities.len() > 16
+            || self
+                .capabilities
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                != self.capabilities.len()
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "capabilities",
+                "capabilities must be unique and bounded",
+            ));
+        }
+        self.provider_consent.validate()
+    }
+}
+
+/// Provider consent recorded as part of node enrollment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderConsent {
+    /// Version of the disclosure accepted by the provider.
+    pub policy_version: String,
+    /// Confirms authorization to operate the host.
+    pub host_owner_consented: bool,
+    /// Confirms acknowledgement that the public IP becomes an exit IP.
+    pub exit_ip_disclosure_accepted: bool,
+    /// Time of local acceptance.
+    pub accepted_at: Timestamp,
+}
+
+impl ProviderConsent {
+    fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_short_text(&self.policy_version, 64, "providerConsent.policyVersion")?;
+        if !self.host_owner_consented || !self.exit_ip_disclosure_accepted {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "providerConsent",
+                "host-owner consent and exit-IP disclosure are required",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Authentication mode issued to an enrolled node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NodeAuthenticationMode {
+    /// The node authenticates with a short-lived client certificate.
+    MutualTls,
+    /// The node signs every request end to end with its enrolled identity key.
+    SignedRequest,
+}
+
+/// First credential metadata issued to an enrolled node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeCredential {
+    /// Controller-assigned key record identity.
+    pub key_id: NodeKeyId,
+    /// Authentication mechanism authorized for the key.
+    pub mode: NodeAuthenticationMode,
+    /// Credential expiry.
+    pub expires_at: Timestamp,
+    /// Optional public client-certificate chain for mTLS mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_certificate_pem: Option<String>,
+}
+
+/// Successful node enrollment response bound to the enrollment transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnrollNodeResponse {
+    /// Network the invitation enrolled into.
+    pub network_id: NetworkId,
+    /// Unique identity assigned to this installation.
+    pub node_id: NodeId,
+    /// Controller epoch used to fence restored controllers.
+    pub controller_instance_id: ControllerInstanceId,
+    /// Initial node authentication credential.
+    pub credential: NodeCredential,
+    /// Controller desired-state signing public key.
+    pub desired_state_signing_public_key: Ed25519PublicKey,
+    /// Fresh controller nonce bound by the response proof.
+    pub controller_nonce: Nonce,
+    /// Controller signature binding both nonces, keys, purpose, and invitation.
+    pub proof: Ed25519Signature,
+}
+
+/// Current high-level Node Host state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NodeRuntimeState {
+    /// Enrolled but not yet approved or configured.
+    Pending,
+    /// Ready but not currently serving member traffic.
+    Idle,
+    /// Serving the last successfully applied configuration.
+    Serving,
+    /// Locally paused by the provider.
+    ProviderPaused,
+    /// Serving with a health or synchronization warning.
+    Degraded,
+    /// Identity collision or security policy prevents operation.
+    Quarantined,
+    /// Locally stopped or removed.
+    Stopped,
+}
+
+/// Data-path endpoint mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EndpointMode {
+    /// Connect reaches the node endpoint directly.
+    Direct,
+    /// Connect reaches the node through an opaque raw TCP relay.
+    Relay,
+}
+
+/// Controller-observed endpoint verification state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EndpointStatus {
+    /// Not yet externally probed.
+    Pending,
+    /// Externally reachable in the reported mode.
+    Verified,
+    /// The most recent external probe failed.
+    Failed,
+    /// No longer eligible for advertisement.
+    Withdrawn,
+}
+
+/// Safe endpoint state reported by a node heartbeat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeEndpointStatus {
+    /// Direct or relay path.
+    pub mode: EndpointMode,
+    /// Hostname or IP address, never a general URL.
+    pub address: String,
+    /// TCP port.
+    pub port: u16,
+    /// Controller probe state last observed by the node.
+    pub status: EndpointStatus,
+}
+
+impl NodeEndpointStatus {
+    fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_short_text(&self.address, 253, "endpoints.address")?;
+        if self.address.contains('/') || self.address.contains(char::is_whitespace) {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InvalidFormat,
+                "endpoints.address",
+                "endpoint address must be a hostname or IP address, not a URL",
+            ));
+        }
+        if self.port == 0 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "endpoints.port",
+                "endpoint port must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Monotonic desired-state progress reported by Node Host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionProgress {
+    /// Latest revision offered by the controller and persisted by the node.
+    pub desired_revision: Option<Revision>,
+    /// Latest revision durably received.
+    pub received_revision: Option<Revision>,
+    /// Latest revision whose generated configuration validated.
+    pub validated_revision: Option<Revision>,
+    /// Revision currently running after health check or rollback.
+    pub applied_revision: Option<Revision>,
+}
+
+impl RevisionProgress {
+    /// Validates `desired >= received >= validated >= applied` and presence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a lifecycle cursor exists without its predecessor
+    /// or exceeds that predecessor's revision.
+    pub fn validate(self) -> Result<(), ProtocolValidationError> {
+        validate_revision_pair(
+            self.desired_revision,
+            self.received_revision,
+            "receivedRevision",
+        )?;
+        validate_revision_pair(
+            self.received_revision,
+            self.validated_revision,
+            "validatedRevision",
+        )?;
+        validate_revision_pair(
+            self.validated_revision,
+            self.applied_revision,
+            "appliedRevision",
+        )
+    }
+}
+
+/// Current-state heartbeat from Node Host; it is not a command envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeHeartbeat {
+    /// Node Host semantic version.
+    pub agent_version: String,
+    /// Running Xray version, when installed.
+    pub xray_version: Option<String>,
+    /// Current high-level state.
+    pub state: NodeRuntimeState,
+    /// Desired-state progress.
+    #[serde(flatten)]
+    pub revisions: RevisionProgress,
+    /// Provider-local pause always takes effect without controller access.
+    pub provider_paused: bool,
+    /// Bounded current endpoint reports.
+    pub endpoints: Vec<NodeEndpointStatus>,
+    /// Highest telemetry sequence retained or acknowledged locally.
+    pub telemetry_cursor: SequenceNumber,
+}
+
+impl NodeHeartbeat {
+    /// Validates heartbeat consistency and bounded text/collections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid versions, inconsistent revision progress,
+    /// pause-state disagreement, too many endpoints, or an invalid endpoint.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_short_text(&self.agent_version, 64, "agentVersion")?;
+        if let Some(version) = &self.xray_version {
+            validate_short_text(version, 64, "xrayVersion")?;
+        }
+        self.revisions.validate()?;
+        if self.provider_paused != (self.state == NodeRuntimeState::ProviderPaused) {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "providerPaused",
+                "providerPaused must agree with the runtime state",
+            ));
+        }
+        if self.endpoints.len() > 16 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "endpoints",
+                "heartbeat endpoint count exceeds the protocol bound",
+            ));
+        }
+        for endpoint in &self.endpoints {
+            endpoint.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Per-member credential in a node's signed desired state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesiredUser {
+    /// Stable logical member identity.
+    pub user_id: UserId,
+    /// Stable per-user, per-node credential identity.
+    pub credential_id: CredentialId,
+    /// Node-specific VLESS UUID bearer secret.
+    pub vless_uuid: Secret<String>,
+    /// Whether the credential may serve traffic.
+    pub enabled: bool,
+}
+
+/// Closed Xray configuration fields centrally controlled for a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesiredXrayState {
+    /// Fixed inbound listen port.
+    pub listen_port: u16,
+    /// REALITY server names accepted by this node.
+    pub server_names: Vec<String>,
+    /// REALITY fallback target in `host:port` form.
+    pub target: String,
+}
+
+/// Immutable signed desired-state artifact for one node and revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignedDesiredState {
+    /// Desired-state schema version.
+    pub schema_version: u16,
+    /// Exact target node.
+    pub node_id: NodeId,
+    /// Monotonic immutable revision.
+    pub revision: Revision,
+    /// Controller publication time.
+    pub created_at: Timestamp,
+    /// Minimum Node Host semantic version required to interpret this state.
+    pub min_agent_version: String,
+    /// Complete enabled/disabled member credential set.
+    pub users: Vec<DesiredUser>,
+    /// Closed centrally managed Xray fields.
+    pub xray: DesiredXrayState,
+    /// Public key identifier used to sign this artifact.
+    pub signing_key_id: SigningKeyId,
+    /// Controller epoch used to prevent restore rollback.
+    pub controller_instance_id: ControllerInstanceId,
+    /// Signature over the canonical unsigned document.
+    pub signature: Ed25519Signature,
+}
+
+impl SignedDesiredState {
+    /// Validates shape, target, schema support, and monotonicity.
+    ///
+    /// This does not verify [`SignedDesiredState::signature`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported schema, a different target node, a
+    /// stale revision, duplicate identities, missing credentials, or invalid
+    /// bounded Xray fields.
+    pub fn validate_for(
+        &self,
+        expected_node_id: NodeId,
+        last_seen_revision: Option<Revision>,
+        supported_schema_versions: &[u16],
+    ) -> Result<(), ProtocolValidationError> {
+        if !supported_schema_versions.contains(&self.schema_version) {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::UnsupportedSchema,
+                "schemaVersion",
+                "desired-state schema version is not supported",
+            ));
+        }
+        if self.node_id != expected_node_id {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::IdentityMismatch,
+                "nodeId",
+                "desired state is addressed to another node",
+            ));
+        }
+        if last_seen_revision.is_some_and(|last| self.revision <= last) {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::StaleState,
+                "revision",
+                "desired-state revision is not newer than local state",
+            ));
+        }
+        validate_short_text(&self.min_agent_version, 64, "minAgentVersion")?;
+        if self.users.len() > 10_000 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "users",
+                "desired-state user count exceeds the protocol bound",
+            ));
+        }
+        let mut user_ids = HashSet::with_capacity(self.users.len());
+        let mut credential_ids = HashSet::with_capacity(self.users.len());
+        for user in &self.users {
+            if !user_ids.insert(user.user_id) || !credential_ids.insert(user.credential_id) {
+                return Err(ProtocolValidationError::new(
+                    ValidationCode::DuplicateIdentity,
+                    "users",
+                    "user and credential IDs must be unique within desired state",
+                ));
+            }
+            if user.vless_uuid.expose_secret().is_empty() {
+                return Err(ProtocolValidationError::new(
+                    ValidationCode::MissingField,
+                    "users.vlessUuid",
+                    "VLESS credential is required",
+                ));
+            }
+        }
+        self.xray.validate()
+    }
+}
+
+impl DesiredXrayState {
+    fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.listen_port == 0 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "xray.listenPort",
+                "Xray listen port must be non-zero",
+            ));
+        }
+        if self.server_names.is_empty() || self.server_names.len() > 16 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "xray.serverNames",
+                "one to sixteen REALITY server names are required",
+            ));
+        }
+        for name in &self.server_names {
+            validate_short_text(name, 253, "xray.serverNames")?;
+        }
+        validate_short_text(&self.target, 259, "xray.target")?;
+        if !self.target.contains(':') || self.target.contains("//") {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InvalidFormat,
+                "xray.target",
+                "Xray target must use host:port form",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Monotonic result state for one desired-state revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RevisionResultState {
+    /// Artifact was durably received.
+    Received,
+    /// Generated Xray configuration validated.
+    Validated,
+    /// Candidate started and passed health checks.
+    Applied,
+    /// Artifact or generated configuration was rejected before activation.
+    Rejected,
+    /// Failed activation restored a prior known-good revision.
+    RolledBack,
+}
+
+impl RevisionResultState {
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Received => 10,
+            Self::Validated => 20,
+            Self::Applied | Self::Rejected | Self::RolledBack => 30,
+        }
+    }
+
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::Applied | Self::Rejected | Self::RolledBack)
+    }
+}
+
+/// Node report for one desired-state revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RevisionResult {
+    /// Monotonic result state.
+    pub state: RevisionResultState,
+    /// Digest of the generated active configuration, when available.
+    pub config_digest: Option<Sha256Digest>,
+    /// Start of the bounded apply attempt.
+    pub started_at: Timestamp,
+    /// Completion of this state.
+    pub completed_at: Timestamp,
+    /// Stable safe diagnostic for a rejected or rolled-back revision.
+    pub error_code: Option<ErrorCode>,
+    /// Prior revision restored after failure.
+    pub rollback_revision: Option<Revision>,
+}
+
+impl RevisionResult {
+    /// Validates state-dependent fields for the addressed revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when timestamps are reversed, required state fields are
+    /// absent, prohibited fields are present, or a rollback does not target an
+    /// earlier revision.
+    pub fn validate(&self, revision: Revision) -> Result<(), ProtocolValidationError> {
+        if self.completed_at < self.started_at {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "completedAt",
+                "completion cannot precede start",
+            ));
+        }
+        match self.state {
+            RevisionResultState::Received => {
+                require_absent(self.config_digest.as_ref(), "configDigest")?;
+                require_absent(self.error_code.as_ref(), "errorCode")?;
+                require_absent(self.rollback_revision.as_ref(), "rollbackRevision")?;
+            }
+            RevisionResultState::Validated | RevisionResultState::Applied => {
+                require_present(self.config_digest.as_ref(), "configDigest")?;
+                require_absent(self.error_code.as_ref(), "errorCode")?;
+                require_absent(self.rollback_revision.as_ref(), "rollbackRevision")?;
+            }
+            RevisionResultState::Rejected => {
+                require_present(self.error_code.as_ref(), "errorCode")?;
+                require_absent(self.rollback_revision.as_ref(), "rollbackRevision")?;
+            }
+            RevisionResultState::RolledBack => {
+                require_present(self.config_digest.as_ref(), "configDigest")?;
+                require_present(self.error_code.as_ref(), "errorCode")?;
+                let rollback = self.rollback_revision.ok_or_else(|| {
+                    ProtocolValidationError::new(
+                        ValidationCode::MissingField,
+                        "rollbackRevision",
+                        "rolled-back state requires the restored revision",
+                    )
+                })?;
+                if rollback >= revision {
+                    return Err(ProtocolValidationError::new(
+                        ValidationCode::InconsistentState,
+                        "rollbackRevision",
+                        "rollback revision must precede the failed revision",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates a monotonic transition from a previously committed result.
+    ///
+    /// Repeating an identical result is idempotent. A different report for the
+    /// same state, a transition from a terminal state, or a rank regression is
+    /// rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the new result is not an identical retry or a
+    /// monotonic transition to a higher lifecycle rank.
+    pub fn validate_transition_from(
+        &self,
+        previous: Option<&Self>,
+    ) -> Result<(), ProtocolValidationError> {
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+        if self == previous {
+            return Ok(());
+        }
+        if self.state == previous.state
+            || previous.state.is_terminal()
+            || self.state.rank() <= previous.state.rank()
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InvalidTransition,
+                "state",
+                "revision result transition must move monotonically to a new state",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_revision_pair(
+    upper: Option<Revision>,
+    lower: Option<Revision>,
+    lower_field: &'static str,
+) -> Result<(), ProtocolValidationError> {
+    match (upper, lower) {
+        (None, Some(_)) => Err(ProtocolValidationError::new(
+            ValidationCode::InconsistentState,
+            lower_field,
+            "revision progress cannot skip a preceding lifecycle state",
+        )),
+        (Some(upper), Some(lower)) if lower > upper => Err(ProtocolValidationError::new(
+            ValidationCode::InconsistentState,
+            lower_field,
+            "revision progress cannot exceed its preceding lifecycle state",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn require_present<T>(
+    value: Option<&T>,
+    field: &'static str,
+) -> Result<(), ProtocolValidationError> {
+    if value.is_none() {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::MissingField,
+            field,
+            "field is required for this revision result state",
+        ));
+    }
+    Ok(())
+}
+
+fn require_absent<T>(
+    value: Option<&T>,
+    field: &'static str,
+) -> Result<(), ProtocolValidationError> {
+    if value.is_some() {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::InconsistentState,
+            field,
+            "field is not permitted for this revision result state",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_display_name(value: &str, field: &'static str) -> Result<(), ProtocolValidationError> {
+    validate_short_text(value, 128, field)
+}
+
+fn validate_short_text(
+    value: &str,
+    maximum_length: usize,
+    field: &'static str,
+) -> Result<(), ProtocolValidationError> {
+    if value.is_empty() {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::MissingField,
+            field,
+            "value is required",
+        ));
+    }
+    if value.len() > maximum_length || value.chars().any(char::is_control) {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::OutOfRange,
+            field,
+            "value exceeds its length or character bound",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RevisionProgress, RevisionResult, RevisionResultState};
+    use crate::crypto::Sha256Digest;
+    use crate::error::ErrorCode;
+    use crate::id::{Revision, Timestamp};
+
+    fn timestamp(value: &str) -> Timestamp {
+        value.parse().unwrap()
+    }
+
+    fn result(state: RevisionResultState) -> RevisionResult {
+        let config_digest = match state {
+            RevisionResultState::Validated
+            | RevisionResultState::Applied
+            | RevisionResultState::RolledBack => Some(
+                format!("sha256:{}", "a".repeat(64))
+                    .parse::<Sha256Digest>()
+                    .unwrap(),
+            ),
+            RevisionResultState::Received | RevisionResultState::Rejected => None,
+        };
+        let error_code = match state {
+            RevisionResultState::Rejected | RevisionResultState::RolledBack => {
+                Some(ErrorCode::ValidationFailed)
+            }
+            _ => None,
+        };
+        let rollback_revision =
+            (state == RevisionResultState::RolledBack).then(|| Revision::new(4).unwrap());
+        RevisionResult {
+            state,
+            config_digest,
+            started_at: timestamp("2026-07-11T20:00:02Z"),
+            completed_at: timestamp("2026-07-11T20:00:04Z"),
+            error_code,
+            rollback_revision,
+        }
+    }
+
+    #[test]
+    fn revision_progress_requires_monotonic_lifecycle_cursors() {
+        let progress = RevisionProgress {
+            desired_revision: Some(Revision::new(12).unwrap()),
+            received_revision: Some(Revision::new(12).unwrap()),
+            validated_revision: Some(Revision::new(11).unwrap()),
+            applied_revision: Some(Revision::new(10).unwrap()),
+        };
+        assert!(progress.validate().is_ok());
+
+        let invalid = RevisionProgress {
+            applied_revision: Some(Revision::new(12).unwrap()),
+            ..progress
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn revision_result_transitions_are_monotonic_and_idempotent() {
+        let received = result(RevisionResultState::Received);
+        let validated = result(RevisionResultState::Validated);
+        let applied = result(RevisionResultState::Applied);
+
+        assert!(received.validate(Revision::new(5).unwrap()).is_ok());
+        assert!(validated.validate_transition_from(Some(&received)).is_ok());
+        assert!(applied.validate_transition_from(Some(&validated)).is_ok());
+        assert!(applied.validate_transition_from(Some(&applied)).is_ok());
+        assert!(received.validate_transition_from(Some(&validated)).is_err());
+        assert!(validated.validate_transition_from(Some(&applied)).is_err());
+    }
+
+    #[test]
+    fn terminal_state_payloads_are_validated() {
+        let revision = Revision::new(5).unwrap();
+        assert!(result(RevisionResultState::RolledBack)
+            .validate(revision)
+            .is_ok());
+
+        let mut invalid = result(RevisionResultState::Applied);
+        invalid.error_code = Some(ErrorCode::ValidationFailed);
+        assert!(invalid.validate(revision).is_err());
+    }
+}
