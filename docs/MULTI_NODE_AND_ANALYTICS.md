@@ -1,8 +1,12 @@
 # Multi-Node And User Analytics Architecture
 
+Status: supporting rationale. The authoritative product, runtime, protocol, persistence, rollout,
+and security contracts are `REQUIREMENTS.md`, `SYSTEM_ARCHITECTURE.md`, `CONTROL_PROTOCOL.md`,
+`DATA_MODEL.md`, `ROLLOUT_AND_RECOVERY.md`, and `SECURITY.md`. Those documents win on conflict.
+
 ## Goals
 
-Reality Console should support a small, reliable private network of always-on nodes while
+The platform should support a small, reliable private network of always-on nodes while
 remaining useful as a single-node local application. A user should be able to select a China,
 United States, or United Kingdom destination without receiving administrative access.
 
@@ -27,7 +31,7 @@ The design borrows proven concepts, not source code, from these projects:
 
 ## Terminology
 
-- **Controller**: the Reality Console instance that owns desired state and presents the admin UI.
+- **Controller**: the Control Service that owns desired state and the Control app that presents it.
 - **Node agent**: a restricted service on each managed computer that applies configuration and
   reports health and telemetry.
 - **Exit node**: a node exposed to clients as a selectable destination.

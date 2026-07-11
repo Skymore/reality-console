@@ -1,91 +1,109 @@
-# Reality Console Implementation Plan
+# Private Network Delivery Plan
 
-## Step 1. Lock Product And Stack
+Each phase ends with a focused commit, tests, and a runnable state. Existing unrelated worktree
+changes are not included in a phase commit until independently verified.
 
-Output:
+## Phase 0: Stabilize Existing Local Identity And Analytics
 
-- project docs aligned around `Tauri + React + TypeScript + Tailwind + shadcn/ui + Radix`
-- implementation phases defined
+Deliverables:
 
-Commit goal:
+- stable logical user ID separated from mutable labels and Xray email;
+- local node ID and revision-safe metadata migration;
+- local traffic deltas and connection events attributable by stable user ID;
+- migration, parser, quota, and analytics tests.
 
-- `docs: define implementation plan and stack`
+Commit: `feat(server): stabilize user identity and local analytics`
 
-## Step 2. Scaffold App Shell
+## Phase 1: Authoritative Product And Protocol Design
 
-Output:
+Deliverables:
 
-- Tauri 2 project created
-- React + TypeScript + Vite frontend running
-- base Rust backend present
+- product requirements and acceptance criteria;
+- system architecture and trust boundaries;
+- Node Host onboarding/reachability design;
+- control protocol and security/privacy design;
+- account-based Connect requirements and delivery sequence.
 
-Commit goal:
+Commit: `docs: define private network platform architecture`
 
-- `chore: scaffold tauri react app`
+## Phase 2: Shared Protocol And Control Service Foundation
 
-## Step 3. Install UI Foundation
+Deliverables:
 
-Output:
+- reusable Rust protocol crate with versioned DTOs and stable error codes;
+- lightweight Rust HTTP service with SQLite migrations;
+- health endpoint, admin bootstrap authentication, structured redacted logging;
+- integration-test harness using an isolated temporary database.
 
-- Tailwind configured
-- shadcn/ui initialized
-- base tokens and theme CSS created from `DESIGN.md`
-- core layout primitives ready
+Commit: `feat(control): add service and protocol foundation`
 
-Commit goal:
+## Phase 3: Node Enrollment And Desired State
 
-- `feat: add design tokens and ui foundation`
+Deliverables:
 
-## Step 4. Build Navigation Shell
+- one-time node invitation creation and atomic consumption;
+- unique node credentials with rotation and revocation;
+- heartbeat, desired revision fetch, and apply-result APIs;
+- idempotency, replay protection, stale-node detection, and audit events;
+- Node Host headless agent scaffold with local durable state.
 
-Output:
+Commit: `feat(node): add secure enrollment and config sync`
 
-- application frame with sidebar and top bar
-- placeholder pages for Dashboard, Users, Config, Diagnostics, Logs, Backups, Settings
-- visual system applied consistently
+## Phase 4: Node Xray Lifecycle And Reachability
 
-Commit goal:
+Deliverables:
 
-- `feat: build application shell`
+- pinned Xray install/bundle and supervisor;
+- signed config validation, atomic activation, health check, and rollback;
+- external endpoint probe and direct mode;
+- consent-gated UPnP/NAT-PMP/PCP mapping;
+- optional raw TCP relay adapter and relay assignment;
+- local pause, schedule, transfer cap, and leave-network controls.
 
-## Step 5. Add Local Xray Inspection
+Commit: `feat(node): add managed xray and reachability modes`
 
-Output:
+## Phase 5: Member Accounts And Signed Bundles
 
-- commands to inspect xray installation, service state, config path, and network basics
-- frontend status cards wired to backend commands
+Deliverables:
 
-Commit goal:
+- account, activation, device session, reset, and revocation APIs;
+- user/node assignment and per-node credential generation;
+- immutable signed multi-node profile bundles with offline validity;
+- audit events and cross-node disable/delete behavior.
 
-- `feat: add local xray inspection`
+Commit: `feat(control): add member accounts and profile bundles`
 
-## Step 6. Add User Management MVP
+## Phase 6: Connect Account Experience
 
-Output:
+Deliverables:
 
-- read VLESS users from config
-- add user, delete user, regenerate link
-- validate config before save
+- activation/login and refresh-token storage in OS credentials;
+- signed bundle verification and atomic offline cache;
+- manual, automatic, and fallback node selection;
+- existing Xray supervisor integration;
+- compatibility import retained outside the primary onboarding flow.
 
-Commit goal:
+Commit: `feat(client): add account sync and multi-node selection`
 
-- `feat: add vless user management`
+## Phase 7: Telemetry Aggregation And Operations
 
-## Step 7. Add Diagnostics MVP
+Deliverables:
 
-Output:
+- node-local ordered usage batches and idempotent server ingestion;
+- per-user/per-node aggregates, retention, purge, and data-quality state;
+- backups, restore, schema upgrades, support bundle, and service installers;
+- macOS/Windows/Linux and direct/relay failure-matrix tests.
 
-- config test results
-- listening port checks
-- recent logs and failure hints
+Commit: `feat(platform): add telemetry and operational recovery`
 
-Commit goal:
+## Engineering Rules
 
-- `feat: add diagnostics workflow`
-
-## Working Rules
-
-- Each step should leave the app in a runnable state
-- No direct config writes without backup creation
-- No hidden state outside documented files unless intentionally designed
-- Prefer explicit local commands over magical background behavior
+- Control plane and data plane remain independent; control outage does not stop valid data plane.
+- Node Host receives declarative desired state, never shell commands.
+- Every secret has a named owner, storage location, rotation path, and redaction test.
+- Every retryable write has an idempotency key or monotonic sequence.
+- Every config mutation validates, backs up, applies atomically, health-checks, and can roll back.
+- Every background task has a timeout and cannot block the Tauri UI thread.
+- Protocol changes are backward-compatible within a declared support window or require an explicit
+  minimum-version response.
+- Each phase updates the authoritative documentation before its implementation commit closes.
