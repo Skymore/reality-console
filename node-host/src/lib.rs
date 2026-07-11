@@ -34,7 +34,7 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
@@ -42,6 +42,7 @@ const MIGRATION_3_NAME: &str = "node_control_sync_state";
 const MIGRATION_4_NAME: &str = "node_desired_state_receipt";
 const MIGRATION_5_NAME: &str = "node_xray_runtime_configuration";
 const MIGRATION_6_NAME: &str = "node_rendered_xray_configs";
+const MIGRATION_7_NAME: &str = "node_xray_activation_state";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -174,6 +175,77 @@ const MIGRATION_6: &str = "
     BEFORE DELETE ON rendered_xray_configs
     BEGIN
         SELECT RAISE(ABORT, 'rendered Xray configs are immutable');
+    END;
+";
+
+const MIGRATION_7: &str = "
+    CREATE TABLE xray_active_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        applied_revision INTEGER
+            REFERENCES rendered_xray_configs(revision) ON DELETE RESTRICT,
+        config_digest TEXT,
+        binary_digest TEXT,
+        generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+        restart_count INTEGER NOT NULL DEFAULT 0 CHECK (restart_count >= 0),
+        applied_at INTEGER,
+        updated_at INTEGER NOT NULL,
+        CHECK (
+            (applied_revision IS NULL
+                AND config_digest IS NULL
+                AND binary_digest IS NULL
+                AND applied_at IS NULL)
+            OR
+            (applied_revision IS NOT NULL
+                AND length(config_digest) = 71
+                AND substr(config_digest, 1, 7) = 'sha256:'
+                AND substr(config_digest, 8) NOT GLOB '*[^0-9a-f]*'
+                AND length(binary_digest) = 64
+                AND binary_digest NOT GLOB '*[^0-9a-f]*'
+                AND applied_at IS NOT NULL)
+        )
+    ) STRICT;
+
+    INSERT INTO xray_active_state(
+        singleton, generation, restart_count, updated_at
+    ) VALUES (1, 0, 0, 0);
+
+    CREATE TABLE xray_activation_journal (
+        revision INTEGER PRIMARY KEY
+            REFERENCES rendered_xray_configs(revision) ON DELETE RESTRICT,
+        previous_revision INTEGER
+            REFERENCES rendered_xray_configs(revision) ON DELETE RESTRICT,
+        phase TEXT NOT NULL CHECK (
+            phase IN (
+                'activating', 'stabilizing', 'retryPending', 'applied',
+                'rollingBack', 'rolledBack', 'rejected', 'recoveryRequired'
+            )
+        ),
+        attempt_count INTEGER NOT NULL CHECK (attempt_count > 0),
+        started_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        error_code TEXT CHECK (error_code IS NULL OR length(error_code) BETWEEN 1 AND 128),
+        CHECK (previous_revision IS NULL OR previous_revision < revision),
+        CHECK (
+            (phase IN ('applied', 'rolledBack', 'rejected', 'recoveryRequired')
+                AND completed_at IS NOT NULL)
+            OR
+            (phase NOT IN ('applied', 'rolledBack', 'rejected', 'recoveryRequired')
+                AND completed_at IS NULL)
+        )
+    ) STRICT;
+
+    CREATE TRIGGER xray_activation_journal_identity_no_update
+    BEFORE UPDATE OF revision, previous_revision, started_at
+    ON xray_activation_journal
+    BEGIN
+        SELECT RAISE(ABORT, 'Xray activation journal identity is immutable');
+    END;
+
+    CREATE TRIGGER xray_activation_journal_no_delete
+    BEFORE DELETE ON xray_activation_journal
+    BEGIN
+        SELECT RAISE(ABORT, 'Xray activation journal is retained for recovery');
     END;
 ";
 
@@ -363,6 +435,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 4, MIGRATION_4_NAME, MIGRATION_4)?;
     apply_migration(&transaction, 5, MIGRATION_5_NAME, MIGRATION_5)?;
     apply_migration(&transaction, 6, MIGRATION_6_NAME, MIGRATION_6)?;
+    apply_migration(&transaction, 7, MIGRATION_7_NAME, MIGRATION_7)?;
     transaction.commit()?;
     Ok(())
 }
@@ -427,6 +500,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (4, MIGRATION_4_NAME, MIGRATION_4),
         (5, MIGRATION_5_NAME, MIGRATION_5),
         (6, MIGRATION_6_NAME, MIGRATION_6),
+        (7, MIGRATION_7_NAME, MIGRATION_7),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");

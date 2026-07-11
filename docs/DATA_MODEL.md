@@ -401,6 +401,13 @@ contract and migration table.
   validation time. The corresponding 0600 JSON is under a 0700 node data subdirectory, is created
   without overwriting an existing artifact, and is digest-checked before a queued `validated`
   result can be retried.
+- `xray_active_state`: the singleton durable pointer to the last locally proven revision, config
+  digest, historical binary digest, generation, restart count, and apply timestamps. A null pointer
+  means no revision has ever passed activation health; it is not inferred from a process ID.
+- `xray_activation_journal`: one retained row per attempted revision with an immutable predecessor,
+  start time, mutable closed phase, attempt count, completion time, and stable secret-free error
+  code. An interrupted nonterminal row forces conservative startup recovery before any newer
+  candidate can run.
 - `apply_journal`: one row per revision with envelope artifact reference/digest, state
   (`received`, `validated`, `activating`, `applied`, `rejected`, `rolling_back`, `rolled_back`),
   rendered config digest, predecessor revision, timestamps, attempt count, and error code. State

@@ -68,9 +68,9 @@ fn migrations_are_recorded_once_and_pragmas_are_enabled() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("migration metadata");
-    assert_eq!(count, 6);
+    assert_eq!(count, 7);
     assert_eq!(journal_mode, "wal");
-    assert_eq!(user_version, 6);
+    assert_eq!(user_version, 7);
     assert_eq!(migration.0, "node_host_foundation");
     assert_eq!(migration.1.len(), 64);
     assert!(migration.2 > 0);
@@ -85,7 +85,12 @@ fn schema_five_upgrades_without_recreating_node_identity() {
     let connection = Connection::open(data_dir.join("node-host.sqlite3")).expect("open database");
     connection
         .execute_batch(
-            "DROP TRIGGER rendered_xray_configs_no_update;
+            "DROP TRIGGER xray_activation_journal_identity_no_update;
+             DROP TRIGGER xray_activation_journal_no_delete;
+             DROP TABLE xray_activation_journal;
+             DROP TABLE xray_active_state;
+             DELETE FROM schema_migrations WHERE version = 7;
+             DROP TRIGGER rendered_xray_configs_no_update;
              DROP TRIGGER rendered_xray_configs_no_delete;
              DROP TABLE rendered_xray_configs;
              DELETE FROM schema_migrations WHERE version = 6;
@@ -96,7 +101,7 @@ fn schema_five_upgrades_without_recreating_node_identity() {
 
     let upgraded = node_host::initialize(&data_dir, "https://controller.example")
         .expect("upgrade existing schema");
-    assert_eq!(upgraded.schema_version, 6);
+    assert_eq!(upgraded.schema_version, 7);
     assert_eq!(
         upgraded.identity_public_key.as_str(),
         original.identity_public_key.as_str()
