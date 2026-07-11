@@ -68,9 +68,9 @@ fn migrations_are_recorded_once_and_pragmas_are_enabled() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("migration metadata");
-    assert_eq!(count, 4);
+    assert_eq!(count, 5);
     assert_eq!(journal_mode, "wal");
-    assert_eq!(user_version, 4);
+    assert_eq!(user_version, 5);
     assert_eq!(migration.0, "node_host_foundation");
     assert_eq!(migration.1.len(), 64);
     assert!(migration.2 > 0);
@@ -84,6 +84,7 @@ fn cli_exposes_single_cycle_sync_command() {
         .assert()
         .success()
         .stdout(predicate::str::contains("sync-once"))
+        .stdout(predicate::str::contains("configure-xray"))
         .stdout(predicate::str::contains("run"));
 }
 

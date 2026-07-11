@@ -3,6 +3,7 @@
 mod enrollment;
 mod service;
 mod sync;
+mod xray;
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -21,7 +22,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use x25519_dalek::{PublicKey as X25519DalekPublicKey, StaticSecret};
@@ -31,13 +32,15 @@ const DATABASE_FILE: &str = "node-host.sqlite3";
 const LOCK_FILE: &str = "node-host.lock";
 const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
+const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+const CURRENT_SCHEMA_VERSION: i64 = 5;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
 const MIGRATION_3_NAME: &str = "node_control_sync_state";
 const MIGRATION_4_NAME: &str = "node_desired_state_receipt";
+const MIGRATION_5_NAME: &str = "node_xray_runtime_configuration";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -129,9 +132,24 @@ const MIGRATION_4: &str = "
     END;
 ";
 
+const MIGRATION_5: &str = "
+    CREATE TABLE xray_runtime_config (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        binary_path TEXT NOT NULL CHECK (length(binary_path) BETWEEN 1 AND 4096),
+        expected_sha256 TEXT NOT NULL CHECK (
+            length(expected_sha256) = 64
+            AND expected_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        version TEXT NOT NULL CHECK (length(version) BETWEEN 1 AND 256),
+        configured_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    ) STRICT;
+";
+
 pub use enrollment::join;
 pub use service::{run, run_until, SyncLoopOptions};
 pub use sync::sync_once;
+pub use xray::configure_xray;
 
 /// Safe enrollment state rendered by the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -175,6 +193,18 @@ pub struct HostStatus {
     pub last_sync_at: Option<Timestamp>,
     /// Highest desired-state revision durably accepted by this host.
     pub desired_revision_cursor: i64,
+    /// Whether an installer-provided, checksum-pinned Xray runtime is configured.
+    pub xray_configured: bool,
+    /// Explicit validated Xray binary path, when configured.
+    pub xray_binary_path: Option<PathBuf>,
+    /// Trusted lowercase SHA-256 of the configured Xray binary.
+    pub xray_expected_sha256: Option<String>,
+    /// Safe first line returned by the bounded Xray version probe.
+    pub xray_version: Option<String>,
+    /// Public REALITY key derived from the node-local private identity.
+    pub reality_public_key: Option<X25519PublicKey>,
+    /// Stable node-local REALITY short ID.
+    pub reality_short_id: Option<String>,
 }
 
 /// A seed whose formatting can never reveal its bytes.
@@ -205,7 +235,7 @@ pub fn initialize(data_dir: &Path, controller: &str) -> Result<HostStatus> {
     migrate(&mut connection)?;
     configure_controller(&connection, &controller)?;
     let identity = Identity::load_or_create(data_dir)?;
-    build_status(&connection, controller, &identity)
+    build_status(&connection, data_dir, controller, &identity)
 }
 
 /// Reads initialized state while holding the data-directory lock.
@@ -228,7 +258,7 @@ pub fn status(data_dir: &Path) -> Result<HostStatus> {
         .context("node host is not initialized")?;
     let controller = parse_controller(&controller_value)?;
     let identity = Identity::load(data_dir)?;
-    build_status(&connection, controller, &identity)
+    build_status(&connection, data_dir, controller, &identity)
 }
 
 fn parse_controller(value: &str) -> Result<Url> {
@@ -296,6 +326,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 2, MIGRATION_2_NAME, MIGRATION_2)?;
     apply_migration(&transaction, 3, MIGRATION_3_NAME, MIGRATION_3)?;
     apply_migration(&transaction, 4, MIGRATION_4_NAME, MIGRATION_4)?;
+    apply_migration(&transaction, 5, MIGRATION_5_NAME, MIGRATION_5)?;
     transaction.commit()?;
     Ok(())
 }
@@ -358,6 +389,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (2, MIGRATION_2_NAME, MIGRATION_2),
         (3, MIGRATION_3_NAME, MIGRATION_3),
         (4, MIGRATION_4_NAME, MIGRATION_4),
+        (5, MIGRATION_5_NAME, MIGRATION_5),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");
@@ -423,6 +455,7 @@ fn configure_controller(connection: &Connection, controller: &Url) -> Result<()>
 
 fn build_status(
     connection: &Connection,
+    data_dir: &Path,
     controller: Url,
     identity: &Identity,
 ) -> Result<HostStatus> {
@@ -433,6 +466,22 @@ fn build_status(
     )?;
     let registration = load_registration_status(connection)?;
     let sync_status = load_sync_status(connection)?;
+    let xray_status = xray::load_xray_runtime_status(connection, data_dir)?;
+    let (
+        xray_binary_path,
+        xray_expected_sha256,
+        xray_version,
+        reality_public_key,
+        reality_short_id,
+    ) = xray_status.map_or((None, None, None, None, None), |status| {
+        (
+            Some(status.binary_path),
+            Some(status.expected_sha256),
+            Some(status.version),
+            Some(status.reality_public_key),
+            Some(status.reality_short_id),
+        )
+    });
     Ok(HostStatus {
         controller,
         identity_public_key: identity.ed25519_public()?,
@@ -448,6 +497,12 @@ fn build_status(
         last_heartbeat_at: sync_status.last_heartbeat_at,
         last_sync_at: sync_status.last_sync_at,
         desired_revision_cursor: sync_status.desired_revision_cursor,
+        xray_configured: xray_binary_path.is_some(),
+        xray_binary_path,
+        xray_expected_sha256,
+        xray_version,
+        reality_public_key,
+        reality_short_id,
     })
 }
 

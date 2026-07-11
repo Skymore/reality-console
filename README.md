@@ -26,8 +26,10 @@ envelopes without applying them to Xray yet. Control Service exposes redacted no
 explicit approve, disable, and revoke operations; it can publish immutable signed revisions and
 record monotonic receive/validate/apply/rollback results. Enrollment and heartbeat never activate
 a node implicitly or overwrite controller-owned desired state. Node Host also has a resilient
-outbound sync loop with jitter, bounded retry backoff, and graceful process shutdown. The Xray
-runtime crate builds deterministic `VLESS + REALITY`
+outbound sync loop with jitter, bounded retry backoff, and graceful process shutdown. Its installer
+integration can verify and pin an explicit Xray binary, probe its version, and create a separate
+owner-only REALITY identity without starting the process. The Xray runtime crate builds
+deterministic `VLESS + REALITY`
 configuration, verifies an explicit checksum-pinned binary, and runs bounded version/config tests
 without starting a listener. Native service installers, atomic Xray activation/supervision,
 account synchronization, and relay fallback remain under active implementation.
@@ -86,6 +88,12 @@ node-host join \
 
 # Development foreground service; the installer will register this automatically.
 node-host run --data-dir ./node-state
+
+# Installer integration only; friends will not enter this manually.
+node-host configure-xray \
+  --data-dir ./node-state \
+  --binary-path /absolute/path/to/bundled/xray \
+  --sha256 64-lowercase-hex-characters
 ```
 
 The future desktop wrapper will pass the same invitation in memory from a QR code or deep link, so

@@ -192,8 +192,8 @@ deleted and the invitation remains consumed. Re-pairing requires a new invitatio
 
 ### 6.4 Headless Development Flow
 
-The current headless implementation exposes `init`, `join`, `sync-once`, and `status`. `join`
-consumes the exact
+The current headless implementation exposes `init`, `join`, `configure-xray`, `sync-once`, `run`,
+and `status`. `join` consumes the exact
 JSON invitation returned by Control Service, requires both provider-consent flags, reuses the
 installation's owner-only Ed25519/X25519 identities, and persists registration only after verifying
 the controller fingerprint and signed response. On Unix, the invitation file must be a regular
@@ -207,6 +207,13 @@ approval and activation remain separate control-plane steps. The operator sees a
 summary and explicitly approves it through Control Service. Heartbeat cannot approve it. Disabling
 the node immediately blocks control authentication; revoking it also atomically revokes all of its
 node credentials.
+
+`configure-xray` is an installer/service integration command, not friend-facing setup. It accepts
+only an explicit absolute binary path and installer-manifest SHA-256, rejects unsafe file metadata,
+revalidates the digest, runs a bounded no-shell `xray version` probe, and then records the pin. A
+different pin requires explicit replacement. Only after verification succeeds does Node Host
+create a separate owner-only REALITY X25519 seed; SQLite stores its public key and stable short ID
+but never its private bytes. This command does not generate desired config or start Xray.
 
 `sync-once` performs outbound signed result retries, one signed heartbeat, and one signed
 desired-state fetch. It records heartbeat and complete-cycle timestamps locally and uses a fresh

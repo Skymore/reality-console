@@ -137,7 +137,7 @@ pub async fn sync_once(data_dir: &Path) -> Result<HostStatus> {
     }
 
     persist_sync_success(&connection)?;
-    build_status(&connection, controller, &identity)
+    build_status(&connection, data_dir, controller, &identity)
 }
 
 fn current_heartbeat(desired_revision_cursor: i64) -> Result<NodeHeartbeat> {

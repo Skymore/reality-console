@@ -85,7 +85,7 @@ pub async fn join(
         invitation.controller_fingerprint.as_str(),
         &response,
     )?;
-    build_status(&connection, controller, &identity)
+    build_status(&connection, data_dir, controller, &identity)
 }
 
 fn read_invitation(path: &Path) -> Result<CreateNodeInvitationResponse> {

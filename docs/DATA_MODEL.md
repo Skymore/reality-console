@@ -389,6 +389,9 @@ contract and migration table.
 - `controller_registration`: controller URL, network ID, controller epoch, pinned signing public
   keys, node-auth `secret_ref`, credential ID, supported schema versions, last contact, and
   credential-rotation state.
+- `xray_runtime_config`: installer-supplied absolute binary path, trusted SHA-256, bounded version
+  probe result, and configuration/update times. The separate REALITY private seed remains in the
+  owner-only secret store; only its public key and derived short ID are exposed by safe status.
 - `apply_journal`: one row per revision with envelope artifact reference/digest, state
   (`received`, `validated`, `activating`, `applied`, `rejected`, `rolling_back`, `rolled_back`),
   rendered config digest, predecessor revision, timestamps, attempt count, and error code. State

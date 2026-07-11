@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use node_host::{initialize, join, run, status, sync_once, HostStatus, SyncLoopOptions};
+use node_host::{
+    configure_xray, initialize, join, run, status, sync_once, HostStatus, SyncLoopOptions,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -52,6 +54,21 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Verify and pin an installer-provided Xray runtime without starting it.
+    ConfigureXray {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Explicit absolute path to the installed Xray executable.
+        #[arg(long)]
+        binary_path: PathBuf,
+        /// Trusted 64-character SHA-256 supplied by the installer manifest.
+        #[arg(long)]
+        sha256: String,
+        /// Explicitly replace a different existing binary pin.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Run resilient outbound synchronization until the process is stopped.
     Run {
         /// Persistent state directory.
@@ -94,6 +111,12 @@ async fn main() -> Result<()> {
         }
         Command::Status { data_dir } => status(&data_dir)?,
         Command::SyncOnce { data_dir } => sync_once(&data_dir).await?,
+        Command::ConfigureXray {
+            data_dir,
+            binary_path,
+            sha256,
+            replace,
+        } => configure_xray(&data_dir, &binary_path, &sha256, replace).await?,
         Command::Run {
             data_dir,
             sync_interval_seconds,
@@ -160,4 +183,25 @@ fn print_status(status: &HostStatus) {
         "desired_revision_cursor: {}",
         status.desired_revision_cursor
     );
+    println!("xray_configured: {}", status.xray_configured);
+    match &status.xray_binary_path {
+        Some(path) => println!("xray_binary_path: {}", path.display()),
+        None => println!("xray_binary_path: none"),
+    }
+    match &status.xray_expected_sha256 {
+        Some(digest) => println!("xray_expected_sha256: {digest}"),
+        None => println!("xray_expected_sha256: none"),
+    }
+    match &status.xray_version {
+        Some(version) => println!("xray_version: {version}"),
+        None => println!("xray_version: none"),
+    }
+    match &status.reality_public_key {
+        Some(public_key) => println!("reality_public_key: {}", public_key.as_str()),
+        None => println!("reality_public_key: none"),
+    }
+    match &status.reality_short_id {
+        Some(short_id) => println!("reality_short_id: {short_id}"),
+        None => println!("reality_short_id: none"),
+    }
 }
