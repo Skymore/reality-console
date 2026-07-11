@@ -133,7 +133,13 @@ fn signed_enrollment_with_key(
         agent_version: "0.1.0".to_string(),
         platform: "macos-arm64".to_string(),
         display_name: "Living room Mac".to_string(),
-        capabilities: vec![NodeCapability::Xray, NodeCapability::DirectTcp],
+        capabilities: vec![
+            NodeCapability::Xray,
+            NodeCapability::DirectTcp,
+            NodeCapability::Pcp,
+            NodeCapability::NatPmp,
+            NodeCapability::Upnp,
+        ],
         identity_public_key,
         encryption_public_key,
         nonce,
@@ -142,6 +148,7 @@ fn signed_enrollment_with_key(
             policy_version: "2026-07-11".to_string(),
             host_owner_consented: true,
             exit_ip_disclosure_accepted: true,
+            router_mapping_accepted: true,
             accepted_at: Timestamp::from_datetime(OffsetDateTime::now_utc()),
         },
     };
@@ -723,11 +730,12 @@ async fn admin_node_list_is_complete_and_redacts_key_material() {
     assert_eq!(summary["xrayVersion"], "26.7.11");
     assert_eq!(
         summary["capabilities"],
-        serde_json::json!(["xray", "direct-tcp"])
+        serde_json::json!(["xray", "direct-tcp", "pcp", "nat-pmp", "upnp"])
     );
     assert_eq!(summary["providerConsent"]["policyVersion"], "2026-07-11");
     assert_eq!(summary["providerConsent"]["hostOwnerConsented"], true);
     assert_eq!(summary["providerConsent"]["exitIpDisclosureAccepted"], true);
+    assert_eq!(summary["providerConsent"]["routerMappingAccepted"], true);
     assert!(summary["providerConsent"]["acceptedAt"].is_string());
     assert!(summary["lastSeenAt"].is_string());
     assert_eq!(summary["runtimeState"], "serving");
@@ -1068,6 +1076,26 @@ async fn provider_nonconsent_is_rejected_without_consuming_invitation() {
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     assert_eq!(json(rejected).await["error"]["code"], "validation_failed");
     assert_eq!(enroll(&app, &valid).await.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn router_mapping_capabilities_require_matching_provider_consent() {
+    let app = TestApp::new();
+    let invitation = create_invitation(&app, 900).await;
+    let (valid, _) = signed_enrollment(&invitation);
+
+    let mut missing_consent = valid.clone();
+    missing_consent.provider_consent.router_mapping_accepted = false;
+    assert!(missing_consent.validate().is_err());
+
+    let mut missing_capability = valid;
+    missing_capability.capabilities.retain(|capability| {
+        !matches!(
+            capability,
+            NodeCapability::Pcp | NodeCapability::NatPmp | NodeCapability::Upnp
+        )
+    });
+    assert!(missing_capability.validate().is_err());
 }
 
 #[tokio::test]
@@ -2139,5 +2167,5 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (6, 6, 1, 1, 1));
+    assert_eq!(durable, (7, 7, 1, 1, 1));
 }

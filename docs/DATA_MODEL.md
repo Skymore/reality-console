@@ -171,6 +171,7 @@ forbid changing a consumed invitation back to unused.
 | `last_seen_at` | Nullable last authenticated heartbeat time |
 | `last_heartbeat_generation` | Last accepted positive Node Host snapshot generation |
 | `last_heartbeat_sha256` | Canonical 32-byte digest used to recognize exact retries |
+| `consent_router_mapping` | Signed provider choice allowing narrow automatic mapping |
 | `created_at`, `approved_at`, `revoked_at`, `removed_at` | Lifecycle timestamps |
 
 Node enrollment consumes the invitation, inserts `nodes`, inserts the first authentication
@@ -392,17 +393,18 @@ Telemetry ingestion uses `BEGIN IMMEDIATE` on the node cursor:
 time, actor, and target. Enrollment, account, assignment, revision, rollout gate, rollback,
 revocation, purge, migration, backup restore, and recovery-fence actions are mandatory audit events.
 
-## 4. Node Host Local Schema Version 1
+## 4. Node Host Local Schema
 
-The Node Host database is owner-only and bound to one enrolled `node_id`. It uses the same SQLite
-contract and migration table.
+The implemented Node Host migration version is 9. The database is owner-only and bound to one
+enrolled `node_id`; it uses the same SQLite contract and migration table. The list below includes
+implemented tables and later planned policy/telemetry expansions.
 
 - `node_identity`: singleton row containing `network_id`, `node_id`, public identity, identity
   `secret_ref`, installation ID, created time, and revocation state. It is never regenerated because
   metadata is corrupt.
-- `provider_policy`: singleton versioned row containing provider pause, consent flags, schedule JSON,
-  monthly transfer cap, optional bandwidth and concurrent-session limits, effective time, and update
-  time. Local policy always overrides controller desire toward less sharing.
+- `provider_network_policy`: singleton provider-owned automatic-mapping flag, durable consent time,
+  separately gated permanent-UPnP flag, and update time. Local policy always overrides controller
+  desire toward less sharing.
 - `controller_registration`: controller URL, network ID, controller epoch, pinned signing public
   keys, node-auth `secret_ref`, credential ID, supported schema versions, last contact, and
   credential-rotation state.
@@ -425,6 +427,10 @@ contract and migration table.
   start time, mutable closed phase, attempt count, completion time, and stable secret-free error
   code. An interrupted nonterminal row forces conservative startup recovery before any newer
   candidate can run.
+- `router_mapping_leases`: one retained row per finite owned mapping. It binds mapping and endpoint
+  IDs, applied revision, PCP/NAT-PMP/UPnP source, gateway and internal/external addresses and ports,
+  protocol-specific ownership evidence, lease interval, closed lifecycle state, and stable failure
+  code. A partial unique index permits only one active or releasing mapping.
 - `apply_journal`: one row per revision with envelope artifact reference/digest, state
   (`received`, `validated`, `activating`, `applied`, `rejected`, `rolling_back`, `rolled_back`),
   rendered config digest, predecessor revision, timestamps, attempt count, and error code. State

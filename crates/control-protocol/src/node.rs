@@ -158,6 +158,21 @@ impl EnrollNodeRequest {
                 "capabilities must be unique and bounded",
             ));
         }
+        let has_mapping_capability = self.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                NodeCapability::Upnp | NodeCapability::NatPmp | NodeCapability::Pcp
+            )
+        });
+        if has_mapping_capability != self.provider_consent.router_mapping_accepted
+            || (has_mapping_capability && !self.capabilities.contains(&NodeCapability::DirectTcp))
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "capabilities",
+                "router mapping capabilities require matching consent and direct TCP support",
+            ));
+        }
         self.provider_consent.validate()
     }
 }
@@ -172,6 +187,8 @@ pub struct ProviderConsent {
     pub host_owner_consented: bool,
     /// Confirms acknowledgement that the public IP becomes an exit IP.
     pub exit_ip_disclosure_accepted: bool,
+    /// Permits this installation to request a narrow router port mapping.
+    pub router_mapping_accepted: bool,
     /// Time of local acceptance.
     pub accepted_at: Timestamp,
 }

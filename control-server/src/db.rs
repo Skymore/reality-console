@@ -39,7 +39,7 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
@@ -532,6 +532,11 @@ CREATE INDEX node_endpoint_verifications_status
     ON node_endpoint_verifications(network_id, status, updated_at);
 ";
 
+const MIGRATION_7_SQL: &str = r"
+ALTER TABLE nodes ADD COLUMN consent_router_mapping INTEGER NOT NULL DEFAULT 0
+    CHECK(consent_router_mapping IN (0, 1));
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -568,6 +573,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "controller_owned_endpoint_verification",
         sql: MIGRATION_6_SQL,
+    },
+    Migration {
+        version: 7,
+        name: "router_mapping_consent",
+        sql: MIGRATION_7_SQL,
     },
 ];
 
@@ -606,6 +616,15 @@ pub struct AuthenticatedNode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeProviderConsentRecord {
+    pub policy_version: String,
+    pub host_owner: bool,
+    pub exit_ip: bool,
+    pub router_mapping: bool,
+    pub accepted_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeSummaryRecord {
     pub node_id: NodeId,
     pub network_id: String,
@@ -615,10 +634,7 @@ pub struct NodeSummaryRecord {
     pub agent_version: String,
     pub xray_version: Option<String>,
     pub capabilities: Vec<NodeCapability>,
-    pub consent_policy_version: String,
-    pub consent_host_owner: bool,
-    pub consent_exit_ip: bool,
-    pub consent_accepted_at: i64,
+    pub provider_consent: NodeProviderConsentRecord,
     pub last_seen_at: Option<i64>,
     pub runtime_state: Option<String>,
     pub provider_paused: bool,
@@ -2204,6 +2220,7 @@ struct RawNodeSummary {
     consent_policy_version: String,
     consent_host_owner: i64,
     consent_exit_ip: i64,
+    consent_router_mapping: i64,
     consent_accepted_at: i64,
     last_seen_at: Option<i64>,
     runtime_state: Option<String>,
@@ -2222,7 +2239,8 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
     let mut statement = connection.prepare(
         "SELECT node_id, network_id, display_name, status, platform, agent_version,
                 xray_version, capabilities_json, consent_policy_version,
-                consent_host_owner, consent_exit_ip, consent_accepted_at,
+                consent_host_owner, consent_exit_ip, consent_router_mapping,
+                consent_accepted_at,
                 last_seen_at, runtime_state, provider_paused, desired_revision,
                 received_revision, validated_revision, applied_revision,
                 telemetry_cursor, created_at, updated_at
@@ -2243,17 +2261,18 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
             consent_policy_version: row.get(8)?,
             consent_host_owner: row.get(9)?,
             consent_exit_ip: row.get(10)?,
-            consent_accepted_at: row.get(11)?,
-            last_seen_at: row.get(12)?,
-            runtime_state: row.get(13)?,
-            provider_paused: row.get(14)?,
-            desired_revision: row.get(15)?,
-            received_revision: row.get(16)?,
-            validated_revision: row.get(17)?,
-            applied_revision: row.get(18)?,
-            telemetry_cursor: row.get(19)?,
-            created_at: row.get(20)?,
-            updated_at: row.get(21)?,
+            consent_router_mapping: row.get(11)?,
+            consent_accepted_at: row.get(12)?,
+            last_seen_at: row.get(13)?,
+            runtime_state: row.get(14)?,
+            provider_paused: row.get(15)?,
+            desired_revision: row.get(16)?,
+            received_revision: row.get(17)?,
+            validated_revision: row.get(18)?,
+            applied_revision: row.get(19)?,
+            telemetry_cursor: row.get(20)?,
+            created_at: row.get(21)?,
+            updated_at: row.get(22)?,
         })
     })?;
 
@@ -2272,10 +2291,13 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
             agent_version: row.agent_version,
             xray_version: row.xray_version,
             capabilities: serde_json::from_str(&row.capabilities_json)?,
-            consent_policy_version: row.consent_policy_version,
-            consent_host_owner: row.consent_host_owner != 0,
-            consent_exit_ip: row.consent_exit_ip != 0,
-            consent_accepted_at: row.consent_accepted_at,
+            provider_consent: NodeProviderConsentRecord {
+                policy_version: row.consent_policy_version,
+                host_owner: row.consent_host_owner != 0,
+                exit_ip: row.consent_exit_ip != 0,
+                router_mapping: row.consent_router_mapping != 0,
+                accepted_at: row.consent_accepted_at,
+            },
             last_seen_at: row.last_seen_at,
             runtime_state: row.runtime_state,
             provider_paused: row.provider_paused != 0,
@@ -2570,7 +2592,8 @@ fn enroll_node(
             "agentVersion": request.agent_version,
             "invitationId": invitation_id,
             "platform": request.platform,
-            "providerConsentPolicyVersion": request.provider_consent.policy_version
+            "providerConsentPolicyVersion": request.provider_consent.policy_version,
+            "routerMappingAccepted": request.provider_consent.router_mapping_accepted
         }),
         now,
     )?;
@@ -2759,8 +2782,8 @@ fn insert_node_records(
             node_id, network_id, display_name, status, agent_version, platform,
             capabilities_json, identity_public_key, encryption_public_key,
             consent_policy_version, consent_host_owner, consent_exit_ip,
-            consent_accepted_at, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, 1, 1, ?10, ?11, ?11)",
+            consent_router_mapping, consent_accepted_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, 1, 1, ?10, ?11, ?12, ?12)",
         params![
             created.node_id.to_string(),
             network_id,
@@ -2771,6 +2794,7 @@ fn insert_node_records(
             request.identity_public_key.as_str(),
             request.encryption_public_key.as_str(),
             request.provider_consent.policy_version,
+            i64::from(request.provider_consent.router_mapping_accepted),
             request
                 .provider_consent
                 .accepted_at

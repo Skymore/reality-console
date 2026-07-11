@@ -1,7 +1,7 @@
 use crate::enrollment::{
     join_invitation, parse_invitation_json, read_invitation, require_provider_consent,
 };
-use crate::{configure_xray, initialize, HostStatus};
+use crate::{configure_xray, initialize, mapping::configure_bootstrap_policy, HostStatus};
 use anyhow::{Context as _, Result};
 use control_protocol::node::CreateNodeInvitationResponse;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ pub struct BootstrapRequest {
     xray_sha256: String,
     accept_host_owner: bool,
     accept_exit_ip: bool,
+    accept_router_mapping: bool,
 }
 
 impl BootstrapRequest {
@@ -34,6 +35,7 @@ impl BootstrapRequest {
         xray_sha256: impl Into<String>,
         accept_host_owner: bool,
         accept_exit_ip: bool,
+        accept_router_mapping: bool,
     ) -> Result<Self> {
         Ok(Self {
             invitation: parse_invitation_json(invitation_json)?,
@@ -42,6 +44,7 @@ impl BootstrapRequest {
             xray_sha256: xray_sha256.into(),
             accept_host_owner,
             accept_exit_ip,
+            accept_router_mapping,
         })
     }
 
@@ -60,6 +63,7 @@ impl BootstrapRequest {
         xray_sha256: impl Into<String>,
         accept_host_owner: bool,
         accept_exit_ip: bool,
+        accept_router_mapping: bool,
     ) -> Result<Self> {
         Ok(Self {
             invitation: read_invitation(invitation_file)?,
@@ -68,6 +72,7 @@ impl BootstrapRequest {
             xray_sha256: xray_sha256.into(),
             accept_host_owner,
             accept_exit_ip,
+            accept_router_mapping,
         })
     }
 }
@@ -95,6 +100,8 @@ pub async fn bootstrap(data_dir: &Path, request: BootstrapRequest) -> Result<Hos
     )
     .await
     .context("Node Host bootstrap could not verify the bundled Xray runtime")?;
+    configure_bootstrap_policy(data_dir, request.accept_router_mapping)
+        .context("Node Host bootstrap could not persist the router-mapping preference")?;
     join_invitation(
         data_dir,
         request.invitation,

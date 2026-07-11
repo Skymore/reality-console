@@ -4,6 +4,7 @@ mod activation;
 mod admission;
 mod bootstrap;
 mod enrollment;
+mod mapping;
 mod service;
 mod sync;
 mod xray;
@@ -37,7 +38,7 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 8;
+const CURRENT_SCHEMA_VERSION: i64 = 9;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
@@ -47,6 +48,7 @@ const MIGRATION_5_NAME: &str = "node_xray_runtime_configuration";
 const MIGRATION_6_NAME: &str = "node_rendered_xray_configs";
 const MIGRATION_7_NAME: &str = "node_xray_activation_state";
 const MIGRATION_8_NAME: &str = "node_heartbeat_generation";
+const MIGRATION_9_NAME: &str = "node_router_mapping_state";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -259,8 +261,79 @@ const MIGRATION_8: &str = "
         CHECK (heartbeat_generation >= 0);
 ";
 
+const MIGRATION_9: &str = "
+    CREATE TABLE provider_network_policy (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        automatic_router_mapping_enabled INTEGER NOT NULL DEFAULT 0
+            CHECK (automatic_router_mapping_enabled IN (0, 1)),
+        router_mapping_consented_at INTEGER,
+        allow_permanent_upnp INTEGER NOT NULL DEFAULT 0
+            CHECK (allow_permanent_upnp IN (0, 1)),
+        updated_at INTEGER NOT NULL,
+        CHECK (
+            automatic_router_mapping_enabled = 0
+            OR router_mapping_consented_at IS NOT NULL
+        ),
+        CHECK (
+            allow_permanent_upnp = 0
+            OR router_mapping_consented_at IS NOT NULL
+        )
+    ) STRICT;
+
+    INSERT INTO provider_network_policy(
+        singleton, automatic_router_mapping_enabled, allow_permanent_upnp, updated_at
+    ) VALUES (1, 0, 0, 0);
+
+    CREATE TABLE router_mapping_leases (
+        mapping_id TEXT PRIMARY KEY CHECK (length(mapping_id) = 36),
+        endpoint_id TEXT NOT NULL UNIQUE CHECK (length(endpoint_id) = 36),
+        applied_revision INTEGER NOT NULL
+            REFERENCES rendered_xray_configs(revision) ON DELETE RESTRICT,
+        source TEXT NOT NULL CHECK (source IN ('pcp', 'natPmp', 'upnp')),
+        gateway_address TEXT NOT NULL CHECK (length(gateway_address) BETWEEN 1 AND 64),
+        internal_address TEXT NOT NULL CHECK (length(internal_address) BETWEEN 1 AND 64),
+        internal_port INTEGER NOT NULL CHECK (internal_port BETWEEN 1 AND 65535),
+        external_address TEXT NOT NULL CHECK (length(external_address) BETWEEN 1 AND 253),
+        external_port INTEGER NOT NULL CHECK (external_port BETWEEN 1 AND 65535),
+        pcp_nonce BLOB CHECK (pcp_nonce IS NULL OR length(pcp_nonce) = 12),
+        upnp_description TEXT
+            CHECK (upnp_description IS NULL OR length(upnp_description) BETWEEN 1 AND 64),
+        gateway_epoch INTEGER CHECK (gateway_epoch IS NULL OR gateway_epoch >= 0),
+        lease_started_at INTEGER NOT NULL,
+        lease_expires_at INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (
+            state IN ('active', 'releasing', 'released', 'failed', 'abandoned')
+        ),
+        failure_code TEXT CHECK (failure_code IS NULL OR length(failure_code) BETWEEN 1 AND 64),
+        ended_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK (lease_expires_at > lease_started_at),
+        CHECK (
+            (source = 'pcp' AND pcp_nonce IS NOT NULL AND upnp_description IS NULL)
+            OR (source = 'natPmp' AND pcp_nonce IS NULL AND upnp_description IS NULL)
+            OR (source = 'upnp' AND pcp_nonce IS NULL AND upnp_description IS NOT NULL)
+        ),
+        CHECK (
+            (state IN ('active', 'releasing') AND ended_at IS NULL)
+            OR (state IN ('released', 'failed', 'abandoned') AND ended_at IS NOT NULL)
+        ),
+        CHECK (state != 'active' OR failure_code IS NULL),
+        CHECK (ended_at IS NULL OR ended_at >= lease_started_at),
+        CHECK (updated_at >= created_at)
+    ) STRICT;
+
+    CREATE UNIQUE INDEX router_mapping_leases_owned_current
+        ON router_mapping_leases ((1))
+        WHERE state IN ('active', 'releasing');
+
+    CREATE INDEX router_mapping_leases_revision_state
+        ON router_mapping_leases(applied_revision, state, lease_expires_at DESC);
+";
+
 pub use bootstrap::{bootstrap, BootstrapRequest};
 pub use enrollment::join;
+pub use mapping::{RouterMappingState, RouterMappingStatus};
 pub use service::{run, run_until, SyncLoopOptions};
 pub use sync::sync_once;
 pub use xray::configure_xray;
@@ -323,6 +396,8 @@ pub struct HostStatus {
     pub reality_public_key: Option<X25519PublicKey>,
     /// Stable node-local REALITY short ID.
     pub reality_short_id: Option<String>,
+    /// Provider-owned automatic router-mapping preference and safe current state.
+    pub router_mapping: RouterMappingStatus,
 }
 
 /// A seed whose formatting can never reveal its bytes.
@@ -452,6 +527,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 6, MIGRATION_6_NAME, MIGRATION_6)?;
     apply_migration(&transaction, 7, MIGRATION_7_NAME, MIGRATION_7)?;
     apply_migration(&transaction, 8, MIGRATION_8_NAME, MIGRATION_8)?;
+    apply_migration(&transaction, 9, MIGRATION_9_NAME, MIGRATION_9)?;
     transaction.commit()?;
     Ok(())
 }
@@ -518,6 +594,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (6, MIGRATION_6_NAME, MIGRATION_6),
         (7, MIGRATION_7_NAME, MIGRATION_7),
         (8, MIGRATION_8_NAME, MIGRATION_8),
+        (9, MIGRATION_9_NAME, MIGRATION_9),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");
@@ -595,6 +672,7 @@ fn build_status(
     let registration = load_registration_status(connection)?;
     let sync_status = load_sync_status(connection)?;
     let activation_status = activation::load_activation_status(connection)?;
+    let router_mapping = mapping::load_status(connection)?;
     let xray_status = xray::load_xray_runtime_status(connection, data_dir)?;
     let (
         xray_binary_path,
@@ -634,6 +712,7 @@ fn build_status(
         xray_version,
         reality_public_key,
         reality_short_id,
+        router_mapping,
     })
 }
 

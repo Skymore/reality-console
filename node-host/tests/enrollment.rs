@@ -163,7 +163,15 @@ async fn enroll(
     if request.invitation_secret != state.invitation.invitation_secret {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if request.capabilities != vec![NodeCapability::Xray, NodeCapability::DirectTcp] {
+    let mut expected_capabilities = vec![NodeCapability::Xray, NodeCapability::DirectTcp];
+    if request.provider_consent.router_mapping_accepted {
+        expected_capabilities.extend([
+            NodeCapability::Pcp,
+            NodeCapability::NatPmp,
+            NodeCapability::Upnp,
+        ]);
+    }
+    if request.capabilities != expected_capabilities {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let invitation = EnrollmentInvitation {
@@ -259,6 +267,7 @@ async fn in_memory_bootstrap_verifies_runtime_then_enrolls_in_one_call() {
         fake.digest.clone(),
         true,
         true,
+        true,
     )
     .unwrap();
 
@@ -266,6 +275,11 @@ async fn in_memory_bootstrap_verifies_runtime_then_enrolls_in_one_call() {
 
     assert_eq!(joined.enrollment_state, EnrollmentState::Enrolled);
     assert!(joined.xray_configured);
+    assert!(joined.router_mapping.enabled);
+    assert_eq!(
+        joined.router_mapping.state,
+        node_host::RouterMappingState::Waiting
+    );
     assert_eq!(
         joined.xray_binary_path.as_deref(),
         Some(fake.path.as_path())
@@ -291,6 +305,7 @@ async fn bootstrap_rejects_a_bad_runtime_before_consuming_the_invitation() {
         "00".repeat(32),
         true,
         true,
+        false,
     )
     .unwrap();
 
@@ -319,6 +334,7 @@ async fn bootstrap_requires_consent_before_creating_local_state() {
         fake.digest,
         true,
         false,
+        false,
     )
     .unwrap();
 
@@ -345,6 +361,7 @@ async fn retrying_bootstrap_reuses_local_identity_and_verified_runtime() {
         fake.digest.clone(),
         true,
         true,
+        true,
     )
     .unwrap();
     bootstrap(&data_dir, first_request).await.unwrap_err();
@@ -357,6 +374,7 @@ async fn retrying_bootstrap_reuses_local_identity_and_verified_runtime() {
         "Friend Mac",
         fake.path,
         fake.digest,
+        true,
         true,
         true,
     )

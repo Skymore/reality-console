@@ -78,6 +78,7 @@ pub(crate) async fn join_invitation(
     migrate(&mut connection)?;
     configure_controller(&connection, &controller)?;
     let identity = Identity::load_or_create(data_dir)?;
+    let router_mapping_accepted = crate::mapping::load_policy(&connection)?.enabled;
 
     if let Some(existing) = load_registration(&connection)? {
         if existing.invitation_id != invitation.invitation_id.to_string() {
@@ -88,8 +89,12 @@ pub(crate) async fn join_invitation(
         }
     }
 
-    let (request, request_transcript) =
-        build_enrollment_request(&invitation, display_name, &identity)?;
+    let (request, request_transcript) = build_enrollment_request(
+        &invitation,
+        display_name,
+        &identity,
+        router_mapping_accepted,
+    )?;
     let response = post_enrollment(&controller, &request).await?;
     verify_controller_response(&invitation, &request_transcript, &response)?;
     persist_verified_registration(
@@ -185,17 +190,26 @@ fn build_enrollment_request(
     invitation: &CreateNodeInvitationResponse,
     display_name: &str,
     identity: &Identity,
+    router_mapping_accepted: bool,
 ) -> Result<(EnrollNodeRequest, Vec<u8>)> {
     let mut nonce_bytes = [0_u8; NONCE_BYTES];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_str(&URL_SAFE_NO_PAD.encode(nonce_bytes))
         .context("failed to encode enrollment nonce")?;
+    let mut capabilities = vec![NodeCapability::Xray, NodeCapability::DirectTcp];
+    if router_mapping_accepted {
+        capabilities.extend([
+            NodeCapability::Pcp,
+            NodeCapability::NatPmp,
+            NodeCapability::Upnp,
+        ]);
+    }
     let mut request = EnrollNodeRequest {
         invitation_secret: invitation.invitation_secret.clone(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         platform: platform_name(),
         display_name: display_name.to_string(),
-        capabilities: vec![NodeCapability::Xray, NodeCapability::DirectTcp],
+        capabilities,
         identity_public_key: identity.ed25519_public()?,
         encryption_public_key: identity.x25519_public()?,
         nonce,
@@ -204,6 +218,7 @@ fn build_enrollment_request(
             policy_version: PROVIDER_CONSENT_POLICY_VERSION.to_string(),
             host_owner_consented: true,
             exit_ip_disclosure_accepted: true,
+            router_mapping_accepted,
             accepted_at: control_protocol::id::Timestamp::from_datetime(OffsetDateTime::now_utc()),
         },
     };

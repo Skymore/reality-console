@@ -216,7 +216,9 @@ manifest SHA-256. Bootstrap first requires both consent decisions, initializes o
 stable local identity, verifies Xray entirely offline, and only then sends the single-use
 invitation. A damaged runtime therefore cannot consume the invitation. Network failure can be
 presented as one `Try again` action: rerunning bootstrap reuses the same identity, runtime pin, and
-invitation recovery semantics. The file-based `bootstrap` subcommand exists only for installer and
+invitation recovery semantics. The optional `accept_router_mapping` choice is persisted locally
+before enrollment; when selected, the signed enrollment advertises PCP, NAT-PMP, and UPnP support
+and binds the mapping consent. The file-based `bootstrap` subcommand exists only for installer and
 headless integration. Native package installation, background-service registration, and the setup
 UI remain separate pending deliverables.
 
@@ -232,8 +234,8 @@ desired-state fetch. Before heartbeat I/O it durably allocates a positive monoto
 failed attempts may leave gaps but restart and retry can never reuse a generation for different
 state. This sequence is independent from telemetry. It records heartbeat and complete-cycle
 timestamps locally and uses a fresh nonce for every request. A `200` response is accepted only after
-closed-schema identity, monotonicity, and pinned controller-signature verification. The immutable envelope and its digests
-are committed before a signed `received` result is sent; an interrupted result remains queued and
+closed-schema identity, monotonicity, and pinned controller-signature verification. The immutable
+envelope and its digests are committed before a signed `received` result is sent; an interrupted result remains queued and
 is retried before the next heartbeat. When a pinned runtime is available, Node Host checks the
 minimum agent version, renders typed deterministic Xray JSON with the managed inbound bound only to
 `127.0.0.1`, and runs the pinned binary's bounded offline config test. Success stores a 0600
@@ -243,6 +245,11 @@ a stable secret-free `rejected`; binary mutation, timeout, spawn, and local I/O 
 `received` for retry. On restart, queued `received` is sent first, but `validated` is not sent until
 the candidate file and digest have been rechecked. This stage still does not activate or start
 Xray.
+
+An automatic mapping is reported in heartbeat only while its local lease is `active`, unexpired,
+and bound to the currently applied revision, and only while the admission gate reports `serving`.
+It remains an unverified candidate at Control. Schema 9 and the safe local status model are now
+implemented; protocol drivers and renewal/release supervision are the next implementation stage.
 
 The current headless `run` command already wraps that cycle in a resilient foreground service. It
 synchronizes immediately, uses a 30-second success interval with bounded jitter, retries failures
@@ -544,6 +551,10 @@ Failure never weakens the host firewall or enables a broad router setting. The p
 the provider to enable DMZ, expose Xray's API, or disable the firewall.
 
 ### 11.2 Mapping Strategy
+
+The current backend has the explicit consent flag, constrained durable lease schema, safe status,
+and heartbeat publication boundary. It does not report `Mapped` merely because consent is enabled;
+without a driver-created lease the state is `Waiting`.
 
 For each active default route, the agent attempts standards in this order:
 

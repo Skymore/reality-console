@@ -402,6 +402,7 @@ struct ProviderConsentResponse {
     policy_version: String,
     host_owner_consented: bool,
     exit_ip_disclosure_accepted: bool,
+    router_mapping_accepted: bool,
     accepted_at: String,
 }
 
@@ -431,10 +432,11 @@ impl TryFrom<NodeSummaryRecord> for NodeSummaryResponse {
             xray_version: record.xray_version,
             capabilities: record.capabilities,
             provider_consent: ProviderConsentResponse {
-                policy_version: record.consent_policy_version,
-                host_owner_consented: record.consent_host_owner,
-                exit_ip_disclosure_accepted: record.consent_exit_ip,
-                accepted_at: format_timestamp(record.consent_accepted_at)?,
+                policy_version: record.provider_consent.policy_version,
+                host_owner_consented: record.provider_consent.host_owner,
+                exit_ip_disclosure_accepted: record.provider_consent.exit_ip,
+                router_mapping_accepted: record.provider_consent.router_mapping,
+                accepted_at: format_timestamp(record.provider_consent.accepted_at)?,
             },
             last_seen_at: record.last_seen_at.map(format_timestamp).transpose()?,
             runtime_state: record.runtime_state,

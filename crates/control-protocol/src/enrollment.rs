@@ -82,6 +82,10 @@ pub fn enrollment_request_transcript(
             request.provider_consent.exit_ip_disclosure_accepted,
         )],
     )?;
+    transcript.bytes(
+        "consent-router-mapping",
+        &[u8::from(request.provider_consent.router_mapping_accepted)],
+    )?;
     transcript.text(
         "consent-accepted-at",
         &request.provider_consent.accepted_at.to_string(),

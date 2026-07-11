@@ -31,8 +31,8 @@ a node implicitly or overwrite controller-owned desired state. Heartbeat endpoin
 revision-bound candidates only; Control owns a separate verification record that starts `pending`
 and legacy node-asserted `verified` rows are discarded. Durable heartbeat generations make exact
 retries idempotent and prevent delayed snapshots from withdrawing newer candidates. Node Host also
-has a resilient outbound sync loop with jitter, bounded retry backoff, and graceful process shutdown. Its installer
-integration can verify and pin an explicit Xray binary, probe its version, and create a separate
+has a resilient outbound sync loop with jitter, bounded retry backoff, and graceful process
+shutdown. Its installer integration can verify and pin an explicit Xray binary, probe its version, and create a separate
 owner-only REALITY identity without starting the process. Candidate files are immutable,
 owner-only, digest-checked on restart, and never replace a known-good configuration during
 validation. A friend-facing backend bootstrap accepts invitation JSON directly from a desktop
@@ -41,8 +41,10 @@ invitation, and completes enrollment as one idempotent retryable operation. The 
 `node-host run` service now owns both a checksum-revalidated Xray child and a byte-transparent IPv4
 admission gate. It activates only controller-acknowledged candidates, requires the signed public
 port to bind and reach Xray through a local canary before recording `applied`, and restores both
-parts of a proven predecessor after failure. Native service installers, automatic router mapping,
-controller-side external probes, relay reachability, account synchronization, and the friend-facing
+parts of a proven predecessor after failure. Bootstrap can now bind explicit automatic-mapping
+consent into enrollment, provide a constrained finite-lease store, and publish only a current
+revision-bound lease as an unverified candidate. Native service installers, router protocol
+drivers, controller-side external probes, relay reachability, account synchronization, and the friend-facing
 setup UI/package are still under implementation.
 
 ## Authoritative Documentation

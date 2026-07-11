@@ -328,6 +328,11 @@ fn current_heartbeat(
         |row| row.get(0),
     )?;
     let applied_revision = optional_revision(applied_revision_value, "applied")?;
+    let endpoints = if runtime_state == NodeRuntimeState::Serving {
+        crate::mapping::load_heartbeat_candidates(connection, applied_revision)?
+    } else {
+        Vec::new()
+    };
     let heartbeat = NodeHeartbeat {
         heartbeat_generation,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -340,7 +345,7 @@ fn current_heartbeat(
             applied_revision,
         },
         provider_paused: false,
-        endpoints: Vec::new(),
+        endpoints,
         telemetry_cursor: SequenceNumber::new(0).context("zero telemetry cursor must be valid")?,
     };
     heartbeat
@@ -782,7 +787,7 @@ mod tests {
     use super::{
         current_heartbeat, load_unreported_results, ReportScope, MAX_PENDING_REPORTS_PER_SYNC,
     };
-    use control_protocol::id::{Revision, SequenceNumber};
+    use control_protocol::id::{EndpointId, Revision, SequenceNumber};
     use control_protocol::node::NodeRuntimeState;
     use rusqlite::{params, Connection};
 
@@ -855,7 +860,35 @@ mod tests {
                     singleton INTEGER PRIMARY KEY,
                     applied_revision INTEGER
                  ) STRICT;
-                 INSERT INTO xray_active_state(singleton, applied_revision) VALUES (1, 1);",
+                 INSERT INTO xray_active_state(singleton, applied_revision) VALUES (1, 1);
+                 CREATE TABLE provider_network_policy (
+                    singleton INTEGER PRIMARY KEY,
+                    automatic_router_mapping_enabled INTEGER NOT NULL,
+                    router_mapping_consented_at INTEGER,
+                    allow_permanent_upnp INTEGER NOT NULL
+                 ) STRICT;
+                 INSERT INTO provider_network_policy VALUES (1, 1, 1, 0);
+                 CREATE TABLE router_mapping_leases (
+                    endpoint_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    external_address TEXT NOT NULL,
+                    external_port INTEGER NOT NULL,
+                    applied_revision INTEGER NOT NULL,
+                    lease_started_at INTEGER NOT NULL,
+                    lease_expires_at INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        let endpoint_id = EndpointId::new();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        connection
+            .execute(
+                "INSERT INTO router_mapping_leases(
+                    endpoint_id, source, external_address, external_port,
+                    applied_revision, lease_started_at, lease_expires_at, state
+                 ) VALUES (?1, 'pcp', '8.8.8.8', 443, 1, ?2, ?3, 'active')",
+                params![endpoint_id.to_string(), now, now + 3_600],
             )
             .unwrap();
 
@@ -873,5 +906,32 @@ mod tests {
         assert_eq!(heartbeat.revisions.received_revision.unwrap().get(), 1);
         assert_eq!(heartbeat.revisions.validated_revision.unwrap().get(), 1);
         assert_eq!(heartbeat.revisions.applied_revision.unwrap().get(), 1);
+        assert_eq!(heartbeat.endpoints.len(), 1);
+        assert_eq!(heartbeat.endpoints[0].endpoint_id, endpoint_id);
+        assert_eq!(heartbeat.endpoints[0].applied_revision.get(), 1);
+
+        let idle = current_heartbeat(
+            &connection,
+            1,
+            NodeRuntimeState::Idle,
+            SequenceNumber::new(8).unwrap(),
+        )
+        .unwrap();
+        assert!(idle.endpoints.is_empty());
+
+        connection
+            .execute(
+                "UPDATE router_mapping_leases SET lease_expires_at = ?1",
+                [now - 1],
+            )
+            .unwrap();
+        let expired = current_heartbeat(
+            &connection,
+            1,
+            NodeRuntimeState::Serving,
+            SequenceNumber::new(9).unwrap(),
+        )
+        .unwrap();
+        assert!(expired.endpoints.is_empty());
     }
 }

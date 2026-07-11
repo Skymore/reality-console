@@ -85,11 +85,18 @@ and is resolved to the high-entropy secret; six decimal digits alone are not a n
   "agentVersion": "0.1.0",
   "platform": "macos-arm64",
   "displayName": "Living room Mac",
-  "capabilities": ["xray", "direct-tcp", "upnp", "relay-tcp"],
+  "capabilities": ["xray", "direct-tcp", "pcp", "nat-pmp", "upnp"],
   "identityPublicKey": "base64url-ed25519-public-key",
   "encryptionPublicKey": "base64url-x25519-public-key",
   "nonce": "base64url-random-nonce",
-  "proof": "base64url-signature-over-enrollment-transcript"
+  "proof": "base64url-signature-over-enrollment-transcript",
+  "providerConsent": {
+    "policyVersion": "2026-07-11",
+    "hostOwnerConsented": true,
+    "exitIpDisclosureAccepted": true,
+    "routerMappingAccepted": true,
+    "acceptedAt": "2026-07-11T20:00:00Z"
+  }
 }
 ```
 
@@ -97,6 +104,9 @@ The transaction verifies and consumes the invitation, creates `nodeId`, issues t
 credential, and writes an audit event. Concurrent consumption has exactly one winner. The proof
 covers invitation purpose, controller origin, both public keys, nonce, software version, and
 capabilities so it cannot be replayed for a different identity.
+PCP, NAT-PMP, or UPnP capabilities require `direct-tcp` and
+`providerConsent.routerMappingAccepted=true`; a node cannot advertise router-changing behavior
+without binding the provider's choice into its proof.
 
 The enrollment proof uses a deterministic binary transcript. Every field is encoded as
 `u16be(labelLength) || labelUtf8 || u32be(valueLength) || valueBytes`. The request domain is

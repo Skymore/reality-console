@@ -39,6 +39,9 @@ enum Command {
         /// Confirms that this network may expose your public IP as an exit IP.
         #[arg(long)]
         accept_exit_ip: bool,
+        /// Enables one finite TCP router mapping after the disclosure is accepted.
+        #[arg(long)]
+        accept_router_mapping: bool,
     },
     /// Initialize persistent node-host state.
     Init {
@@ -122,6 +125,7 @@ async fn main() -> Result<()> {
             xray_sha256,
             accept_host_owner,
             accept_exit_ip,
+            accept_router_mapping,
         } => {
             let request = BootstrapRequest::from_invitation_file(
                 &invitation_file,
@@ -130,6 +134,7 @@ async fn main() -> Result<()> {
                 xray_sha256,
                 accept_host_owner,
                 accept_exit_ip,
+                accept_router_mapping,
             )?;
             bootstrap(&data_dir, request).await?
         }
@@ -256,4 +261,8 @@ fn print_status(status: &HostStatus) {
         Some(short_id) => println!("reality_short_id: {short_id}"),
         None => println!("reality_short_id: none"),
     }
+    println!(
+        "router_mapping: {} ({:?})",
+        status.router_mapping.enabled, status.router_mapping.state
+    );
 }
