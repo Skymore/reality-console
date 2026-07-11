@@ -190,6 +190,20 @@ deleted and the invitation remains consumed. Re-pairing requires a new invitatio
 - Controller-initiated removal is delivered as a signed tombstone. On receipt, the node performs
   the same local teardown and acknowledges with the tombstone ID.
 
+### 6.4 Headless Development Flow
+
+The current headless implementation exposes `init`, `join`, and `status`. `join` consumes the exact
+JSON invitation returned by Control Service, requires both provider-consent flags, reuses the
+installation's owner-only Ed25519/X25519 identities, and persists registration only after verifying
+the controller fingerprint and signed response. On Unix, the invitation file must be a regular
+non-symlink file inaccessible to group and other users. Repeating `join` with the same invitation
+and local identity safely recovers a lost success response without creating another node.
+
+This CLI is a development and service integration surface, not the intended friend-facing UX. The
+desktop wrapper will receive the invitation in memory through a QR code or deep link and present
+the provider disclosures as explicit checkboxes. Registration creates a pending node; operator
+approval and activation remain separate control-plane steps.
+
 ## 7. Outbound-Only Control Sync
 
 ### 7.1 Transport

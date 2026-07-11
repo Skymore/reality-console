@@ -19,8 +19,9 @@ The local Control application manages a native Xray installation, users, configu
 backups, diagnostics, quotas, and local telemetry. Connect can securely import a compatibility
 profile and supervise a pinned Xray sidecar. Control Service now supports secure one-time node
 invitations and proof-of-possession enrollment. Node Host has durable owner-only identities and a
-headless `init`/`status` foundation. The Node Host enrollment client, heartbeat, multi-node desired
-state, account synchronization, and relay fallback remain under active implementation.
+headless `init`/`join`/`status` flow that verifies the controller response before persisting its
+registration. Heartbeat, multi-node desired state, account synchronization, and relay fallback
+remain under active implementation.
 
 ## Authoritative Documentation
 
@@ -59,6 +60,23 @@ cargo test --manifest-path crates/control-protocol/Cargo.toml
 cargo test --manifest-path control-server/Cargo.toml
 cargo test --manifest-path node-host/Cargo.toml
 ```
+
+The development Node Host join flow accepts the exact JSON returned by
+`POST /v1/admin/node-invitations`. Because that file contains a one-time secret, it must be
+owner-only on Unix:
+
+```bash
+chmod 600 invitation.json
+node-host join \
+  --data-dir ./node-state \
+  --invitation-file ./invitation.json \
+  --display-name "Friend Mac" \
+  --accept-host-owner \
+  --accept-exit-ip
+```
+
+The future desktop wrapper will pass the same invitation in memory from a QR code or deep link, so
+friends will not need to manage this file or run the CLI.
 
 Each implementation phase must leave affected applications buildable, update its authoritative
 documentation, and end in a focused commit.

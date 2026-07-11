@@ -44,7 +44,7 @@ fn restart_is_idempotent_and_status_is_safe() {
 }
 
 #[test]
-fn migration_is_recorded_once_and_pragmas_are_enabled() {
+fn migrations_are_recorded_once_and_pragmas_are_enabled() {
     let temp = tempfile::tempdir().expect("tempdir");
     let data_dir = temp.path().join("state");
     node_host::initialize(&data_dir, "http://localhost:8080").expect("initialize");
@@ -68,9 +68,9 @@ fn migration_is_recorded_once_and_pragmas_are_enabled() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("migration metadata");
-    assert_eq!(count, 1);
+    assert_eq!(count, 2);
     assert_eq!(journal_mode, "wal");
-    assert_eq!(user_version, 1);
+    assert_eq!(user_version, 2);
     assert_eq!(migration.0, "node_host_foundation");
     assert_eq!(migration.1.len(), 64);
     assert!(migration.2 > 0);

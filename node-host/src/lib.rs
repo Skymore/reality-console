@@ -1,13 +1,17 @@
 //! Persistent local foundation for the Reality Console node host.
 
+mod enrollment;
+
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use control_protocol::crypto::{Ed25519PublicKey, X25519PublicKey};
-use ed25519_dalek::SigningKey;
+use control_protocol::crypto::{Ed25519PublicKey, Ed25519Signature, X25519PublicKey};
+use control_protocol::id::{NodeId, NodeInvitationId, Timestamp};
+use control_protocol::node::{EnrollNodeResponse, NodeAuthenticationMode};
+use ed25519_dalek::{Signer as _, SigningKey};
 use fs2::FileExt;
 use rand_core::{OsRng, RngCore as _};
-use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension as _, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -26,9 +30,10 @@ const LOCK_FILE: &str = "node-host.lock";
 const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
+const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -36,6 +41,43 @@ const MIGRATION_1: &str = "
         controller_url TEXT NOT NULL
     ) STRICT;
 ";
+
+const MIGRATION_2: &str = "
+    CREATE TABLE enrollment_registration (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        invitation_id TEXT NOT NULL UNIQUE,
+        network_id TEXT NOT NULL,
+        node_id TEXT NOT NULL UNIQUE,
+        controller_instance_id TEXT NOT NULL,
+        controller_fingerprint TEXT NOT NULL,
+        controller_signing_public_key TEXT NOT NULL,
+        credential_key_id TEXT NOT NULL,
+        credential_mode TEXT NOT NULL,
+        credential_expires_at TEXT NOT NULL,
+        enrolled_at INTEGER NOT NULL
+    ) STRICT;
+";
+
+pub use enrollment::join;
+
+/// Safe enrollment state rendered by the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EnrollmentState {
+    /// The local identity has not completed controller enrollment.
+    NotEnrolled,
+    /// A controller response was cryptographically verified and persisted.
+    Enrolled,
+}
+
+impl fmt::Display for EnrollmentState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotEnrolled => formatter.write_str("not-enrolled"),
+            Self::Enrolled => formatter.write_str("enrolled"),
+        }
+    }
+}
 
 /// Public, non-secret state suitable for CLI output and logs.
 #[derive(Debug, Serialize)]
@@ -48,6 +90,12 @@ pub struct HostStatus {
     pub encryption_public_key: X25519PublicKey,
     /// Applied database schema version.
     pub schema_version: i64,
+    /// Whether a verified controller enrollment is persisted.
+    pub enrollment_state: EnrollmentState,
+    /// Controller-assigned node identity, when enrolled.
+    pub node_id: Option<NodeId>,
+    /// Expiry of the active node authentication credential, when enrolled.
+    pub credential_expires_at: Option<Timestamp>,
 }
 
 /// A seed whose formatting can never reveal its bytes.
@@ -165,22 +213,32 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_migration_state(&transaction)?;
-    let applied: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE version = 1",
-        [],
+    apply_migration(&transaction, 1, MIGRATION_1_NAME, MIGRATION_1)?;
+    apply_migration(&transaction, 2, MIGRATION_2_NAME, MIGRATION_2)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn apply_migration(connection: &Connection, version: i64, name: &str, sql: &str) -> Result<()> {
+    let applied: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+        params![version],
         |row| row.get(0),
     )?;
     if applied == 0 {
-        let checksum = migration_checksum();
-        transaction.execute_batch(MIGRATION_1)?;
-        transaction.execute(
+        connection.execute_batch(sql)?;
+        connection.execute(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at)
-             VALUES (1, ?1, ?2, ?3)",
-            params![MIGRATION_1_NAME, checksum, unix_timestamp()?],
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                version,
+                name,
+                migration_checksum(version, name, sql),
+                unix_timestamp()?
+            ],
         )?;
-        transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        connection.pragma_update(None, "user_version", version)?;
     }
-    transaction.commit()?;
     Ok(())
 }
 
@@ -207,28 +265,42 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
             .collect::<rusqlite::Result<_>>()?;
         rows
     };
-    match rows.as_slice() {
-        [] if user_version == 0 => Ok(()),
-        [(1, name, checksum)]
-            if user_version == 1
-                && name == MIGRATION_1_NAME
-                && checksum == &migration_checksum() =>
-        {
-            Ok(())
+    if rows.is_empty() {
+        if user_version == 0 {
+            return Ok(());
         }
-        [] => bail!("schema migration history does not match PRAGMA user_version"),
-        [(version, _, _)] if *version > CURRENT_SCHEMA_VERSION => {
-            bail!("database schema is newer than this node host supports")
-        }
-        _ => bail!("schema migration history is invalid or has been modified"),
+        bail!("schema migration history does not match PRAGMA user_version");
     }
+
+    let known = [
+        (1, MIGRATION_1_NAME, MIGRATION_1),
+        (2, MIGRATION_2_NAME, MIGRATION_2),
+    ];
+    if rows.len() > known.len() {
+        bail!("database schema is newer than this node host supports");
+    }
+    for ((version, name, checksum), (expected_version, expected_name, expected_sql)) in
+        rows.iter().zip(known)
+    {
+        if *version != expected_version
+            || name != expected_name
+            || checksum != &migration_checksum(expected_version, expected_name, expected_sql)
+        {
+            bail!("schema migration history is invalid or has been modified");
+        }
+    }
+    let last_version = rows.last().map_or(0, |row| row.0);
+    if user_version != last_version {
+        bail!("schema migration history does not match PRAGMA user_version");
+    }
+    Ok(())
 }
 
-fn migration_checksum() -> String {
+fn migration_checksum(version: i64, name: &str, sql: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(CURRENT_SCHEMA_VERSION.to_be_bytes());
-    hasher.update(MIGRATION_1_NAME.as_bytes());
-    hasher.update(MIGRATION_1.as_bytes());
+    hasher.update(version.to_be_bytes());
+    hasher.update(name.as_bytes());
+    hasher.update(sql.as_bytes());
     hasher
         .finalize()
         .iter()
@@ -276,12 +348,148 @@ fn build_status(
         [],
         |row| row.get(0),
     )?;
+    let registration = load_registration_status(connection)?;
     Ok(HostStatus {
         controller,
         identity_public_key: identity.ed25519_public()?,
         encryption_public_key: identity.x25519_public()?,
         schema_version,
+        enrollment_state: if registration.is_some() {
+            EnrollmentState::Enrolled
+        } else {
+            EnrollmentState::NotEnrolled
+        },
+        node_id: registration.as_ref().map(|value| value.0),
+        credential_expires_at: registration.map(|value| value.1),
     })
+}
+
+fn load_registration_status(connection: &Connection) -> Result<Option<(NodeId, Timestamp)>> {
+    connection
+        .query_row(
+            "SELECT node_id, credential_expires_at
+             FROM enrollment_registration WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .map(|(node_id, expires_at)| {
+            Ok((
+                node_id.parse().context("stored node ID is invalid")?,
+                expires_at
+                    .parse()
+                    .context("stored credential expiry is invalid")?,
+            ))
+        })
+        .transpose()
+}
+
+pub(crate) fn persist_verified_registration(
+    connection: &mut Connection,
+    invitation_id: NodeInvitationId,
+    controller_fingerprint: &str,
+    response: &EnrollNodeResponse,
+) -> Result<()> {
+    let expected =
+        RegistrationRecord::from_verified_response(invitation_id, controller_fingerprint, response);
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing = load_registration(&transaction)?;
+    match existing {
+        Some(existing) if existing == expected => {}
+        Some(_) => bail!("node host is already enrolled with different registration metadata"),
+        None => {
+            transaction.execute(
+                "INSERT INTO enrollment_registration(
+                    singleton, invitation_id, network_id, node_id, controller_instance_id,
+                    controller_fingerprint, controller_signing_public_key, credential_key_id,
+                    credential_mode, credential_expires_at, enrolled_at
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    expected.invitation_id,
+                    expected.network_id,
+                    expected.node_id,
+                    expected.controller_instance_id,
+                    expected.controller_fingerprint,
+                    expected.controller_signing_public_key,
+                    expected.credential_key_id,
+                    expected.credential_mode,
+                    expected.credential_expires_at,
+                    unix_timestamp()?,
+                ],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RegistrationRecord {
+    invitation_id: String,
+    network_id: String,
+    node_id: String,
+    controller_instance_id: String,
+    controller_fingerprint: String,
+    controller_signing_public_key: String,
+    credential_key_id: String,
+    credential_mode: String,
+    credential_expires_at: String,
+}
+
+impl RegistrationRecord {
+    fn from_verified_response(
+        invitation_id: NodeInvitationId,
+        controller_fingerprint: &str,
+        response: &EnrollNodeResponse,
+    ) -> Self {
+        Self {
+            invitation_id: invitation_id.to_string(),
+            network_id: response.network_id.to_string(),
+            node_id: response.node_id.to_string(),
+            controller_instance_id: response.controller_instance_id.to_string(),
+            controller_fingerprint: controller_fingerprint.to_string(),
+            controller_signing_public_key: response
+                .desired_state_signing_public_key
+                .as_str()
+                .to_string(),
+            credential_key_id: response.credential.key_id.to_string(),
+            credential_mode: authentication_mode_name(response.credential.mode).to_string(),
+            credential_expires_at: response.credential.expires_at.to_string(),
+        }
+    }
+}
+
+fn load_registration(connection: &Connection) -> Result<Option<RegistrationRecord>> {
+    connection
+        .query_row(
+            "SELECT invitation_id, network_id, node_id, controller_instance_id,
+                    controller_fingerprint, controller_signing_public_key, credential_key_id,
+                    credential_mode, credential_expires_at
+             FROM enrollment_registration WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(RegistrationRecord {
+                    invitation_id: row.get(0)?,
+                    network_id: row.get(1)?,
+                    node_id: row.get(2)?,
+                    controller_instance_id: row.get(3)?,
+                    controller_fingerprint: row.get(4)?,
+                    controller_signing_public_key: row.get(5)?,
+                    credential_key_id: row.get(6)?,
+                    credential_mode: row.get(7)?,
+                    credential_expires_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn authentication_mode_name(mode: NodeAuthenticationMode) -> &'static str {
+    match mode {
+        NodeAuthenticationMode::MutualTls => "mutualTls",
+        NodeAuthenticationMode::SignedRequest => "signedRequest",
+    }
 }
 
 struct Identity {
@@ -321,6 +529,17 @@ impl Identity {
             .encode(X25519DalekPublicKey::from(&secret).to_bytes())
             .parse()
             .context("generated invalid X25519 public key")
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Ed25519Signature> {
+        URL_SAFE_NO_PAD
+            .encode(
+                SigningKey::from_bytes(&self.signing.0)
+                    .sign(message)
+                    .to_bytes(),
+            )
+            .parse()
+            .context("generated invalid Ed25519 signature")
     }
 }
 
