@@ -2,8 +2,8 @@
 
 use crate::crypto::{Ed25519PublicKey, Ed25519Signature, Nonce, Sha256Digest, X25519PublicKey};
 use crate::id::{
-    BundleGeneration, BundleId, ControllerInstanceId, CredentialId, DeviceActivationId, DeviceId,
-    NetworkId, NodeId, SessionId, SigningKeyId, Timestamp, UserId,
+    AssignmentId, BundleGeneration, BundleId, ControllerInstanceId, CredentialId,
+    DeviceActivationId, DeviceId, NetworkId, NodeId, SessionId, SigningKeyId, Timestamp, UserId,
 };
 use crate::node::EndpointMode;
 use crate::secret::Secret;
@@ -33,6 +33,106 @@ pub struct AccountMetadata {
     pub display_name: String,
     /// Current account lifecycle state.
     pub status: AccountStatus,
+}
+
+/// Administrator request to create one logical member account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateAccountRequest {
+    /// Mutable presentation name; never an authentication identity.
+    pub display_name: String,
+}
+
+impl CreateAccountRequest {
+    /// Validates bounded account metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the display name is empty, too long, or contains
+    /// control characters.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_text(&self.display_name, 128, "displayName")
+    }
+}
+
+/// Administrator request to change a member lifecycle explicitly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetAccountStatusRequest {
+    /// Requested account status; deleting is terminal at Control.
+    pub status: AccountStatus,
+}
+
+/// Lifecycle of one logical account-to-node assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountNodeAssignmentStatus {
+    /// The account should be present in this node's desired state.
+    Enabled,
+    /// The assignment is retained but excluded from desired state.
+    Disabled,
+    /// The assignment is tombstoned and cannot be re-enabled.
+    Deleted,
+}
+
+/// Safe administrator-facing account-to-node assignment metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountNodeAssignment {
+    /// Stable assignment identity.
+    pub assignment_id: AssignmentId,
+    /// Assigned node identity.
+    pub node_id: NodeId,
+    /// Current assignment lifecycle.
+    pub status: AccountNodeAssignmentStatus,
+}
+
+/// Complete safe administrator view of one member and its node set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummary {
+    /// Safe logical account metadata.
+    pub account: AccountMetadata,
+    /// Complete assignments sorted by node identity.
+    pub assignments: Vec<AccountNodeAssignment>,
+    /// Account creation time.
+    pub created_at: Timestamp,
+    /// Last lifecycle or assignment update time.
+    pub updated_at: Timestamp,
+}
+
+/// Administrator request that atomically replaces an account's enabled nodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReplaceAccountNodesRequest {
+    /// Complete desired node set; omission disables an existing assignment.
+    pub node_ids: Vec<NodeId>,
+}
+
+impl ReplaceAccountNodesRequest {
+    /// Validates a bounded duplicate-free node set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when more than 100 nodes are requested or a node ID is
+    /// repeated.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.node_ids.len() > 100 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "nodeIds",
+                "an account may be assigned to at most 100 nodes",
+            ));
+        }
+        if self.node_ids.iter().copied().collect::<HashSet<_>>().len() != self.node_ids.len() {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::DuplicateIdentity,
+                "nodeIds",
+                "node IDs must be unique",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Asymmetric identity and proof generated locally for a member device.
@@ -636,7 +736,9 @@ fn validate_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{CreateSessionRequest, DeviceEnrollment};
+    use super::{
+        CreateAccountRequest, CreateSessionRequest, DeviceEnrollment, ReplaceAccountNodesRequest,
+    };
     use crate::crypto::{Ed25519PublicKey, Ed25519Signature, Nonce, X25519PublicKey};
     use crate::secret::Secret;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -689,5 +791,26 @@ mod tests {
         assert_eq!(value["password"], "wire-secret");
         assert!(value["device"].get("identityPublicKey").is_some());
         assert!(value["device"].get("encryptionPublicKey").is_some());
+    }
+
+    #[test]
+    fn administrator_account_inputs_are_bounded_and_duplicate_free() {
+        assert!(CreateAccountRequest {
+            display_name: "Friend".to_string(),
+        }
+        .validate()
+        .is_ok());
+        assert!(CreateAccountRequest {
+            display_name: String::new(),
+        }
+        .validate()
+        .is_err());
+
+        let node_id = crate::id::NodeId::new();
+        assert!(ReplaceAccountNodesRequest {
+            node_ids: vec![node_id, node_id],
+        }
+        .validate()
+        .is_err());
     }
 }

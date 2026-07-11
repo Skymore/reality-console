@@ -362,6 +362,25 @@ revision to have reached `applied` with the same restored-config digest.
 
 ## 6. Member And Bundle API
 
+### Administrator account management
+
+- `POST /v1/admin/accounts` creates one logical account from a bounded display name. It returns no
+  password, VLESS UUID, refresh credential, or device key.
+- `GET /v1/admin/accounts` returns safe account metadata and complete assignments sorted by node
+  ID.
+- `PUT /v1/admin/accounts/{userId}/nodes` atomically replaces the enabled node set. The request is
+  a duplicate-free list of at most 100 node IDs; clients never submit assignment IDs or VLESS
+  credentials. Omitted existing assignments become disabled, newly requested nodes receive stable
+  assignments and distinct controller-generated credentials, and unchanged entries remain
+  idempotent.
+- `PUT /v1/admin/accounts/{userId}/status` explicitly changes `active` or `disabled`, or applies the
+  terminal `deleted` tombstone. Account status gates every session and desired-state credential
+  independently of cached assignment state.
+
+Account mutations require administrator authentication, use canonical UUID paths, and write
+redacted audit events. A safe account summary contains only account identity, display name,
+lifecycle, assignment identity/node/status, and timestamps.
+
 ### Activate device
 
 `POST /v1/device-activations/consume`

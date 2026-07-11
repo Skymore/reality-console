@@ -110,6 +110,8 @@ typed_id!(/// Stable node installation identity.
     NodeId);
 typed_id!(/// Stable per-user, per-node credential identity.
     CredentialId);
+typed_id!(/// Stable logical user-to-node assignment identity.
+    AssignmentId);
 typed_id!(/// Stable immutable configuration-revision identity.
     RevisionId);
 typed_id!(/// Stable signed profile-bundle identity.
