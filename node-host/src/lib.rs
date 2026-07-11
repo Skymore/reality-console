@@ -277,6 +277,10 @@ pub fn initialize(data_dir: &Path, controller: &str) -> Result<HostStatus> {
 /// locked, or contains invalid state.
 pub fn status(data_dir: &Path) -> Result<HostStatus> {
     let _lock = DataDirLock::acquire(data_dir, false)?;
+    status_locked(data_dir)
+}
+
+fn status_locked(data_dir: &Path) -> Result<HostStatus> {
     let connection = open_database(data_dir, false)?;
     apply_pragmas(&connection)?;
     validate_migration_state(&connection)?;

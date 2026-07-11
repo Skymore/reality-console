@@ -879,20 +879,34 @@ async fn service_loop_repeats_sync_and_releases_the_data_lock_on_shutdown() {
     let data_dir = temp.path().join("state");
     install_registration(&data_dir, &controller.origin);
 
-    run_until(
-        &data_dir,
-        SyncLoopOptions {
-            success_interval: StdDuration::from_millis(10),
-            initial_backoff: StdDuration::from_millis(5),
-            max_backoff: StdDuration::from_millis(20),
-        },
-        async {
-            tokio::time::sleep(StdDuration::from_millis(100)).await;
-            Ok(())
-        },
-    )
-    .await
-    .unwrap();
+    let service = async {
+        run_until(
+            &data_dir,
+            SyncLoopOptions {
+                success_interval: StdDuration::from_millis(10),
+                initial_backoff: StdDuration::from_millis(5),
+                max_backoff: StdDuration::from_millis(20),
+            },
+            async {
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
+                Ok(())
+            },
+        )
+        .await
+    };
+    let observe_lock = async {
+        let mut observed_lifetime_lock = false;
+        for _ in 0..20 {
+            if status(&data_dir).is_err_and(|error| error.to_string().contains("already in use")) {
+                observed_lifetime_lock = true;
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+        assert!(observed_lifetime_lock);
+    };
+    let (service_result, ()) = tokio::join!(service, observe_lock);
+    service_result.unwrap();
 
     assert!(controller.captured().len() >= 4);
     status(&data_dir).expect("shutdown must release the exclusive data-directory lock");

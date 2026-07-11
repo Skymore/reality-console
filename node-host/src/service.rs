@@ -1,4 +1,4 @@
-use crate::{status, sync_once, EnrollmentState};
+use crate::{status_locked, sync::sync_once_locked, DataDirLock, EnrollmentState};
 use anyhow::{bail, Result};
 use rand_core::{OsRng, RngCore as _};
 use std::future::Future;
@@ -72,7 +72,8 @@ where
     F: Future<Output = Result<()>>,
 {
     let options = options.validate()?;
-    if status(data_dir)?.enrollment_state != EnrollmentState::Enrolled {
+    let _lock = DataDirLock::acquire(data_dir, false)?;
+    if status_locked(data_dir)?.enrollment_state != EnrollmentState::Enrolled {
         bail!("node host must be enrolled before starting its sync service");
     }
 
@@ -81,7 +82,7 @@ where
     loop {
         let result = tokio::select! {
             shutdown_result = &mut shutdown => return shutdown_result,
-            result = sync_once(data_dir) => result,
+            result = sync_once_locked(data_dir) => result,
         };
         let base_delay = match result {
             Ok(_) => {

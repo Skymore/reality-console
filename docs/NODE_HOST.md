@@ -232,10 +232,12 @@ Xray.
 
 The current headless `run` command already wraps that cycle in a resilient foreground service. It
 synchronizes immediately, uses a 30-second success interval with bounded jitter, retries failures
-with exponential backoff capped at five minutes, and exits cleanly on Ctrl-C or `SIGTERM`. Timing
-bounds are configurable for service integration. It does not create a macOS power assertion or
-prevent lock/sleep; sleeping pauses networking and the next wake resumes convergence. Native
-`launchd` and `systemd` installation remains a packaging step rather than protocol behavior.
+with exponential backoff capped at five minutes, and exits cleanly on Ctrl-C or `SIGTERM`. It holds
+the node data-directory lock for its complete lifetime, so a second service, `sync-once`, runtime
+replacement, or direct database operation cannot become a concurrent Xray owner between polling
+cycles. Timing bounds are configurable for service integration. It does not create a macOS power
+assertion or prevent lock/sleep; sleeping pauses networking and the next wake resumes convergence.
+Native `launchd` and `systemd` installation remains a packaging step rather than protocol behavior.
 
 ## 7. Outbound-Only Control Sync
 

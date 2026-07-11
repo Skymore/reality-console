@@ -53,6 +53,10 @@ enum ReportScope {
 /// request is rejected.
 pub async fn sync_once(data_dir: &Path) -> Result<HostStatus> {
     let _lock = DataDirLock::acquire(data_dir, false)?;
+    sync_once_locked(data_dir).await
+}
+
+pub(crate) async fn sync_once_locked(data_dir: &Path) -> Result<HostStatus> {
     let mut connection = open_database(data_dir, false)?;
     migrate(&mut connection)?;
     let controller_value: String = connection
