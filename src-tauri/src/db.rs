@@ -567,9 +567,11 @@ impl Db {
 fn migrate_schema(conn: &mut Connection) -> Result<(), String> {
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = NORMAL;
+         PRAGMA synchronous = FULL;
          PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;",
+         PRAGMA foreign_keys = ON;
+         PRAGMA trusted_schema = OFF;
+         PRAGMA secure_delete = FAST;",
     )
     .map_err(|e| format!("Failed to configure database: {e}"))?;
     let current: i64 = conn
@@ -1146,6 +1148,34 @@ mod tests {
             .unwrap()
             .any(|column| column.unwrap() == "legacy_connection_log_id");
         assert!(has_legacy_column);
+    }
+
+    #[test]
+    fn configures_durable_and_hardened_sqlite_connection() {
+        let (_dir, db) = test_db();
+        let conn = db.conn.lock().unwrap();
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        let trusted_schema: i64 = conn
+            .query_row("PRAGMA trusted_schema", [], |row| row.get(0))
+            .unwrap();
+        let secure_delete: i64 = conn
+            .query_row("PRAGMA secure_delete", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(synchronous, 2);
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(trusted_schema, 0);
+        assert_eq!(secure_delete, 2);
     }
 
     #[test]
