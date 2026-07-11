@@ -1,5 +1,8 @@
 use crate::auth::BootstrapTokenVerifier;
-use crate::db::{AuthenticatedNode, Database, DatabaseError, NetworkRecord, SCHEMA_VERSION};
+use crate::db::{
+    AuthenticatedNode, Database, DatabaseError, NetworkRecord, NodeLifecycleAction,
+    NodeSummaryRecord, SCHEMA_VERSION,
+};
 use crate::error::{ApiError, REQUEST_ID_HEADER};
 use crate::protocol::RequestId;
 use axum::body::Body;
@@ -9,9 +12,10 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use control_protocol::id::NodeId;
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
-    EnrollNodeResponse, NodeHeartbeat,
+    EnrollNodeResponse, NodeCapability, NodeHeartbeat,
 };
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
 use http_body_util::BodyExt as _;
@@ -24,6 +28,7 @@ use time::OffsetDateTime;
 use tracing::Instrument;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const CANONICAL_UUID_LENGTH: usize = 36;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,7 +58,11 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/v1/admin/network", get(get_network))
+        .route("/v1/admin/nodes", get(get_nodes))
         .route("/v1/admin/node-invitations", post(create_node_invitation))
+        .route("/v1/admin/nodes/{node_id}/approve", post(approve_node))
+        .route("/v1/admin/nodes/{node_id}/disable", post(disable_node))
+        .route("/v1/admin/nodes/{node_id}/revoke", post(revoke_node))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let authenticated_node_routes = Router::new()
         .route("/v1/nodes/{node_id}/heartbeat", post(node_heartbeat))
@@ -255,6 +264,8 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::NodeRequestClockSkew => ApiError::clock_skew(request_id),
         DatabaseError::NodeRequestNonceReplayed => ApiError::nonce_replayed(request_id),
         DatabaseError::NodeProgressRegressed => ApiError::state_stale(request_id),
+        DatabaseError::NodeNotFound => ApiError::not_found(request_id),
+        DatabaseError::NodeLifecycleConflict { .. } => ApiError::conflict(request_id),
         other => {
             tracing::error!(request_id = %request_id, error = %other, "database request failed");
             ApiError::internal(request_id)
@@ -298,12 +309,91 @@ impl TryFrom<NetworkRecord> for NetworkResponse {
             status: record.status,
             last_revision: record.last_revision,
             controller_epoch: record.controller_epoch,
-            created_at: OffsetDateTime::from_unix_timestamp(record.created_at)?
-                .format(&Rfc3339)
-                .expect("RFC 3339 formatting is infallible for a valid timestamp"),
-            updated_at: OffsetDateTime::from_unix_timestamp(record.updated_at)?
-                .format(&Rfc3339)
-                .expect("RFC 3339 formatting is infallible for a valid timestamp"),
+            created_at: format_timestamp(record.created_at)?,
+            updated_at: format_timestamp(record.updated_at)?,
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeListResponse {
+    nodes: Vec<NodeSummaryResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeSummaryResponse {
+    node_id: NodeId,
+    network_id: String,
+    display_name: String,
+    status: String,
+    platform: String,
+    agent_version: String,
+    xray_version: Option<String>,
+    capabilities: Vec<NodeCapability>,
+    provider_consent: ProviderConsentResponse,
+    last_seen_at: Option<String>,
+    runtime_state: Option<String>,
+    provider_paused: bool,
+    revisions: NodeRevisionResponse,
+    telemetry_cursor: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderConsentResponse {
+    policy_version: String,
+    host_owner_consented: bool,
+    exit_ip_disclosure_accepted: bool,
+    accepted_at: String,
+}
+
+#[derive(Serialize)]
+struct NodeRevisionResponse {
+    #[serde(rename = "desiredRevision")]
+    desired: Option<i64>,
+    #[serde(rename = "receivedRevision")]
+    received: Option<i64>,
+    #[serde(rename = "validatedRevision")]
+    validated: Option<i64>,
+    #[serde(rename = "appliedRevision")]
+    applied: Option<i64>,
+}
+
+impl TryFrom<NodeSummaryRecord> for NodeSummaryResponse {
+    type Error = time::error::ComponentRange;
+
+    fn try_from(record: NodeSummaryRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            node_id: record.node_id,
+            network_id: record.network_id,
+            display_name: record.display_name,
+            status: record.status,
+            platform: record.platform,
+            agent_version: record.agent_version,
+            xray_version: record.xray_version,
+            capabilities: record.capabilities,
+            provider_consent: ProviderConsentResponse {
+                policy_version: record.consent_policy_version,
+                host_owner_consented: record.consent_host_owner,
+                exit_ip_disclosure_accepted: record.consent_exit_ip,
+                accepted_at: format_timestamp(record.consent_accepted_at)?,
+            },
+            last_seen_at: record.last_seen_at.map(format_timestamp).transpose()?,
+            runtime_state: record.runtime_state,
+            provider_paused: record.provider_paused,
+            revisions: NodeRevisionResponse {
+                desired: record.desired_revision,
+                received: record.received_revision,
+                validated: record.validated_revision,
+                applied: record.applied_revision,
+            },
+            telemetry_cursor: record.telemetry_cursor,
+            created_at: format_timestamp(record.created_at)?,
+            updated_at: format_timestamp(record.updated_at)?,
         })
     }
 }
@@ -321,6 +411,96 @@ async fn get_network(
         ApiError::internal(request_id)
     })?;
     Ok(Json(response))
+}
+
+async fn get_nodes(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<NodeListResponse>, ApiError> {
+    let records = state
+        .database
+        .list_nodes()
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    let nodes = records
+        .into_iter()
+        .map(NodeSummaryResponse::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            tracing::error!(request_id = %request_id, error = %error, "stored timestamp is invalid");
+            ApiError::internal(request_id)
+        })?;
+    Ok(Json(NodeListResponse { nodes }))
+}
+
+async fn approve_node(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<StatusCode, ApiError> {
+    apply_node_lifecycle(
+        &state,
+        &path_node_id,
+        NodeLifecycleAction::Approve,
+        request_id,
+    )
+    .await
+}
+
+async fn disable_node(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<StatusCode, ApiError> {
+    apply_node_lifecycle(
+        &state,
+        &path_node_id,
+        NodeLifecycleAction::Disable,
+        request_id,
+    )
+    .await
+}
+
+async fn revoke_node(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<StatusCode, ApiError> {
+    apply_node_lifecycle(
+        &state,
+        &path_node_id,
+        NodeLifecycleAction::Revoke,
+        request_id,
+    )
+    .await
+}
+
+async fn apply_node_lifecycle(
+    state: &AppState,
+    path_node_id: &str,
+    action: NodeLifecycleAction,
+    request_id: RequestId,
+) -> Result<StatusCode, ApiError> {
+    let node_id = parse_node_id(path_node_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    state
+        .database
+        .transition_node(node_id, action)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn parse_node_id(value: &str) -> Option<NodeId> {
+    if value.len() != CANONICAL_UUID_LENGTH {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn format_timestamp(value: i64) -> Result<String, time::error::ComponentRange> {
+    Ok(OffsetDateTime::from_unix_timestamp(value)?
+        .format(&Rfc3339)
+        .expect("RFC 3339 formatting is infallible for a valid timestamp"))
 }
 
 async fn require_admin(State(state): State<AppState>, request: Request, next: Next) -> Response {

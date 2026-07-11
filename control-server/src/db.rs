@@ -12,7 +12,8 @@ use control_protocol::id::{
 };
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
-    EnrollNodeResponse, NodeAuthenticationMode, NodeCredential, NodeHeartbeat, PairingPurpose,
+    EnrollNodeResponse, NodeAuthenticationMode, NodeCapability, NodeCredential, NodeHeartbeat,
+    PairingPurpose,
 };
 use control_protocol::request_auth::{
     verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
@@ -233,6 +234,57 @@ pub struct AuthenticatedNode {
     pub key_id: NodeKeyId,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeSummaryRecord {
+    pub node_id: NodeId,
+    pub network_id: String,
+    pub display_name: String,
+    pub status: String,
+    pub platform: String,
+    pub agent_version: String,
+    pub xray_version: Option<String>,
+    pub capabilities: Vec<NodeCapability>,
+    pub consent_policy_version: String,
+    pub consent_host_owner: bool,
+    pub consent_exit_ip: bool,
+    pub consent_accepted_at: i64,
+    pub last_seen_at: Option<i64>,
+    pub runtime_state: Option<String>,
+    pub provider_paused: bool,
+    pub desired_revision: Option<i64>,
+    pub received_revision: Option<i64>,
+    pub validated_revision: Option<i64>,
+    pub applied_revision: Option<i64>,
+    pub telemetry_cursor: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeLifecycleAction {
+    Approve,
+    Disable,
+    Revoke,
+}
+
+impl NodeLifecycleAction {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Disable => "disable",
+            Self::Revoke => "revoke",
+        }
+    }
+
+    const fn audit_event(self) -> &'static str {
+        match self {
+            Self::Approve => "node.approved",
+            Self::Disable => "node.disabled",
+            Self::Revoke => "node.revoked",
+        }
+    }
+}
+
 impl Database {
     /// Opens the exclusively owned database, migrates it, and bootstraps its network.
     ///
@@ -279,6 +331,42 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
             load_network(&guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Loads safe operator-facing node summaries without credential or key material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when the blocking worker, ownership mutex,
+    /// stored protocol data, or `SQLite` query fails.
+    pub async fn list_nodes(&self) -> Result<Vec<NodeSummaryRecord>, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            load_nodes(&guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Applies an operator-controlled node lifecycle transition atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError::NodeNotFound`] for an unknown node and
+    /// [`DatabaseError::NodeLifecycleConflict`] for a disallowed transition.
+    pub async fn transition_node(
+        &self,
+        node_id: NodeId,
+        action: NodeLifecycleAction,
+    ) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            transition_node(&mut guard.connection, node_id, action)
         })
         .await
         .map_err(DatabaseError::Worker)?
@@ -857,6 +945,267 @@ fn load_network(connection: &Connection) -> Result<NetworkRecord, DatabaseError>
         )
         .optional()?
         .ok_or(DatabaseError::NetworkMissing)
+}
+
+struct RawNodeSummary {
+    node_id: String,
+    network_id: String,
+    display_name: String,
+    status: String,
+    platform: String,
+    agent_version: String,
+    xray_version: Option<String>,
+    capabilities_json: String,
+    consent_policy_version: String,
+    consent_host_owner: i64,
+    consent_exit_ip: i64,
+    consent_accepted_at: i64,
+    last_seen_at: Option<i64>,
+    runtime_state: Option<String>,
+    provider_paused: i64,
+    desired_revision: Option<i64>,
+    received_revision: Option<i64>,
+    validated_revision: Option<i64>,
+    applied_revision: Option<i64>,
+    telemetry_cursor: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, DatabaseError> {
+    let network = load_network(connection)?;
+    let mut statement = connection.prepare(
+        "SELECT node_id, network_id, display_name, status, platform, agent_version,
+                xray_version, capabilities_json, consent_policy_version,
+                consent_host_owner, consent_exit_ip, consent_accepted_at,
+                last_seen_at, runtime_state, provider_paused, desired_revision,
+                received_revision, validated_revision, applied_revision,
+                telemetry_cursor, created_at, updated_at
+         FROM nodes
+         WHERE network_id = ?1
+         ORDER BY created_at ASC, node_id ASC",
+    )?;
+    let rows = statement.query_map([network.network_id], |row| {
+        Ok(RawNodeSummary {
+            node_id: row.get(0)?,
+            network_id: row.get(1)?,
+            display_name: row.get(2)?,
+            status: row.get(3)?,
+            platform: row.get(4)?,
+            agent_version: row.get(5)?,
+            xray_version: row.get(6)?,
+            capabilities_json: row.get(7)?,
+            consent_policy_version: row.get(8)?,
+            consent_host_owner: row.get(9)?,
+            consent_exit_ip: row.get(10)?,
+            consent_accepted_at: row.get(11)?,
+            last_seen_at: row.get(12)?,
+            runtime_state: row.get(13)?,
+            provider_paused: row.get(14)?,
+            desired_revision: row.get(15)?,
+            received_revision: row.get(16)?,
+            validated_revision: row.get(17)?,
+            applied_revision: row.get(18)?,
+            telemetry_cursor: row.get(19)?,
+            created_at: row.get(20)?,
+            updated_at: row.get(21)?,
+        })
+    })?;
+
+    let mut summaries = Vec::new();
+    for row in rows {
+        let row = row?;
+        summaries.push(NodeSummaryRecord {
+            node_id: row
+                .node_id
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            network_id: row.network_id,
+            display_name: row.display_name,
+            status: row.status,
+            platform: row.platform,
+            agent_version: row.agent_version,
+            xray_version: row.xray_version,
+            capabilities: serde_json::from_str(&row.capabilities_json)?,
+            consent_policy_version: row.consent_policy_version,
+            consent_host_owner: row.consent_host_owner != 0,
+            consent_exit_ip: row.consent_exit_ip != 0,
+            consent_accepted_at: row.consent_accepted_at,
+            last_seen_at: row.last_seen_at,
+            runtime_state: row.runtime_state,
+            provider_paused: row.provider_paused != 0,
+            desired_revision: row.desired_revision,
+            received_revision: row.received_revision,
+            validated_revision: row.validated_revision,
+            applied_revision: row.applied_revision,
+            telemetry_cursor: row.telemetry_cursor,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        });
+    }
+    Ok(summaries)
+}
+
+fn transition_node(
+    connection: &mut Connection,
+    node_id: NodeId,
+    action: NodeLifecycleAction,
+) -> Result<(), DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let node_id = node_id.to_string();
+    let current_status = transaction
+        .query_row(
+            "SELECT status FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeNotFound)?;
+
+    let Some(target_status) = node_lifecycle_target(action, &current_status)? else {
+        insert_node_lifecycle_audit(
+            &transaction,
+            &network.network_id,
+            &node_id,
+            action,
+            "rejected",
+            &serde_json::json!({
+                "action": action.wire_name(),
+                "fromStatus": current_status,
+                "reason": "invalid-state-transition"
+            }),
+            now,
+        )?;
+        transaction.commit()?;
+        return Err(DatabaseError::NodeLifecycleConflict {
+            action: action.wire_name(),
+            current_status,
+        });
+    };
+
+    let status_changed = current_status != target_status;
+    if status_changed {
+        let updated = transaction.execute(
+            "UPDATE nodes SET status = ?1, updated_at = ?2
+             WHERE network_id = ?3 AND node_id = ?4 AND status = ?5",
+            params![
+                target_status,
+                now,
+                network.network_id,
+                node_id,
+                current_status
+            ],
+        )?;
+        if updated != 1 {
+            return Err(DatabaseError::NodeLifecycleConflict {
+                action: action.wire_name(),
+                current_status,
+            });
+        }
+    }
+
+    let credentials_revoked =
+        revoke_node_credentials(&transaction, &network.network_id, &node_id, action, now)?;
+    if credentials_revoked > 0 && !status_changed {
+        transaction.execute(
+            "UPDATE nodes SET updated_at = ?1 WHERE network_id = ?2 AND node_id = ?3",
+            params![now, network.network_id, node_id],
+        )?;
+    }
+
+    insert_node_lifecycle_audit(
+        &transaction,
+        &network.network_id,
+        &node_id,
+        action,
+        "success",
+        &serde_json::json!({
+            "action": action.wire_name(),
+            "credentialsRevoked": credentials_revoked,
+            "fromStatus": current_status,
+            "idempotent": !status_changed && credentials_revoked == 0,
+            "toStatus": target_status
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn node_lifecycle_target(
+    action: NodeLifecycleAction,
+    current_status: &str,
+) -> Result<Option<&'static str>, DatabaseError> {
+    match action {
+        NodeLifecycleAction::Approve if matches!(current_status, "pending" | "active") => {
+            Ok(Some("active"))
+        }
+        NodeLifecycleAction::Disable
+            if matches!(current_status, "pending" | "active" | "disabled") =>
+        {
+            Ok(Some("disabled"))
+        }
+        NodeLifecycleAction::Revoke
+            if matches!(
+                current_status,
+                "pending" | "active" | "disabled" | "revoked"
+            ) =>
+        {
+            Ok(Some("revoked"))
+        }
+        _ if matches!(
+            current_status,
+            "pending" | "active" | "disabled" | "revoked"
+        ) =>
+        {
+            Ok(None)
+        }
+        _ => Err(DatabaseError::StoredProtocolValue),
+    }
+}
+
+fn revoke_node_credentials(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: &str,
+    action: NodeLifecycleAction,
+    now: i64,
+) -> Result<usize, DatabaseError> {
+    if action != NodeLifecycleAction::Revoke {
+        return Ok(0);
+    }
+    transaction
+        .execute(
+            "UPDATE node_auth_credentials SET revoked_at = ?1
+             WHERE network_id = ?2 AND node_id = ?3 AND revoked_at IS NULL",
+            params![now, network_id, node_id],
+        )
+        .map_err(DatabaseError::from)
+}
+
+fn insert_node_lifecycle_audit(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: &str,
+    action: NodeLifecycleAction,
+    outcome: &str,
+    details: &serde_json::Value,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    insert_audit_event(
+        transaction,
+        Some(network_id),
+        "admin",
+        None,
+        action.audit_event(),
+        "node",
+        Some(node_id),
+        outcome,
+        details,
+        now,
+    )
 }
 
 fn create_node_invitation(
@@ -1472,6 +1821,13 @@ pub enum DatabaseError {
     NodeProgressRegressed,
     #[error("the node request signature is invalid")]
     InvalidNodeRequestSignature,
+    #[error("the node was not found")]
+    NodeNotFound,
+    #[error("cannot {action} a node in status {current_status}")]
+    NodeLifecycleConflict {
+        action: &'static str,
+        current_status: String,
+    },
     #[error("the controller identity no longer matches the invitation")]
     ControllerIdentityMismatch,
     #[error("a stored protocol value is invalid")]

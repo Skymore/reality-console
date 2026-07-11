@@ -169,6 +169,17 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn conflict(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "The requested operation conflicts with the current resource state.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
     pub fn timeout(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::GATEWAY_TIMEOUT,

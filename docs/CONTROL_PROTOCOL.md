@@ -161,6 +161,25 @@ minimum-version hints but not arbitrary executable instructions.
 The initial implementation returns `204 No Content` after durably accepting the heartbeat. A
 heartbeat never approves a pending node, and revision plus telemetry cursors cannot move backward.
 
+### Operator node lifecycle
+
+All operator endpoints require administrator authentication:
+
+- `GET /v1/admin/nodes` returns node identity, status, consent, version, runtime, revision, and
+  telemetry summaries. It never returns node public keys, credential identifiers, or secret
+  material.
+- `POST /v1/admin/nodes/{nodeId}/approve` changes `pending` to `active`; approving an already
+  active node is idempotent.
+- `POST /v1/admin/nodes/{nodeId}/disable` changes `pending` or `active` to `disabled`; disabling an
+  already disabled node is idempotent.
+- `POST /v1/admin/nodes/{nodeId}/revoke` changes any non-revoked node to `revoked` and atomically
+  revokes every node authentication credential; repeating it is idempotent.
+
+Unknown or non-canonical node IDs return `404 Not Found`. Disallowed transitions return
+`409 Conflict`. Disabled and revoked nodes cannot authenticate control requests. Every accepted,
+idempotent, or rejected transition for a known node writes a redacted audit event. The current API
+does not reactivate a disabled node; that requires a future explicit credential-recovery flow.
+
 ## 5. Desired State API
 
 ### Fetch

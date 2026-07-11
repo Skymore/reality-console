@@ -167,6 +167,99 @@ async fn enroll(app: &TestApp, request: &EnrollNodeRequest) -> axum::response::R
         .unwrap()
 }
 
+async fn admin_node_action(
+    app: &TestApp,
+    node_id: NodeId,
+    action: &str,
+) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/admin/nodes/{node_id}/{action}"))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn admin_nodes(app: &TestApp) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::get("/v1/admin/nodes")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+fn assert_revoked_state_and_lifecycle_audit(app: &TestApp, node_id: NodeId) {
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let (status, live_credentials): (String, i64) = connection
+        .query_row(
+            "SELECT n.status,
+                    (SELECT COUNT(*) FROM node_auth_credentials AS c
+                     WHERE c.node_id = n.node_id AND c.revoked_at IS NULL)
+             FROM nodes AS n WHERE n.node_id = ?1",
+            [node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "revoked");
+    assert_eq!(live_credentials, 0);
+
+    let mut statement = connection
+        .prepare(
+            "SELECT actor_type, event_type, outcome, details_json
+             FROM audit_events
+             WHERE target_type = 'node' AND target_id = ?1
+               AND event_type IN ('node.approved', 'node.disabled', 'node.revoked')
+             ORDER BY event_id",
+        )
+        .unwrap();
+    let events: Vec<(String, String, String, Value)> = statement
+        .query_map([node_id.to_string()], |row| {
+            let details: String = row.get(3)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                serde_json::from_str(&details).unwrap(),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(events.len(), 7);
+    assert!(events.iter().all(|event| event.0 == "admin"));
+    assert_eq!(
+        (events[0].1.as_str(), events[0].2.as_str()),
+        ("node.approved", "success")
+    );
+    assert_eq!(events[0].3["idempotent"], false);
+    assert_eq!(events[1].3["idempotent"], true);
+    assert_eq!(
+        (events[2].1.as_str(), events[2].2.as_str()),
+        ("node.disabled", "success")
+    );
+    assert_eq!(events[3].3["idempotent"], true);
+    assert_eq!(
+        (events[4].1.as_str(), events[4].2.as_str()),
+        ("node.approved", "rejected")
+    );
+    assert_eq!(events[4].3["reason"], "invalid-state-transition");
+    assert_eq!(
+        (events[5].1.as_str(), events[5].2.as_str()),
+        ("node.revoked", "success")
+    );
+    assert_eq!(events[5].3["credentialsRevoked"], 1);
+    assert_eq!(events[6].3["idempotent"], true);
+}
+
 struct SignedNode {
     node_id: NodeId,
     key_id: NodeKeyId,
@@ -293,6 +386,229 @@ async fn admin_route_requires_the_bootstrap_bearer() {
     assert_eq!(body["displayName"], "Private Network");
     assert_eq!(body["status"], "active");
     assert_eq!(body["lastRevision"], 0);
+}
+
+#[tokio::test]
+async fn admin_node_list_is_complete_and_redacts_key_material() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let heartbeat_path = format!("/v1/nodes/{}/heartbeat", node.node_id);
+    let heartbeat_request = signed_node_request(
+        &node,
+        "POST",
+        &heartbeat_path,
+        serde_json::to_vec(&heartbeat()).unwrap(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &nonce(60),
+    );
+    assert_eq!(
+        app.router
+            .clone()
+            .oneshot(heartbeat_request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let (identity_public_key, encryption_public_key): (String, String) = connection
+        .query_row(
+            "SELECT identity_public_key, encryption_public_key FROM nodes WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(connection);
+
+    let response = admin_nodes(&app).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    assert!(!raw.contains(&identity_public_key));
+    assert!(!raw.contains(&encryption_public_key));
+    assert!(!raw.contains("identityPublicKey"));
+    assert!(!raw.contains("encryptionPublicKey"));
+
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let nodes = body["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1);
+    let summary = &nodes[0];
+    assert_eq!(summary["nodeId"], node.node_id.to_string());
+    assert!(Uuid::parse_str(summary["networkId"].as_str().unwrap()).is_ok());
+    assert_eq!(summary["displayName"], "Living room Mac");
+    assert_eq!(summary["status"], "pending");
+    assert_eq!(summary["platform"], "macos-arm64");
+    assert_eq!(summary["agentVersion"], "0.2.0");
+    assert_eq!(summary["xrayVersion"], "26.7.11");
+    assert_eq!(
+        summary["capabilities"],
+        serde_json::json!(["xray", "direct-tcp"])
+    );
+    assert_eq!(summary["providerConsent"]["policyVersion"], "2026-07-11");
+    assert_eq!(summary["providerConsent"]["hostOwnerConsented"], true);
+    assert_eq!(summary["providerConsent"]["exitIpDisclosureAccepted"], true);
+    assert!(summary["providerConsent"]["acceptedAt"].is_string());
+    assert!(summary["lastSeenAt"].is_string());
+    assert_eq!(summary["runtimeState"], "serving");
+    assert_eq!(summary["providerPaused"], false);
+    assert_eq!(summary["revisions"]["desiredRevision"], 4);
+    assert_eq!(summary["revisions"]["receivedRevision"], 4);
+    assert_eq!(summary["revisions"]["validatedRevision"], 4);
+    assert_eq!(summary["revisions"]["appliedRevision"], 4);
+    assert_eq!(summary["telemetryCursor"], 9);
+    assert!(summary["createdAt"].is_string());
+    assert!(summary["updatedAt"].is_string());
+}
+
+#[tokio::test]
+async fn operator_lifecycle_is_strict_idempotent_audited_and_blocks_node_auth() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "approve")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "approve")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "disable")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "disable")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let desired_path = format!("/v1/nodes/{}/desired?afterRevision=0", node.node_id);
+    let disabled_request = signed_node_request(
+        &node,
+        "GET",
+        &desired_path,
+        Vec::new(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &nonce(61),
+    );
+    let disabled_response = app.router.clone().oneshot(disabled_request).await.unwrap();
+    assert_eq!(disabled_response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json(disabled_response).await["error"]["code"],
+        "node_revoked"
+    );
+
+    let conflict = admin_node_action(&app, node.node_id, "approve").await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(json(conflict).await["error"]["code"], "conflict");
+
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "revoke")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "revoke")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let revoked_request = signed_node_request(
+        &node,
+        "GET",
+        &desired_path,
+        Vec::new(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &nonce(62),
+    );
+    let revoked_response = app.router.clone().oneshot(revoked_request).await.unwrap();
+    assert_eq!(revoked_response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json(revoked_response).await["error"]["code"],
+        "node_revoked"
+    );
+
+    assert_revoked_state_and_lifecycle_audit(&app, node.node_id);
+}
+
+#[tokio::test]
+async fn revoke_accepts_pending_active_and_disabled_nodes() {
+    let app = TestApp::new();
+    let pending = enroll_signed_node(&app).await;
+    let active = enroll_signed_node(&app).await;
+    let disabled = enroll_signed_node(&app).await;
+    assert_eq!(
+        admin_node_action(&app, active.node_id, "approve")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        admin_node_action(&app, disabled.node_id, "disable")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    for node in [&pending, &active, &disabled] {
+        assert_eq!(
+            admin_node_action(&app, node.node_id, "revoke")
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    for node in [&pending, &active, &disabled] {
+        let stored: (String, i64) = connection
+            .query_row(
+                "SELECT n.status,
+                        (SELECT COUNT(*) FROM node_auth_credentials AS c
+                         WHERE c.node_id = n.node_id AND c.revoked_at IS NULL)
+                 FROM nodes AS n WHERE n.node_id = ?1",
+                [node.node_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("revoked".to_string(), 0));
+    }
+}
+
+#[tokio::test]
+async fn operator_node_paths_require_known_canonical_bounded_uuids() {
+    let app = TestApp::new();
+    for path in [
+        "/v1/admin/nodes/not-a-uuid/approve".to_string(),
+        "/v1/admin/nodes/AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA/approve".to_string(),
+        "/v1/admin/nodes/00000000-0000-4000-8000-000000000000-extra/approve".to_string(),
+        format!("/v1/admin/nodes/{}/approve", NodeId::new()),
+    ] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(response).await["error"]["code"], "not_found");
+    }
 }
 
 #[tokio::test]

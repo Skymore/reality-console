@@ -203,7 +203,10 @@ and local identity safely recovers a lost success response without creating anot
 This CLI is a development and service integration surface, not the intended friend-facing UX. The
 desktop wrapper will receive the invitation in memory through a QR code or deep link and present
 the provider disclosures as explicit checkboxes. Registration creates a pending node; operator
-approval and activation remain separate control-plane steps.
+approval and activation remain separate control-plane steps. The operator sees a redacted node
+summary and explicitly approves it through Control Service. Heartbeat cannot approve it. Disabling
+the node immediately blocks control authentication; revoking it also atomically revokes all of its
+node credentials.
 
 `sync-once` performs one outbound signed heartbeat and one signed desired-state fetch. It records
 heartbeat and complete-cycle timestamps locally, uses a fresh nonce for every request, and accepts
