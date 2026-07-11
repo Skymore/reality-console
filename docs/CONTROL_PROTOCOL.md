@@ -269,9 +269,6 @@ does not reactivate a disabled node; that requires a future explicit credential-
 ```json
 {
   "minAgentVersion": "0.1.0",
-  "users": [
-    {"userId": "uuid", "credentialId": "uuid", "vlessUuid": "secret", "enabled": true}
-  ],
   "xray": {
     "listenPort": 10443,
     "publicPort": 443,
@@ -281,12 +278,26 @@ does not reactivate a disabled node; that requires a future explicit credential-
 }
 ```
 
-Only an `active` node can receive a revision. Control Service canonicalizes ordered fields,
-allocates the next network revision, signs the exact node document, stores its artifact and
-digests immutably, updates that node's authoritative desired revision, and writes a secret-free
-audit event in one transaction. The initial low-level endpoint returns `201 Created`; later account
-and assignment mutations compile the same document rather than exposing raw desired-state editing
-as the primary operator workflow.
+The administrator supplies only closed Xray settings. A caller-provided `users` field is rejected;
+Control Service compiles the complete member list from active accounts, enabled assignments, and
+pending/active per-node credentials. Only an `active` node can receive a revision. Publication
+canonicalizes ordered fields, allocates the next network revision, signs the exact node document,
+stores its artifact and member snapshot immutably, updates that node's authoritative desired
+revision, and writes a secret-free audit event in one transaction.
+
+The `201 Created` administrator response is redacted and contains only `nodeId`, `revision`,
+`schemaVersion`, `createdAt`, `userCount`, and `created: true`. The signed artifact and member UUIDs
+are returned only from the node-authenticated fetch route.
+
+### Reconcile
+
+`PUT /v1/admin/nodes/{nodeId}/reconcile`
+
+Recompiles the authoritative member set while preserving the latest verified Xray settings. It
+returns `200 OK` with the same redacted revision when the latest target already matches and is not
+terminally failed. It publishes and returns `201 Created` only after `rejected`/`rolledBack` or when
+the immutable member snapshot differs. Repeating a successful retry before another state change is
+therefore naturally idempotent.
 
 ### Fetch
 
@@ -374,7 +385,8 @@ revision to have reached `applied` with the same restored-config digest.
   a duplicate-free list of at most 100 node IDs; clients never submit assignment IDs or VLESS
   credentials. Omitted existing assignments become disabled, newly requested nodes receive stable
   assignments and distinct controller-generated credentials, and unchanged entries remain
-  idempotent.
+  idempotent. Every changed active node receives a complete signed target in the same database
+  transaction; a missing baseline Xray configuration rolls back the whole multi-node mutation.
 - `PUT /v1/admin/accounts/{userId}/status` explicitly changes `active` or `disabled`, or applies the
   terminal `deleted` tombstone. Account status gates every session and desired-state credential
   independently of cached assignment state.
@@ -383,7 +395,8 @@ Account mutations require administrator authentication, use canonical UUID paths
 redacted audit events. A safe account summary contains only account identity, display name,
 lifecycle, assignment identity/node/status, provisioning state, and timestamps. Assignment status
 is authorization intent; `provisioningState` independently reports `pending`, `applied`,
-`removalPending`, or `notProvisioned` and must drive operator UI claims.
+`removalPending`, `removed`, or `notProvisioned` and must drive operator UI claims. `applied` and
+`removed` require exact revision-result evidence, not heartbeat freshness or a database status flag.
 
 ### Activate device
 
@@ -448,13 +461,12 @@ semantics affect security; it rejects incompatible required features with a stab
 
 The executable Control Service includes health, node invitation/enrollment, replay-resistant node
 authentication, signed heartbeat status, immutable signed desired revisions, monotonic rollout
-results, node lifecycle controls, and controller-owned TCP preflight state. Account migration 9
-also implements administrator account creation/listing, terminal account lifecycle, atomic complete
-node-set replacement, stable assignments, durable account-creation idempotency, explicit
-provisioning state, and distinct pending per-node VLESS credentials.
+results, node lifecycle controls, and controller-owned TCP preflight state. Account migrations 9
+and 10 implement administrator account creation/listing, terminal account lifecycle, atomic
+multi-node target compilation, stable assignments, durable account-creation idempotency, immutable
+per-revision member snapshots, apply-driven credential activation/removal, explicit provisioning
+state, and distinct per-node VLESS credentials.
 
-`pending` assignment credentials are control-plane intent only. Automatic desired-state
-reconciliation, apply-driven credential promotion/retirement, member activation and sessions,
-encrypted signed profile bundles, telemetry aggregation, protocol-aware endpoint verification, and
-relay remain later slices. Until reconciliation and protocol verification are implemented, account
-assignment APIs must not be presented as proof that a member can connect.
+Member activation and sessions, encrypted signed profile bundles, telemetry aggregation,
+protocol-aware endpoint verification, and relay remain later slices. Even an `applied` assignment
+must not enter a Connect bundle until its endpoint is controller-verified.

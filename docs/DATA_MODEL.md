@@ -268,13 +268,18 @@ verified endpoint, and has an applied configuration compatible with the profile 
 every node assignment. Rotation may overlap old and new credentials only until `retire_after`; a
 disabled/deleted user or assignment gates bundle publication regardless of cached credential state.
 
-Control Service migration 9 is the executable account/assignment slice. A newly generated
-credential is `pending`: it is durable but is not evidence that Node Host has received, validated,
-or applied it. The desired-state reconciliation phase promotes it only after the exact signed node
-revision reaches `applied`; no Connect bundle may advertise that profile before then. Disabling or
-revoking a node closes its assignments and revokes its stored member credentials in the same
-Control transaction. Remote Xray removal still requires a reachable Node Host and a successfully
-applied replacement revision.
+Control Service migration 9 creates accounts, assignments, credentials, and durable creation
+idempotency. Migration 10 closes the data-plane evidence loop. A newly generated credential is
+`pending`: it is durable but is not evidence that Node Host has received, validated, or applied it.
+Only an exact `applied` result for a revision whose immutable member snapshot contains that
+credential promotes it to `active`. An active or retiring credential becomes `revoked` only when a
+later applied snapshot excludes it. No Connect bundle may advertise a profile before this evidence
+and endpoint verification both exist.
+
+Disabling or revoking a node closes its assignments and revokes its stored member credentials in
+the same Control transaction, but the provisioning view remains `removalPending` when the node's
+last applied snapshot still contains them. Remote Xray removal still requires a reachable Node Host
+and a successfully applied replacement revision; Control never claims stronger offline revocation.
 
 ### 3.5 Immutable desired state and rollout state
 
@@ -316,6 +321,18 @@ The artifact contains the protocol envelope and secrets required by that node. B
 commit, it is written to a temporary owner-only file, fsynced, atomically renamed, and hashed. A
 failed database transaction can leave only an unreferenced artifact, which garbage collection may
 remove. A committed row can never reference a partially written artifact.
+
+`node_revision_member_snapshots` has one immutable marker for every newly compiled
+`(network_id, node_id, revision)`, including an empty member list.
+`node_revision_member_credentials` stores the exact credential, assignment, and user identities
+present in that target, with uniqueness per revision and composite foreign keys back to both the
+target and credential. Update/delete triggers make both tables append-only. The tables contain no
+VLESS UUID; the signed owner-only artifact carries the secret.
+
+Account and assignment APIs derive provisioning evidence by comparing `nodes.applied_revision`
+with these snapshots. A historical applied snapshot plus a current applied snapshot that excludes
+the assignment yields `removed`; a currently applied snapshot that still contains disabled access
+yields `removalPending`.
 
 `node_rollout_gates` is mutable operational state keyed by `(network_id, node_id, revision)`. It has
 `gate_state` (`held`, `eligible`, `paused`, or `cancelled`), `wave`, `eligible_at`,

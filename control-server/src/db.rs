@@ -1,7 +1,7 @@
 use crate::config::{validate_network_name, ConfigError};
 use crate::desired::{
     build_signed_desired_state, controller_signing_key_id, verify_stored_desired_state,
-    DesiredStateDraft, DesiredStateError, StoredDesiredState,
+    DesiredStateConfigurationDraft, DesiredStateError, StoredDesiredState,
     SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS,
 };
 use crate::identity::{set_owner_only, ControllerIdentity, IdentityError};
@@ -26,8 +26,8 @@ use control_protocol::id::{
 };
 use control_protocol::idempotency::IdempotencyKey;
 use control_protocol::node::{
-    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate, EndpointMode,
-    EndpointReadiness, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
+    CreateNodeInvitationRequest, CreateNodeInvitationResponse, DesiredUser, EndpointCandidate,
+    EndpointMode, EndpointReadiness, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
     NodeCapability, NodeCredential, NodeEndpointStatus, NodeHeartbeat, NodeHeartbeatStatus,
     NodeLifecycleState, PairingPurpose, RevisionResult, RevisionResultState, SignedDesiredState,
     SignedNodeHeartbeatStatus,
@@ -53,7 +53,7 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
@@ -761,6 +761,70 @@ CREATE INDEX idempotency_records_expiry
     ON idempotency_records(network_id, expires_at);
 ";
 
+const MIGRATION_10_SQL: &str = r"
+CREATE UNIQUE INDEX user_node_credentials_snapshot_identity
+    ON user_node_credentials(
+        network_id, credential_id, assignment_id, user_id, node_id
+    );
+
+CREATE TABLE node_revision_member_snapshots (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id, revision),
+    FOREIGN KEY(network_id, node_id, revision)
+        REFERENCES node_revision_targets(network_id, node_id, revision)
+        ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE node_revision_member_credentials (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    credential_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    PRIMARY KEY(network_id, node_id, revision, credential_id),
+    UNIQUE(network_id, node_id, revision, assignment_id),
+    UNIQUE(network_id, node_id, revision, user_id),
+    FOREIGN KEY(network_id, node_id, revision)
+        REFERENCES node_revision_member_snapshots(network_id, node_id, revision)
+        ON DELETE RESTRICT,
+    FOREIGN KEY(network_id, credential_id, assignment_id, user_id, node_id)
+        REFERENCES user_node_credentials(
+            network_id, credential_id, assignment_id, user_id, node_id
+        ) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX node_revision_member_credentials_assignment
+    ON node_revision_member_credentials(network_id, assignment_id, revision);
+
+CREATE TRIGGER node_revision_member_snapshots_no_update
+BEFORE UPDATE ON node_revision_member_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'node revision member snapshots are immutable');
+END;
+
+CREATE TRIGGER node_revision_member_snapshots_no_delete
+BEFORE DELETE ON node_revision_member_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'node revision member snapshots are immutable');
+END;
+
+CREATE TRIGGER node_revision_member_credentials_no_update
+BEFORE UPDATE ON node_revision_member_credentials
+BEGIN
+    SELECT RAISE(ABORT, 'node revision member credentials are immutable');
+END;
+
+CREATE TRIGGER node_revision_member_credentials_no_delete
+BEFORE DELETE ON node_revision_member_credentials
+BEGIN
+    SELECT RAISE(ABORT, 'node revision member credentials are immutable');
+END;
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -813,6 +877,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "member_accounts_and_assignments",
         sql: MIGRATION_9_SQL,
     },
+    Migration {
+        version: 10,
+        name: "member_desired_state_snapshots",
+        sql: MIGRATION_10_SQL,
+    },
 ];
 
 #[derive(Clone)]
@@ -840,6 +909,11 @@ pub struct NetworkRecord {
 /// Enrollment response plus whether this request created the durable node.
 pub struct NodeEnrollmentResult {
     pub response: EnrollNodeResponse,
+    pub created: bool,
+}
+
+pub(crate) struct DesiredStateReconcileResult {
+    pub desired: SignedDesiredState,
     pub created: bool,
 }
 
@@ -1022,10 +1096,11 @@ impl Database {
         request: ReplaceAccountNodesRequest,
     ) -> Result<AccountSummary, DatabaseError> {
         request.validate()?;
+        let identity = self.controller_identity.clone();
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
-            replace_account_nodes(&mut guard.connection, user_id, &request)
+            replace_account_nodes(&mut guard.connection, &identity, user_id, &request)
         })
         .await
         .map_err(DatabaseError::Worker)?
@@ -1042,10 +1117,11 @@ impl Database {
         user_id: UserId,
         status: AccountStatus,
     ) -> Result<AccountSummary, DatabaseError> {
+        let identity = self.controller_identity.clone();
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
-            set_account_status(&mut guard.connection, user_id, status)
+            set_account_status(&mut guard.connection, &identity, user_id, status)
         })
         .await
         .map_err(DatabaseError::Worker)?
@@ -1214,13 +1290,28 @@ impl Database {
     pub(crate) async fn publish_desired_state(
         &self,
         node_id: NodeId,
-        draft: DesiredStateDraft,
+        configuration: DesiredStateConfigurationDraft,
     ) -> Result<SignedDesiredState, DatabaseError> {
         let identity = self.controller_identity.clone();
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
-            publish_desired_state(&mut guard.connection, &identity, node_id, draft)
+            publish_desired_state(&mut guard.connection, &identity, node_id, configuration)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Returns or republishes the current authoritative snapshot for one node.
+    pub(crate) async fn reconcile_node_desired_state(
+        &self,
+        node_id: NodeId,
+    ) -> Result<DesiredStateReconcileResult, DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            reconcile_node_desired_state(&mut guard.connection, &identity, node_id)
         })
         .await
         .map_err(DatabaseError::Worker)?
@@ -2510,11 +2601,11 @@ fn publish_desired_state(
     connection: &mut Connection,
     identity: &ControllerIdentity,
     node_id: NodeId,
-    draft: DesiredStateDraft,
+    configuration: DesiredStateConfigurationDraft,
 ) -> Result<SignedDesiredState, DatabaseError> {
     let now = unix_timestamp()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let network = load_network(&transaction)?;
+    let mut network = load_network(&transaction)?;
     let node_id_text = node_id.to_string();
     let node_status = transaction
         .query_row(
@@ -2543,6 +2634,147 @@ fn publish_desired_state(
         });
     }
 
+    let users = compile_desired_users(&transaction, &network.network_id, node_id)?;
+    let desired = publish_compiled_desired_state(
+        &transaction,
+        identity,
+        &mut network,
+        node_id,
+        configuration,
+        &users,
+        "operator-configuration",
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(desired)
+}
+
+fn reconcile_node_desired_state(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    node_id: NodeId,
+) -> Result<DesiredStateReconcileResult, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut network = load_network(&transaction)?;
+    let current = load_latest_node_desired(&transaction, identity, &network, node_id)?;
+    let users = compile_desired_users(&transaction, &network.network_id, node_id)?;
+    let mut expected_users = users
+        .iter()
+        .map(|compiled| compiled.user.clone())
+        .collect::<Vec<_>>();
+    expected_users.sort_by(|left, right| {
+        left.user_id
+            .cmp(&right.user_id)
+            .then_with(|| left.credential_id.cmp(&right.credential_id))
+    });
+    let revision = current.document.revision;
+    let member_snapshot_matches =
+        member_snapshot_matches(&transaction, &network.network_id, node_id, revision, &users)?;
+    let terminal_failure = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM node_revision_results
+            WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3
+              AND state IN ('rejected', 'rolledBack')
+         )",
+        params![network.network_id, node_id.to_string(), revision.get()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if current.document.users == expected_users && member_snapshot_matches && !terminal_failure {
+        insert_audit_event(
+            &transaction,
+            Some(&network.network_id),
+            "bootstrap-admin",
+            None,
+            "node.desired-state-reconciled",
+            "node",
+            Some(&node_id.to_string()),
+            "success",
+            &serde_json::json!({ "created": false, "revision": revision }),
+            now,
+        )?;
+        transaction.commit()?;
+        return Ok(DesiredStateReconcileResult {
+            desired: current,
+            created: false,
+        });
+    }
+
+    let configuration = DesiredStateConfigurationDraft {
+        min_agent_version: current.document.min_agent_version,
+        xray: current.document.xray,
+    };
+    let desired = publish_compiled_desired_state(
+        &transaction,
+        identity,
+        &mut network,
+        node_id,
+        configuration,
+        &users,
+        "operator-reconcile",
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(DesiredStateReconcileResult {
+        desired,
+        created: true,
+    })
+}
+
+fn member_snapshot_matches(
+    connection: &Connection,
+    network_id: &str,
+    node_id: NodeId,
+    revision: Revision,
+    users: &[CompiledDesiredUser],
+) -> Result<bool, DatabaseError> {
+    let marker_exists = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM node_revision_member_snapshots
+            WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3
+         )",
+        params![network_id, node_id.to_string(), revision.get()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !marker_exists {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare(
+        "SELECT credential_id FROM node_revision_member_credentials
+         WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3
+         ORDER BY credential_id",
+    )?;
+    let stored = statement
+        .query_map(
+            params![network_id, node_id.to_string(), revision.get()],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut expected = users
+        .iter()
+        .map(|compiled| compiled.user.credential_id.to_string())
+        .collect::<Vec<_>>();
+    expected.sort();
+    Ok(stored == expected)
+}
+
+#[derive(Clone)]
+struct CompiledDesiredUser {
+    assignment_id: AssignmentId,
+    user: DesiredUser,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_compiled_desired_state(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &ControllerIdentity,
+    network: &mut NetworkRecord,
+    node_id: NodeId,
+    configuration: DesiredStateConfigurationDraft,
+    users: &[CompiledDesiredUser],
+    reason: &'static str,
+    now: i64,
+) -> Result<SignedDesiredState, DatabaseError> {
     let next_revision = network
         .last_revision
         .checked_add(1)
@@ -2563,10 +2795,19 @@ fn publish_desired_state(
         next_revision,
         timestamp(now)?,
         controller_instance_id,
-        draft,
+        configuration.with_users(users.iter().map(|user| user.user.clone()).collect()),
     )
     .map_err(map_desired_state_publication_error)?;
-    insert_desired_revision(&transaction, &network, &node_id_text, &artifact, now)?;
+    let node_id_text = node_id.to_string();
+    insert_desired_revision(transaction, network, &node_id_text, &artifact, now)?;
+    insert_member_revision_snapshot(
+        transaction,
+        &network.network_id,
+        node_id,
+        next_revision,
+        users,
+        now,
+    )?;
 
     let revision = next_revision.get();
     let node_updated = transaction.execute(
@@ -2580,12 +2821,20 @@ fn publish_desired_state(
         params![revision, now, network.network_id, network.last_revision],
     )?;
     if node_updated != 1 || network_updated != 1 {
+        let node_status = transaction
+            .query_row(
+                "SELECT status FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+                params![network.network_id, node_id_text],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "missing".to_string());
         return Err(DatabaseError::DesiredStatePublicationConflict {
             current_status: node_status,
         });
     }
     insert_audit_event(
-        &transaction,
+        transaction,
         Some(&network.network_id),
         "admin",
         None,
@@ -2595,13 +2844,211 @@ fn publish_desired_state(
         "success",
         &serde_json::json!({
             "parentRevision": (revision > 1).then_some(revision - 1),
+            "reason": reason,
             "revision": revision,
-            "schemaVersion": artifact.envelope.document.schema_version
+            "schemaVersion": artifact.envelope.document.schema_version,
+            "userCount": users.len(),
         }),
         now,
     )?;
-    transaction.commit()?;
+    network.last_revision = revision;
+    network.updated_at = now;
     Ok(artifact.envelope)
+}
+
+fn compile_desired_users(
+    connection: &Connection,
+    network_id: &str,
+    node_id: NodeId,
+) -> Result<Vec<CompiledDesiredUser>, DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT credential.credential_id, credential.assignment_id,
+                credential.user_id, credential.vless_uuid
+         FROM user_node_credentials AS credential
+         JOIN user_node_assignments AS assignment
+           ON assignment.network_id = credential.network_id
+          AND assignment.assignment_id = credential.assignment_id
+         JOIN users AS account
+           ON account.network_id = credential.network_id
+          AND account.user_id = credential.user_id
+         WHERE credential.network_id = ?1 AND credential.node_id = ?2
+           AND credential.status IN ('pending', 'active')
+           AND assignment.status = 'enabled' AND account.status = 'active'
+         ORDER BY credential.user_id, credential.version DESC",
+    )?;
+    let rows = statement.query_map(params![network_id, node_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut users = Vec::new();
+    let mut user_ids = BTreeSet::new();
+    let mut assignment_ids = BTreeSet::new();
+    for row in rows {
+        let (credential_id, assignment_id, user_id, vless_uuid) = row?;
+        let credential_id = credential_id
+            .parse::<CredentialId>()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        let assignment_id = assignment_id
+            .parse::<AssignmentId>()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        let user_id = user_id
+            .parse::<UserId>()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        if !user_ids.insert(user_id) || !assignment_ids.insert(assignment_id) {
+            return Err(DatabaseError::StoredProtocolValue);
+        }
+        users.push(CompiledDesiredUser {
+            assignment_id,
+            user: DesiredUser {
+                user_id,
+                credential_id,
+                vless_uuid: Secret::new(vless_uuid),
+                enabled: true,
+            },
+        });
+    }
+    Ok(users)
+}
+
+fn insert_member_revision_snapshot(
+    connection: &Connection,
+    network_id: &str,
+    node_id: NodeId,
+    revision: Revision,
+    users: &[CompiledDesiredUser],
+    now: i64,
+) -> Result<(), DatabaseError> {
+    connection.execute(
+        "INSERT INTO node_revision_member_snapshots(network_id, node_id, revision, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![network_id, node_id.to_string(), revision.get(), now],
+    )?;
+    for user in users {
+        connection.execute(
+            "INSERT INTO node_revision_member_credentials(
+                network_id, node_id, revision, credential_id, assignment_id, user_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                network_id,
+                node_id.to_string(),
+                revision.get(),
+                user.user.credential_id.to_string(),
+                user.assignment_id.to_string(),
+                user.user.user_id.to_string(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn publish_account_revisions(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &ControllerIdentity,
+    network: &mut NetworkRecord,
+    node_ids: &BTreeSet<NodeId>,
+    reason: &'static str,
+    now: i64,
+) -> Result<Vec<(NodeId, Revision)>, DatabaseError> {
+    let mut revisions = Vec::with_capacity(node_ids.len());
+    for node_id in node_ids {
+        let configuration =
+            load_node_desired_configuration(transaction, identity, network, *node_id)?;
+        let users = compile_desired_users(transaction, &network.network_id, *node_id)?;
+        let desired = publish_compiled_desired_state(
+            transaction,
+            identity,
+            network,
+            *node_id,
+            configuration,
+            &users,
+            reason,
+            now,
+        )?;
+        revisions.push((*node_id, desired.document.revision));
+    }
+    Ok(revisions)
+}
+
+fn load_node_desired_configuration(
+    connection: &Connection,
+    identity: &ControllerIdentity,
+    network: &NetworkRecord,
+    node_id: NodeId,
+) -> Result<DesiredStateConfigurationDraft, DatabaseError> {
+    let desired = load_latest_node_desired(connection, identity, network, node_id)?;
+    Ok(DesiredStateConfigurationDraft {
+        min_agent_version: desired.document.min_agent_version,
+        xray: desired.document.xray,
+    })
+}
+
+fn load_latest_node_desired(
+    connection: &Connection,
+    identity: &ControllerIdentity,
+    network: &NetworkRecord,
+    node_id: NodeId,
+) -> Result<SignedDesiredState, DatabaseError> {
+    let node_id_text = node_id.to_string();
+    let (status, desired_revision) = connection
+        .query_row(
+            "SELECT status, desired_revision FROM nodes
+             WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id_text],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeNotFound)?;
+    if status != "active" {
+        return Err(DatabaseError::DesiredStatePublicationConflict {
+            current_status: status,
+        });
+    }
+    let desired_revision = desired_revision.ok_or(DatabaseError::NodeConfigurationMissing)?;
+    let stored = load_stored_desired_revision(
+        connection,
+        &network.network_id,
+        &node_id_text,
+        desired_revision,
+    )?
+    .ok_or(DatabaseError::StoredDesiredStateCorrupt)?;
+    verify_desired_revision(identity, network, node_id, &stored)
+}
+
+fn load_publishable_account_nodes(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+) -> Result<BTreeSet<NodeId>, DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT assignment.node_id
+         FROM user_node_assignments AS assignment
+         JOIN nodes AS node
+           ON node.network_id = assignment.network_id
+          AND node.node_id = assignment.node_id
+         WHERE assignment.network_id = ?1 AND assignment.user_id = ?2
+           AND assignment.status = 'enabled' AND node.status = 'active'",
+    )?;
+    let node_ids = statement
+        .query_map(params![network_id, user_id.to_string()], |row| {
+            row.get::<_, String>(0)
+        })?
+        .map(|row| {
+            row?.parse::<NodeId>()
+                .map_err(|_| DatabaseError::StoredProtocolValue)
+        })
+        .collect();
+    node_ids
+}
+
+fn revision_audit_details(revisions: &[(NodeId, Revision)]) -> Vec<serde_json::Value> {
+    revisions
+        .iter()
+        .map(|(node_id, revision)| serde_json::json!({ "nodeId": node_id, "revision": revision }))
+        .collect()
 }
 
 fn insert_desired_revision(
@@ -2812,7 +3259,104 @@ fn record_revision_result(
         result,
         now,
     )?;
+    if matches!(
+        result.state,
+        RevisionResultState::Applied | RevisionResultState::RolledBack
+    ) {
+        reconcile_applied_member_credentials(&transaction, &network.network_id, node_id, now)?;
+    }
     transaction.commit()?;
+    Ok(())
+}
+
+fn reconcile_applied_member_credentials(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let node_id_text = node_id.to_string();
+    let applied_revision = transaction
+        .query_row(
+            "SELECT applied_revision FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+            params![network_id, node_id_text],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .ok_or(DatabaseError::RevisionResultConflict)?;
+    let has_authoritative_snapshot = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM node_revision_member_snapshots
+            WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3
+         )",
+        params![network_id, node_id_text, applied_revision],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_authoritative_snapshot {
+        return Ok(());
+    }
+
+    let activated = transaction.execute(
+        "UPDATE user_node_credentials AS credential
+         SET status = 'active', activated_at = COALESCE(activated_at, ?1)
+         WHERE credential.network_id = ?2 AND credential.node_id = ?3
+           AND credential.status = 'pending' AND EXISTS(
+                SELECT 1 FROM node_revision_member_credentials AS snapshot
+                WHERE snapshot.network_id = credential.network_id
+                  AND snapshot.node_id = credential.node_id
+                  AND snapshot.revision = ?4
+                  AND snapshot.credential_id = credential.credential_id
+           )",
+        params![now, network_id, node_id_text, applied_revision],
+    )?;
+    let revoked = transaction.execute(
+        "UPDATE user_node_credentials AS credential
+         SET status = 'revoked', revoked_at = ?1, retire_after = NULL
+         WHERE credential.network_id = ?2 AND credential.node_id = ?3
+           AND credential.status IN ('active', 'retiring') AND NOT EXISTS(
+                SELECT 1 FROM node_revision_member_credentials AS snapshot
+                WHERE snapshot.network_id = credential.network_id
+                  AND snapshot.node_id = credential.node_id
+                  AND snapshot.revision = ?4
+                  AND snapshot.credential_id = credential.credential_id
+           )",
+        params![now, network_id, node_id_text, applied_revision],
+    )?;
+    let policy_violations: i64 = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM node_revision_member_credentials AS snapshot
+         JOIN user_node_credentials AS credential
+           ON credential.network_id = snapshot.network_id
+          AND credential.credential_id = snapshot.credential_id
+         JOIN user_node_assignments AS assignment
+           ON assignment.network_id = credential.network_id
+          AND assignment.assignment_id = credential.assignment_id
+         JOIN users AS account
+           ON account.network_id = credential.network_id
+          AND account.user_id = credential.user_id
+         WHERE snapshot.network_id = ?1 AND snapshot.node_id = ?2
+           AND snapshot.revision = ?3
+           AND (credential.status != 'active' OR assignment.status != 'enabled'
+                OR account.status != 'active')",
+        params![network_id, node_id_text, applied_revision],
+        |row| row.get(0),
+    )?;
+    insert_audit_event(
+        transaction,
+        Some(network_id),
+        "node",
+        Some(&node_id_text),
+        "node.member-credentials-reconciled",
+        "node",
+        Some(&node_id_text),
+        "success",
+        &serde_json::json!({
+            "activated": activated,
+            "appliedRevision": applied_revision,
+            "policyViolations": policy_violations,
+            "revoked": revoked,
+        }),
+        now,
+    )?;
     Ok(())
 }
 
@@ -3620,24 +4164,43 @@ fn load_account(
     let mut statement = connection.prepare(
         "SELECT assignment.assignment_id, assignment.node_id, assignment.status,
                 CASE
-                    WHEN (?3 != 'active' OR assignment.status != 'enabled')
-                         AND EXISTS(
-                            SELECT 1 FROM user_node_credentials AS credential
-                            WHERE credential.network_id = assignment.network_id
-                              AND credential.assignment_id = assignment.assignment_id
-                              AND credential.activated_at IS NOT NULL
-                         ) THEN 'removal_pending'
-                    WHEN ?3 != 'active' OR assignment.status != 'enabled'
-                        THEN 'not_provisioned'
+                    WHEN ?3 = 'active' AND assignment.status = 'enabled' THEN
+                        CASE WHEN EXISTS(
+                            SELECT 1
+                            FROM node_revision_member_credentials AS snapshot
+                            JOIN user_node_credentials AS credential
+                              ON credential.network_id = snapshot.network_id
+                             AND credential.credential_id = snapshot.credential_id
+                            WHERE snapshot.network_id = assignment.network_id
+                              AND snapshot.node_id = assignment.node_id
+                              AND snapshot.revision = node.applied_revision
+                              AND snapshot.assignment_id = assignment.assignment_id
+                              AND credential.status IN ('pending', 'active')
+                        ) THEN 'applied' ELSE 'pending' END
                     WHEN EXISTS(
-                        SELECT 1 FROM user_node_credentials AS credential
-                        WHERE credential.network_id = assignment.network_id
-                          AND credential.assignment_id = assignment.assignment_id
-                          AND credential.status = 'active'
-                    ) THEN 'applied'
-                    ELSE 'pending'
+                        SELECT 1 FROM node_revision_member_credentials AS snapshot
+                        WHERE snapshot.network_id = assignment.network_id
+                          AND snapshot.node_id = assignment.node_id
+                          AND snapshot.revision = node.applied_revision
+                          AND snapshot.assignment_id = assignment.assignment_id
+                    ) THEN 'removal_pending'
+                    WHEN EXISTS(
+                        SELECT 1
+                        FROM node_revision_member_credentials AS historical
+                        JOIN node_revision_results AS result
+                          ON result.network_id = historical.network_id
+                         AND result.node_id = historical.node_id
+                         AND result.revision = historical.revision
+                         AND result.state = 'applied'
+                        WHERE historical.network_id = assignment.network_id
+                          AND historical.assignment_id = assignment.assignment_id
+                    ) THEN 'removed'
+                    ELSE 'not_provisioned'
                 END
          FROM user_node_assignments AS assignment
+         JOIN nodes AS node
+           ON node.network_id = assignment.network_id
+          AND node.node_id = assignment.node_id
          WHERE assignment.network_id = ?1 AND assignment.user_id = ?2
          ORDER BY assignment.node_id ASC",
     )?;
@@ -3681,6 +4244,7 @@ fn load_account(
 
 fn replace_account_nodes(
     connection: &mut Connection,
+    identity: &ControllerIdentity,
     user_id: UserId,
     request: &ReplaceAccountNodesRequest,
 ) -> Result<AccountSummary, DatabaseError> {
@@ -3690,7 +4254,7 @@ fn replace_account_nodes(
         .checked_add(3_600)
         .ok_or(DatabaseError::TimestampOverflow)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let network = load_network(&transaction)?;
+    let mut network = load_network(&transaction)?;
     let account_status = load_account_status(&transaction, &network.network_id, user_id)?;
     if account_status != "active" {
         return Err(DatabaseError::AccountLifecycleConflict {
@@ -3702,7 +4266,7 @@ fn replace_account_nodes(
     let requested = request.node_ids.iter().copied().collect::<BTreeSet<_>>();
     validate_assignment_nodes(&transaction, &network.network_id, &requested)?;
     let existing = load_stored_assignments(&transaction, &network.network_id, user_id)?;
-    let enabled_changed = enable_requested_assignments(
+    let mut affected_nodes = enable_requested_assignments(
         &transaction,
         &network.network_id,
         user_id,
@@ -3710,21 +4274,29 @@ fn replace_account_nodes(
         &existing,
         now,
     )?;
-    let disabled_changed = disable_omitted_assignments(
+    affected_nodes.extend(disable_omitted_assignments(
         &transaction,
         &network.network_id,
         &requested,
         &existing,
         now,
         retire_after,
-    )?;
-    let changed = enabled_changed || disabled_changed;
+    )?);
+    let changed = !affected_nodes.is_empty();
     if changed {
         transaction.execute(
             "UPDATE users SET updated_at = ?1 WHERE network_id = ?2 AND user_id = ?3",
             params![now, network.network_id, user_id.to_string()],
         )?;
     }
+    let revisions = publish_account_revisions(
+        &transaction,
+        identity,
+        &mut network,
+        &affected_nodes,
+        "account-node-assignment",
+        now,
+    )?;
     insert_audit_event(
         &transaction,
         Some(&network.network_id),
@@ -3734,7 +4306,11 @@ fn replace_account_nodes(
         "account",
         Some(&user_id.to_string()),
         "success",
-        &serde_json::json!({ "nodeCount": requested.len(), "changed": changed }),
+        &serde_json::json!({
+            "changed": changed,
+            "nodeCount": requested.len(),
+            "publishedRevisions": revision_audit_details(&revisions),
+        }),
         now,
     )?;
     let summary = load_account(&transaction, &network.network_id, user_id)?;
@@ -3749,8 +4325,8 @@ fn enable_requested_assignments(
     requested: &BTreeSet<NodeId>,
     existing: &BTreeMap<NodeId, StoredAssignment>,
     now: i64,
-) -> Result<bool, DatabaseError> {
-    let mut changed = false;
+) -> Result<BTreeSet<NodeId>, DatabaseError> {
+    let mut changed = BTreeSet::new();
     for node_id in requested {
         match existing.get(node_id) {
             None => {
@@ -3776,7 +4352,7 @@ fn enable_requested_assignments(
                     *node_id,
                     now,
                 )?;
-                changed = true;
+                changed.insert(*node_id);
             }
             Some(assignment) if assignment.status == "disabled" => {
                 revoke_assignment_credentials(
@@ -3799,7 +4375,7 @@ fn enable_requested_assignments(
                     *node_id,
                     now,
                 )?;
-                changed = true;
+                changed.insert(*node_id);
             }
             Some(assignment) if assignment.status == "enabled" => {}
             Some(assignment) => {
@@ -3820,8 +4396,8 @@ fn disable_omitted_assignments(
     existing: &BTreeMap<NodeId, StoredAssignment>,
     now: i64,
     retire_after: i64,
-) -> Result<bool, DatabaseError> {
-    let mut changed = false;
+) -> Result<BTreeSet<NodeId>, DatabaseError> {
+    let mut changed = BTreeSet::new();
     for (node_id, assignment) in existing {
         if assignment.status == "enabled" && !requested.contains(node_id) {
             disable_assignment(
@@ -3831,7 +4407,7 @@ fn disable_omitted_assignments(
                 now,
                 retire_after,
             )?;
-            changed = true;
+            changed.insert(*node_id);
         }
     }
     Ok(changed)
@@ -3982,6 +4558,7 @@ fn disable_assignment(
 
 fn set_account_status(
     connection: &mut Connection,
+    identity: &ControllerIdentity,
     user_id: UserId,
     requested: AccountStatus,
 ) -> Result<AccountSummary, DatabaseError> {
@@ -3990,7 +4567,7 @@ fn set_account_status(
         .checked_add(3_600)
         .ok_or(DatabaseError::TimestampOverflow)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let network = load_network(&transaction)?;
+    let mut network = load_network(&transaction)?;
     let current = load_account_status(&transaction, &network.network_id, user_id)?;
     let requested_wire = enum_wire(&requested)?;
     if current == "deleted" && requested_wire != "deleted" {
@@ -4000,6 +4577,11 @@ fn set_account_status(
         });
     }
     let changed = current != requested_wire;
+    let affected_nodes = if changed {
+        load_publishable_account_nodes(&transaction, &network.network_id, user_id)?
+    } else {
+        BTreeSet::new()
+    };
     if changed {
         apply_account_status_transition(
             &transaction,
@@ -4010,6 +4592,14 @@ fn set_account_status(
             retire_after,
         )?;
     }
+    let revisions = publish_account_revisions(
+        &transaction,
+        identity,
+        &mut network,
+        &affected_nodes,
+        "account-lifecycle",
+        now,
+    )?;
     insert_audit_event(
         &transaction,
         Some(&network.network_id),
@@ -4021,6 +4611,7 @@ fn set_account_status(
         "success",
         &serde_json::json!({
             "fromStatus": current,
+            "publishedRevisions": revision_audit_details(&revisions),
             "toStatus": requested_wire,
             "changed": changed,
         }),
@@ -4168,6 +4759,7 @@ fn parse_assignment_provisioning_state(
         "pending" => Ok(AccountNodeProvisioningState::Pending),
         "applied" => Ok(AccountNodeProvisioningState::Applied),
         "removal_pending" => Ok(AccountNodeProvisioningState::RemovalPending),
+        "removed" => Ok(AccountNodeProvisioningState::Removed),
         "not_provisioned" => Ok(AccountNodeProvisioningState::NotProvisioned),
         _ => Err(DatabaseError::StoredProtocolValue),
     }
@@ -5056,6 +5648,8 @@ pub enum DatabaseError {
     },
     #[error("cannot publish desired state for a node in status {current_status}")]
     DesiredStatePublicationConflict { current_status: String },
+    #[error("the node has no baseline desired Xray configuration")]
+    NodeConfigurationMissing,
     #[error("the revision is not targeted to this node")]
     RevisionTargetNotFound,
     #[error("the revision result conflicts with its durable result journal")]

@@ -85,6 +85,8 @@ pub enum AccountNodeProvisioningState {
     Applied,
     /// The assignment is disabled but prior applied access is not confirmed removed.
     RemovalPending,
+    /// A later applied node revision confirms prior access is absent.
+    Removed,
     /// No credential for this assignment has ever been applied.
     NotProvisioned,
 }

@@ -3,7 +3,7 @@ use crate::db::{
     AuthenticatedNode, Database, DatabaseError, NetworkRecord, NodeLifecycleAction,
     NodeSummaryRecord, SCHEMA_VERSION,
 };
-use crate::desired::DesiredStateDraft;
+use crate::desired::DesiredStateConfigurationDraft;
 use crate::error::{ApiError, REQUEST_ID_HEADER};
 use crate::protocol::RequestId;
 use axum::body::Body;
@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use control_protocol::account::{
     AccountSummary, CreateAccountRequest, ReplaceAccountNodesRequest, SetAccountStatusRequest,
 };
-use control_protocol::id::{NodeId, Revision, UserId};
+use control_protocol::id::{NodeId, Revision, Timestamp, UserId};
 use control_protocol::idempotency::{IdempotencyKey, IDEMPOTENCY_KEY_HEADER};
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
@@ -78,6 +78,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/admin/nodes/{node_id}/approve", post(approve_node))
         .route("/v1/admin/nodes/{node_id}/disable", post(disable_node))
         .route("/v1/admin/nodes/{node_id}/revoke", post(revoke_node))
+        .route(
+            "/v1/admin/nodes/{node_id}/reconcile",
+            put(reconcile_node_desired_state),
+        )
         .route(
             "/v1/admin/nodes/{node_id}/desired-state",
             post(publish_desired_state),
@@ -339,7 +343,8 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::NodeLifecycleConflict { .. }
         | DatabaseError::AccountLifecycleConflict { .. }
         | DatabaseError::NodeUnavailableForAssignment { .. }
-        | DatabaseError::AccountAssignmentConflict { .. } => ApiError::conflict(request_id),
+        | DatabaseError::AccountAssignmentConflict { .. }
+        | DatabaseError::NodeConfigurationMissing => ApiError::conflict(request_id),
         other => {
             tracing::error!(request_id = %request_id, error = %other, "database request failed");
             ApiError::internal(request_id)
@@ -399,6 +404,30 @@ struct NodeListResponse {
 #[serde(rename_all = "camelCase")]
 struct AccountListResponse {
     accounts: Vec<AccountSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesiredStatePublicationResponse {
+    node_id: NodeId,
+    revision: Revision,
+    schema_version: u16,
+    created_at: Timestamp,
+    user_count: usize,
+    created: bool,
+}
+
+impl DesiredStatePublicationResponse {
+    fn from_desired(desired: &SignedDesiredState, created: bool) -> Self {
+        Self {
+            node_id: desired.document.node_id,
+            revision: desired.document.revision,
+            schema_version: desired.document.schema_version,
+            created_at: desired.document.created_at,
+            user_count: desired.document.users.len(),
+            created,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -579,15 +608,36 @@ async fn publish_desired_state(
     Path(path_node_id): Path<String>,
     Extension(request_id): Extension<RequestId>,
     request: Request,
-) -> Result<(StatusCode, Json<SignedDesiredState>), ApiError> {
+) -> Result<(StatusCode, Json<DesiredStatePublicationResponse>), ApiError> {
     let node_id = parse_node_id(&path_node_id).ok_or_else(|| ApiError::not_found(request_id))?;
-    let draft: DesiredStateDraft = parse_bounded_json(request, request_id).await?;
+    let draft: DesiredStateConfigurationDraft = parse_bounded_json(request, request_id).await?;
     let desired = state
         .database
         .publish_desired_state(node_id, draft)
         .await
         .map_err(|error| database_api_error(error, request_id))?;
-    Ok((StatusCode::CREATED, Json(desired)))
+    let response = DesiredStatePublicationResponse::from_desired(&desired, true);
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn reconcile_node_desired_state(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<(StatusCode, Json<DesiredStatePublicationResponse>), ApiError> {
+    let node_id = parse_node_id(&path_node_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    let result = state
+        .database
+        .reconcile_node_desired_state(node_id)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    let status = if result.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    let response = DesiredStatePublicationResponse::from_desired(&result.desired, result.created);
+    Ok((status, Json(response)))
 }
 
 async fn approve_node(

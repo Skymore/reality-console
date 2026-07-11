@@ -14,8 +14,8 @@ use control_protocol::enrollment::{
 };
 use control_protocol::error::ErrorCode;
 use control_protocol::id::{
-    ControllerInstanceId, CredentialId, EndpointId, NodeId, NodeKeyId, Revision, SequenceNumber,
-    Timestamp, UserId,
+    ControllerInstanceId, EndpointId, NodeId, NodeKeyId, Revision, SequenceNumber, Timestamp,
+    UserId,
 };
 use control_protocol::idempotency::IDEMPOTENCY_KEY_HEADER;
 use control_protocol::node::{
@@ -34,6 +34,7 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, Verifying
 use futures_util::stream;
 use http_body_util::BodyExt;
 use rand_core::{OsRng, RngCore as _};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::Digest as _;
 use std::convert::Infallible;
@@ -258,6 +259,22 @@ async fn admin_accounts(app: &TestApp) -> axum::response::Response {
         .unwrap()
 }
 
+async fn only_account(app: &TestApp) -> AccountSummary {
+    let response = admin_accounts(app).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json(response).await;
+    serde_json::from_value(body["accounts"][0].clone()).unwrap()
+}
+
+fn provisioning_state(account: &AccountSummary, node_id: NodeId) -> AccountNodeProvisioningState {
+    account
+        .assignments
+        .iter()
+        .find(|assignment| assignment.node_id == node_id)
+        .unwrap()
+        .provisioning_state
+}
+
 async fn create_account(app: &TestApp, display_name: &str) -> AccountSummary {
     let response = create_account_with_key(app, display_name, &Uuid::new_v4().to_string()).await;
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -386,6 +403,16 @@ struct SignedNode {
     signing_key: SigningKey,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesiredPublicationSummary {
+    node_id: NodeId,
+    revision: Revision,
+    schema_version: u16,
+    user_count: usize,
+    created: bool,
+}
+
 async fn enroll_signed_node(app: &TestApp) -> SignedNode {
     let invitation = create_invitation(app, 900).await;
     let (request, _, signing_key) = signed_enrollment_with_key(&invitation);
@@ -429,6 +456,12 @@ fn nonce(byte: u8) -> Nonce {
     Nonce::from_str(&URL_SAFE_NO_PAD.encode([byte; 32])).unwrap()
 }
 
+fn fresh_nonce() -> Nonce {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    Nonce::from_str(&URL_SAFE_NO_PAD.encode(bytes)).unwrap()
+}
+
 fn heartbeat() -> NodeHeartbeat {
     NodeHeartbeat {
         heartbeat_generation: SequenceNumber::new(1).unwrap(),
@@ -470,9 +503,7 @@ fn endpoint_candidate(
 async fn setup_applied_heartbeat(app: &TestApp) -> (SignedNode, NodeHeartbeat) {
     let node = enroll_signed_node(app).await;
     approve_node(app, node.node_id).await;
-    let response = publish_desired(app, node.node_id, &desired_state_body()).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let desired: SignedDesiredState = serde_json::from_value(json(response).await).unwrap();
+    let desired = publish_and_fetch_desired(app, &node, &desired_state_body()).await;
     let revision = desired.document.revision;
     report_applied_revision(app, &node, revision, 7, [20, 21, 22]).await;
     let mut current = heartbeat();
@@ -495,20 +526,6 @@ async fn setup_applied_heartbeat(app: &TestApp) -> (SignedNode, NodeHeartbeat) {
 fn desired_state_body() -> Value {
     serde_json::json!({
         "minAgentVersion": "0.2.0",
-        "users": [
-            {
-                "userId": UserId::new(),
-                "credentialId": CredentialId::new(),
-                "vlessUuid": Uuid::new_v4(),
-                "enabled": true
-            },
-            {
-                "userId": UserId::new(),
-                "credentialId": CredentialId::new(),
-                "vlessUuid": Uuid::new_v4(),
-                "enabled": false
-            }
-        ],
         "xray": {
             "listenPort": 10443,
             "publicPort": 443,
@@ -532,6 +549,66 @@ async fn publish_desired(app: &TestApp, node_id: NodeId, body: &Value) -> axum::
         .unwrap()
 }
 
+async fn publication_summary(
+    response: axum::response::Response,
+    expected_status: StatusCode,
+) -> DesiredPublicationSummary {
+    assert_eq!(response.status(), expected_status);
+    serde_json::from_value(json(response).await).unwrap()
+}
+
+async fn fetch_published_desired(
+    app: &TestApp,
+    node: &SignedNode,
+    publication: &DesiredPublicationSummary,
+) -> SignedDesiredState {
+    assert_eq!(publication.node_id, node.node_id);
+    let after_revision = publication.revision.get() - 1;
+    let path = format!(
+        "/v1/nodes/{}/desired?afterRevision={after_revision}",
+        node.node_id
+    );
+    let request = signed_node_request(
+        node,
+        "GET",
+        &path,
+        Vec::new(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &fresh_nonce(),
+    );
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let desired: SignedDesiredState = serde_json::from_value(json(response).await).unwrap();
+    assert_eq!(desired.document.revision, publication.revision);
+    assert_eq!(desired.document.schema_version, publication.schema_version);
+    assert_eq!(desired.document.users.len(), publication.user_count);
+    desired
+}
+
+async fn publish_and_fetch_desired(
+    app: &TestApp,
+    node: &SignedNode,
+    body: &Value,
+) -> SignedDesiredState {
+    let response = publish_desired(app, node.node_id, body).await;
+    let publication = publication_summary(response, StatusCode::CREATED).await;
+    assert!(publication.created);
+    fetch_published_desired(app, node, &publication).await
+}
+
+async fn reconcile_desired(app: &TestApp, node_id: NodeId) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::put(format!("/v1/admin/nodes/{node_id}/reconcile"))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 async fn approve_and_publish(app: &TestApp, node: &SignedNode, body: &Value) -> SignedDesiredState {
     assert_eq!(
         admin_node_action(app, node.node_id, "approve")
@@ -539,9 +616,7 @@ async fn approve_and_publish(app: &TestApp, node: &SignedNode, body: &Value) -> 
             .status(),
         StatusCode::NO_CONTENT
     );
-    let response = publish_desired(app, node.node_id, body).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    serde_json::from_value(json(response).await).unwrap()
+    publish_and_fetch_desired(app, node, body).await
 }
 
 async fn fetch_desired(
@@ -563,6 +638,17 @@ async fn fetch_desired(
         &nonce(nonce_byte),
     );
     app.router.clone().oneshot(request).await.unwrap()
+}
+
+async fn fetch_desired_ok(
+    app: &TestApp,
+    node: &SignedNode,
+    after_revision: Revision,
+    nonce_byte: u8,
+) -> SignedDesiredState {
+    let response = fetch_desired(app, node, after_revision.get(), nonce_byte).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_value(json(response).await).unwrap()
 }
 
 async fn report_result(
@@ -682,6 +768,35 @@ fn assert_revision_journal_progress(app: &TestApp, node_id: NodeId) {
         .is_err());
 }
 
+fn assert_empty_member_snapshot_journal_is_immutable_and_redacted(app: &TestApp) {
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let member_snapshots: (i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM node_revision_member_snapshots),
+                (SELECT COUNT(*) FROM node_revision_member_credentials)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(member_snapshots, (2, 0));
+    assert!(connection
+        .execute(
+            "UPDATE node_revision_member_snapshots SET created_at = created_at + 1",
+            [],
+        )
+        .is_err());
+    let audit: String = connection
+        .query_row(
+            "SELECT group_concat(details_json, '') FROM audit_events
+             WHERE event_type LIKE 'node.desired-state-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!audit.contains("vlessUuid"));
+}
+
 fn assert_cached_progress(
     app: &TestApp,
     node_id: NodeId,
@@ -760,6 +875,10 @@ async fn approve_node(app: &TestApp, node_id: NodeId) {
         admin_node_action(app, node_id, "approve").await.status(),
         StatusCode::NO_CONTENT
     );
+}
+
+async fn approve_configured_node(app: &TestApp, node: &SignedNode) -> SignedDesiredState {
+    approve_and_publish(app, node, &desired_state_body()).await
 }
 
 #[tokio::test]
@@ -2118,9 +2237,7 @@ async fn desired_publication_is_signed_canonical_monotonic_and_immutable() {
             .status(),
         StatusCode::NO_CONTENT
     );
-    let first_response = publish_desired(&app, node.node_id, &body).await;
-    assert_eq!(first_response.status(), StatusCode::CREATED);
-    let first: SignedDesiredState = serde_json::from_value(json(first_response).await).unwrap();
+    let first = publish_and_fetch_desired(&app, &node, &body).await;
     verify_desired_state_signature(
         &first.document,
         &first.signature,
@@ -2136,15 +2253,9 @@ async fn desired_publication_is_signed_canonical_monotonic_and_immutable() {
         first.document.xray.server_names,
         vec!["a.example.test".to_string(), "z.example.test".to_string()]
     );
-    assert!(first
-        .document
-        .users
-        .windows(2)
-        .all(|pair| pair[0].user_id <= pair[1].user_id));
+    assert!(first.document.users.is_empty());
 
-    let second_response = publish_desired(&app, node.node_id, &body).await;
-    assert_eq!(second_response.status(), StatusCode::CREATED);
-    let second: SignedDesiredState = serde_json::from_value(json(second_response).await).unwrap();
+    let second = publish_and_fetch_desired(&app, &node, &body).await;
     assert_eq!(second.document.revision.get(), 2);
     assert_eq!(
         second.document.signing_key_id,
@@ -2185,17 +2296,8 @@ async fn desired_publication_is_signed_canonical_monotonic_and_immutable() {
     assert!(connection
         .execute("DELETE FROM node_revision_targets WHERE revision = 1", [],)
         .is_err());
-    let audit: String = connection
-        .query_row(
-            "SELECT group_concat(details_json, '') FROM audit_events
-             WHERE event_type LIKE 'node.desired-state-%'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    for user in &first.document.users {
-        assert!(!audit.contains(user.vless_uuid.expose_secret()));
-    }
+    drop(connection);
+    assert_empty_member_snapshot_journal_is_immutable_and_redacted(&app);
 }
 
 #[tokio::test]
@@ -2244,8 +2346,7 @@ async fn desired_fetch_returns_verified_latest_state_or_strict_empty_204() {
         .to_bytes()
         .is_empty());
 
-    let second_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
-    let second: SignedDesiredState = serde_json::from_value(json(second_response).await).unwrap();
+    let second = publish_and_fetch_desired(&app, &node, &desired_state_body()).await;
     let response = fetch_desired(&app, &node, 1, 72).await;
     let fetched: SignedDesiredState = serde_json::from_value(json(response).await).unwrap();
     assert_eq!(fetched, second);
@@ -2309,6 +2410,73 @@ async fn corrupt_desired_artifacts_fail_closed() {
     let response = fetch_desired(&app, &node, 0, 77).await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(json(response).await["error"]["code"], "internal");
+}
+
+#[tokio::test]
+async fn desired_configuration_rejects_caller_supplied_member_credentials() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    approve_node(&app, node.node_id).await;
+    let mut body = desired_state_body();
+    body["users"] = serde_json::json!([{
+        "userId": UserId::new(),
+        "credentialId": Uuid::new_v4(),
+        "vlessUuid": Uuid::new_v4(),
+        "enabled": true
+    }]);
+
+    let response = publish_desired(&app, node.node_id, &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json(response).await["error"]["code"], "validation_failed");
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let revisions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM config_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(revisions, 0);
+}
+
+#[tokio::test]
+async fn admin_desired_responses_redact_member_artifacts() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Redacted desired user").await;
+    let node = enroll_signed_node(&app).await;
+    approve_configured_node(&app, &node).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let vless_uuid: String = connection
+        .query_row(
+            "SELECT vless_uuid FROM user_node_credentials WHERE user_id = ?1",
+            [account.account.user_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+
+    for response in [
+        reconcile_desired(&app, node.node_id).await,
+        publish_desired(&app, node.node_id, &desired_state_body()).await,
+    ] {
+        assert!(matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::CREATED
+        ));
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!raw.contains(&vless_uuid));
+        assert!(!raw.contains("vlessUuid"));
+        assert!(!raw.contains("signature"));
+        assert!(!raw.contains("document"));
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["nodeId"], node.node_id.to_string());
+        assert_eq!(body["userCount"], 1);
+    }
 }
 
 #[tokio::test]
@@ -2395,13 +2563,9 @@ async fn rollback_requires_validation_and_an_earlier_target_for_the_same_node() 
     let other = enroll_signed_node(&app).await;
     approve_node(&app, node.node_id).await;
     approve_node(&app, other.node_id).await;
-    let first_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
-    let first: SignedDesiredState = serde_json::from_value(json(first_response).await).unwrap();
-    let other_response = publish_desired(&app, other.node_id, &desired_state_body()).await;
-    let other_revision: SignedDesiredState =
-        serde_json::from_value(json(other_response).await).unwrap();
-    let third_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
-    let third: SignedDesiredState = serde_json::from_value(json(third_response).await).unwrap();
+    let first = publish_and_fetch_desired(&app, &node, &desired_state_body()).await;
+    let other_revision = publish_and_fetch_desired(&app, &other, &desired_state_body()).await;
+    let third = publish_and_fetch_desired(&app, &node, &desired_state_body()).await;
     assert_eq!(
         (
             first.document.revision.get(),
@@ -2466,8 +2630,7 @@ async fn rollback_requires_validation_and_an_earlier_target_for_the_same_node() 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(json(response).await["error"]["code"], "not_found");
 
-    let fourth_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
-    let fourth: SignedDesiredState = serde_json::from_value(json(fourth_response).await).unwrap();
+    let fourth = publish_and_fetch_desired(&app, &node, &desired_state_body()).await;
     let received = revision_result(RevisionResultState::Received, 0, None);
     assert_eq!(
         report_result(&app, &node, fourth.document.revision, &received, 94)
@@ -2532,8 +2695,7 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
         StatusCode::NO_CONTENT
     );
 
-    let second_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
-    let second: SignedDesiredState = serde_json::from_value(json(second_response).await).unwrap();
+    let second = publish_and_fetch_desired(&app, &node, &desired_state_body()).await;
     let mut old_progress = heartbeat();
     old_progress.heartbeat_generation = SequenceNumber::new(4).unwrap();
     old_progress.revisions = RevisionProgress {
@@ -2633,8 +2795,8 @@ async fn account_assignments_are_idempotent_and_redact_credentials() {
 
     let first = enroll_signed_node(&app).await;
     let second = enroll_signed_node(&app).await;
-    approve_node(&app, first.node_id).await;
-    approve_node(&app, second.node_id).await;
+    approve_configured_node(&app, &first).await;
+    approve_configured_node(&app, &second).await;
 
     let response = replace_account_nodes(
         &app,
@@ -2702,14 +2864,159 @@ async fn account_assignments_are_idempotent_and_redact_credentials() {
     .await;
     assert_eq!(idempotent.status(), StatusCode::OK);
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
-    let credential_count: i64 = connection
+    let durable: (i64, i64, i64) = connection
         .query_row(
-            "SELECT COUNT(*) FROM user_node_credentials WHERE user_id = ?1",
+            "SELECT
+                (SELECT COUNT(*) FROM user_node_credentials WHERE user_id = ?1),
+                (SELECT COUNT(*) FROM config_revisions),
+                (SELECT COUNT(*) FROM node_revision_member_snapshots)",
             [account.account.user_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (2, 4, 4));
+}
+
+#[tokio::test]
+async fn credential_schema_rejects_contradictory_lifecycle_fields() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Constraint user").await;
+    let node = enroll_signed_node(&app).await;
+    approve_configured_node(&app, &node).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    for sql in [
+        "UPDATE user_node_credentials SET activated_at = created_at",
+        "UPDATE user_node_credentials SET status = 'active'",
+        "UPDATE user_node_credentials
+         SET status = 'retiring', retire_after = created_at + 1",
+        "UPDATE user_node_credentials SET status = 'revoked'",
+    ] {
+        assert!(connection.execute(sql, []).is_err());
+    }
+    let stored: (String, Option<i64>, Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT status, activated_at, retire_after, revoked_at
+             FROM user_node_credentials",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, ("pending".to_string(), None, None, None));
+}
+
+#[tokio::test]
+async fn multi_node_assignments_publish_distinct_snapshots_and_converge_independently() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Multi-node user").await;
+    let first = enroll_signed_node(&app).await;
+    let second = enroll_signed_node(&app).await;
+    let first_baseline = approve_configured_node(&app, &first).await;
+    let second_baseline = approve_configured_node(&app, &second).await;
+
+    let assigned = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[first.node_id, second.node_id],
+    )
+    .await;
+    assert_eq!(assigned.status(), StatusCode::OK);
+    let assigned: AccountSummary = serde_json::from_value(json(assigned).await).unwrap();
+    assert_eq!(
+        provisioning_state(&assigned, first.node_id),
+        AccountNodeProvisioningState::Pending
+    );
+    assert_eq!(
+        provisioning_state(&assigned, second.node_id),
+        AccountNodeProvisioningState::Pending
+    );
+
+    let first_desired = fetch_desired_ok(&app, &first, first_baseline.document.revision, 200).await;
+    let second_desired =
+        fetch_desired_ok(&app, &second, second_baseline.document.revision, 204).await;
+    assert_eq!(first_desired.document.users.len(), 1);
+    assert_eq!(second_desired.document.users.len(), 1);
+    assert_eq!(
+        first_desired.document.users[0].user_id,
+        account.account.user_id
+    );
+    assert_eq!(
+        second_desired.document.users[0].user_id,
+        account.account.user_id
+    );
+    assert_ne!(
+        first_desired.document.users[0].credential_id,
+        second_desired.document.users[0].credential_id
+    );
+    assert_ne!(
+        first_desired.document.users[0].vless_uuid.expose_secret(),
+        second_desired.document.users[0].vless_uuid.expose_secret()
+    );
+
+    report_applied_revision(
+        &app,
+        &first,
+        first_desired.document.revision,
+        51,
+        [201, 202, 203],
+    )
+    .await;
+    let partial = only_account(&app).await;
+    assert_eq!(
+        provisioning_state(&partial, first.node_id),
+        AccountNodeProvisioningState::Applied
+    );
+    assert_eq!(
+        provisioning_state(&partial, second.node_id),
+        AccountNodeProvisioningState::Pending
+    );
+
+    report_applied_revision(
+        &app,
+        &second,
+        second_desired.document.revision,
+        52,
+        [205, 206, 207],
+    )
+    .await;
+    let converged = only_account(&app).await;
+    assert!(converged.assignments.iter().all(|assignment| {
+        assignment.provisioning_state == AccountNodeProvisioningState::Applied
+    }));
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM node_revision_member_snapshots),
+                (SELECT COUNT(*) FROM node_revision_member_credentials),
+                (SELECT COUNT(*) FROM user_node_credentials WHERE status = 'active')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (4, 2, 2));
+    assert!(connection
+        .execute(
+            "UPDATE node_revision_member_credentials SET user_id = user_id",
+            [],
+        )
+        .is_err());
+    let audit: String = connection
+        .query_row(
+            "SELECT group_concat(details_json, '') FROM audit_events",
+            [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(credential_count, 2);
+    assert!(!audit.contains(first_desired.document.users[0].vless_uuid.expose_secret()));
+    assert!(!audit.contains(second_desired.document.users[0].vless_uuid.expose_secret()));
 }
 
 #[tokio::test]
@@ -2718,8 +3025,8 @@ async fn account_assignment_removal_and_restore_rotate_credentials() {
     let account = create_account(&app, "Alice").await;
     let first = enroll_signed_node(&app).await;
     let second = enroll_signed_node(&app).await;
-    approve_node(&app, first.node_id).await;
-    approve_node(&app, second.node_id).await;
+    approve_configured_node(&app, &first).await;
+    approve_configured_node(&app, &second).await;
     let assigned = replace_account_nodes(
         &app,
         account.account.user_id,
@@ -2814,7 +3121,7 @@ async fn account_assignment_rejects_unavailable_nodes_atomically() {
     let account = create_account(&app, "Bob").await;
     let active = enroll_signed_node(&app).await;
     let pending = enroll_signed_node(&app).await;
-    approve_node(&app, active.node_id).await;
+    approve_configured_node(&app, &active).await;
     assert_eq!(
         replace_account_nodes(&app, account.account.user_id, &[active.node_id])
             .await
@@ -2830,6 +3137,16 @@ async fn account_assignment_rejects_unavailable_nodes_atomically() {
     .await;
     assert_eq!(unavailable.status(), StatusCode::CONFLICT);
     assert_eq!(json(unavailable).await["error"]["code"], "conflict");
+
+    let unconfigured = enroll_signed_node(&app).await;
+    approve_node(&app, unconfigured.node_id).await;
+    let missing_configuration = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[active.node_id, unconfigured.node_id],
+    )
+    .await;
+    assert_eq!(missing_configuration.status(), StatusCode::CONFLICT);
 
     let unknown_node = replace_account_nodes(
         &app,
@@ -2860,18 +3177,69 @@ async fn account_assignment_rejects_unavailable_nodes_atomically() {
     assert_eq!(malformed_account.status(), StatusCode::NOT_FOUND);
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
-    let durable: (i64, i64, i64) = connection
+    let durable: (i64, i64, i64, i64) = connection
         .query_row(
             "SELECT
                 (SELECT COUNT(*) FROM user_node_assignments WHERE user_id = ?1),
                 (SELECT COUNT(*) FROM user_node_assignments
                  WHERE user_id = ?1 AND status = 'enabled'),
-                (SELECT COUNT(*) FROM user_node_credentials WHERE user_id = ?1)",
+                (SELECT COUNT(*) FROM user_node_credentials WHERE user_id = ?1),
+                (SELECT last_revision FROM networks)",
             [account.account.user_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
-    assert_eq!(durable, (1, 1, 1));
+    assert_eq!(durable, (1, 1, 1, 2));
+}
+
+#[tokio::test]
+async fn multi_node_assignment_rolls_back_if_a_later_node_has_no_configuration() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Atomic user").await;
+    let first = enroll_signed_node(&app).await;
+    let second = enroll_signed_node(&app).await;
+    approve_node(&app, first.node_id).await;
+    approve_node(&app, second.node_id).await;
+    let (configured, unconfigured) = if first.node_id < second.node_id {
+        (&first, &second)
+    } else {
+        (&second, &first)
+    };
+    let baseline = publish_desired(&app, configured.node_id, &desired_state_body()).await;
+    assert_eq!(baseline.status(), StatusCode::CREATED);
+
+    let response = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[configured.node_id, unconfigured.node_id],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64, i64, i64, Option<i64>) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM user_node_assignments),
+                (SELECT COUNT(*) FROM user_node_credentials),
+                (SELECT COUNT(*) FROM config_revisions),
+                (SELECT COUNT(*) FROM node_revision_member_snapshots),
+                (SELECT last_revision FROM networks),
+                (SELECT desired_revision FROM nodes WHERE node_id = ?1)",
+            [unconfigured.node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(durable, (0, 0, 1, 1, 1, None));
 }
 
 #[tokio::test]
@@ -2880,8 +3248,8 @@ async fn account_disable_and_reactivation_rotate_credentials() {
     let account = create_account(&app, "Carol").await;
     let first = enroll_signed_node(&app).await;
     let second = enroll_signed_node(&app).await;
-    approve_node(&app, first.node_id).await;
-    approve_node(&app, second.node_id).await;
+    approve_configured_node(&app, &first).await;
+    approve_configured_node(&app, &second).await;
     assert_eq!(
         replace_account_nodes(
             &app,
@@ -2949,7 +3317,7 @@ async fn account_deletion_is_terminal_redacted_and_durable() {
     let app = TestApp::new();
     let account = create_account(&app, "Deleted user").await;
     let node = enroll_signed_node(&app).await;
-    approve_node(&app, node.node_id).await;
+    approve_configured_node(&app, &node).await;
     assert_eq!(
         replace_account_nodes(&app, account.account.user_id, &[node.node_id])
             .await
@@ -3003,36 +3371,18 @@ async fn applied_account_disable_exposes_removal_pending_and_rotates_on_restore(
     let app = TestApp::new();
     let account = create_account(&app, "Applied user").await;
     let node = enroll_signed_node(&app).await;
-    approve_node(&app, node.node_id).await;
+    let baseline = approve_configured_node(&app, &node).await;
     assert_eq!(
         replace_account_nodes(&app, account.account.user_id, &[node.node_id])
             .await
             .status(),
         StatusCode::OK
     );
-
-    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
-    let contradictory = connection.execute(
-        "UPDATE user_node_credentials SET status = 'active'
-         WHERE user_id = ?1 AND node_id = ?2",
-        [
-            account.account.user_id.to_string(),
-            node.node_id.to_string(),
-        ],
-    );
-    assert!(contradictory.is_err());
-    connection
-        .execute(
-            "UPDATE user_node_credentials
-             SET status = 'active', activated_at = created_at
-             WHERE user_id = ?1 AND node_id = ?2",
-            [
-                account.account.user_id.to_string(),
-                node.node_id.to_string(),
-            ],
-        )
-        .unwrap();
-    drop(connection);
+    let desired_response = fetch_desired(&app, &node, baseline.document.revision.get(), 180).await;
+    assert_eq!(desired_response.status(), StatusCode::OK);
+    let desired: SignedDesiredState = serde_json::from_value(json(desired_response).await).unwrap();
+    assert_eq!(desired.document.users.len(), 1);
+    report_applied_revision(&app, &node, desired.document.revision, 44, [181, 182, 183]).await;
 
     let listed = json(admin_accounts(&app).await).await;
     assert_eq!(
@@ -3086,17 +3436,165 @@ async fn applied_account_disable_exposes_removal_pending_and_rotates_on_restore(
 }
 
 #[tokio::test]
-async fn disabling_or_revoking_a_node_closes_member_access() {
+async fn rejected_removal_stays_pending_until_a_later_revision_applies() {
     let app = TestApp::new();
-    let account = create_account(&app, "Dave").await;
+    let account = create_account(&app, "Removal user").await;
     let node = enroll_signed_node(&app).await;
-    approve_node(&app, node.node_id).await;
+    let baseline = approve_configured_node(&app, &node).await;
     assert_eq!(
         replace_account_nodes(&app, account.account.user_id, &[node.node_id])
             .await
             .status(),
         StatusCode::OK
     );
+    let assigned = fetch_desired_ok(&app, &node, baseline.document.revision, 210).await;
+    report_applied_revision(&app, &node, assigned.document.revision, 61, [211, 212, 213]).await;
+
+    let disabled = set_account_status(&app, account.account.user_id, AccountStatus::Disabled).await;
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let disabled: AccountSummary = serde_json::from_value(json(disabled).await).unwrap();
+    assert_eq!(
+        disabled.assignments[0].provisioning_state,
+        AccountNodeProvisioningState::RemovalPending
+    );
+    let removal = fetch_desired_ok(&app, &node, assigned.document.revision, 214).await;
+    assert!(removal.document.users.is_empty());
+    assert_eq!(
+        report_result(
+            &app,
+            &node,
+            removal.document.revision,
+            &revision_result(RevisionResultState::Received, 0, None),
+            215,
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        report_result(
+            &app,
+            &node,
+            removal.document.revision,
+            &revision_result(RevisionResultState::Rejected, 0, None),
+            216,
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        only_account(&app).await.assignments[0].provisioning_state,
+        AccountNodeProvisioningState::RemovalPending
+    );
+
+    let retry_response = reconcile_desired(&app, node.node_id).await;
+    let retry = publication_summary(retry_response, StatusCode::CREATED).await;
+    assert!(retry.created);
+    assert_eq!(retry.user_count, 0);
+    let idempotent_retry = reconcile_desired(&app, node.node_id).await;
+    let idempotent_retry = publication_summary(idempotent_retry, StatusCode::OK).await;
+    assert!(!idempotent_retry.created);
+    assert_eq!(idempotent_retry.revision, retry.revision);
+    let fetched_retry = fetch_desired_ok(&app, &node, removal.document.revision, 217).await;
+    assert_eq!(fetched_retry.document.revision, retry.revision);
+    report_applied_revision(&app, &node, retry.revision, 62, [218, 219, 220]).await;
+    assert_eq!(
+        only_account(&app).await.assignments[0].provisioning_state,
+        AccountNodeProvisioningState::Removed
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM user_node_credentials WHERE user_id = ?1",
+            [account.account.user_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "revoked");
+}
+
+#[tokio::test]
+async fn rolled_back_removal_keeps_access_pending_and_can_be_republished() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Rollback user").await;
+    let node = enroll_signed_node(&app).await;
+    let baseline = approve_configured_node(&app, &node).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let assigned = fetch_desired_ok(&app, &node, baseline.document.revision, 230).await;
+    report_applied_revision(&app, &node, assigned.document.revision, 70, [231, 232, 233]).await;
+    assert_eq!(
+        set_account_status(&app, account.account.user_id, AccountStatus::Disabled)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let removal = fetch_desired_ok(&app, &node, assigned.document.revision, 234).await;
+    for (result, nonce_byte) in [
+        (revision_result(RevisionResultState::Received, 0, None), 235),
+        (
+            revision_result(RevisionResultState::Validated, 71, None),
+            236,
+        ),
+        (
+            revision_result(
+                RevisionResultState::RolledBack,
+                70,
+                Some(assigned.document.revision),
+            ),
+            237,
+        ),
+    ] {
+        assert_eq!(
+            report_result(&app, &node, removal.document.revision, &result, nonce_byte,)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(
+        only_account(&app).await.assignments[0].provisioning_state,
+        AccountNodeProvisioningState::RemovalPending
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (String, i64) = connection
+        .query_row(
+            "SELECT credential.status, node.applied_revision
+             FROM user_node_credentials AS credential
+             JOIN nodes AS node ON node.node_id = credential.node_id
+             WHERE credential.user_id = ?1",
+            [account.account.user_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        durable,
+        ("retiring".to_string(), assigned.document.revision.get())
+    );
+    drop(connection);
+    let retry = reconcile_desired(&app, node.node_id).await;
+    assert_eq!(retry.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn disabling_or_revoking_a_node_closes_member_access() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Dave").await;
+    let node = enroll_signed_node(&app).await;
+    let baseline = approve_configured_node(&app, &node).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let assigned = fetch_desired_ok(&app, &node, baseline.document.revision, 240).await;
+    report_applied_revision(&app, &node, assigned.document.revision, 80, [241, 242, 243]).await;
 
     assert_eq!(
         admin_node_action(&app, node.node_id, "disable")
@@ -3108,6 +3606,10 @@ async fn disabling_or_revoking_a_node_closes_member_access() {
     assert_eq!(
         listed["accounts"][0]["assignments"][0]["status"],
         "disabled"
+    );
+    assert_eq!(
+        listed["accounts"][0]["assignments"][0]["provisioningState"],
+        "removalPending"
     );
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
     let credential_status: String = connection
@@ -3131,6 +3633,10 @@ async fn disabling_or_revoking_a_node_closes_member_access() {
     );
     let listed = json(admin_accounts(&app).await).await;
     assert_eq!(listed["accounts"][0]["assignments"][0]["status"], "deleted");
+    assert_eq!(
+        listed["accounts"][0]["assignments"][0]["provisioningState"],
+        "removalPending"
+    );
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
     let mut statement = connection
@@ -3206,5 +3712,5 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (9, 9, 1, 1, 1));
+    assert_eq!(durable, (10, 10, 1, 1, 1));
 }

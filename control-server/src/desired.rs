@@ -21,10 +21,26 @@ pub(crate) const SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS: &[u16] =
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DesiredStateConfigurationDraft {
+    pub min_agent_version: String,
+    pub xray: DesiredXrayState,
+}
+
+#[derive(Clone)]
 pub(crate) struct DesiredStateDraft {
     pub min_agent_version: String,
     pub users: Vec<DesiredUser>,
     pub xray: DesiredXrayState,
+}
+
+impl DesiredStateConfigurationDraft {
+    pub(crate) fn with_users(self, users: Vec<DesiredUser>) -> DesiredStateDraft {
+        DesiredStateDraft {
+            min_agent_version: self.min_agent_version,
+            users,
+            xray: self.xray,
+        }
+    }
 }
 
 impl DesiredStateDraft {
