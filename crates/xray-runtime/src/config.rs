@@ -333,12 +333,13 @@ impl VlessRealityConfigBuilder {
     /// Validates all cross-field constraints and renders deterministic JSON.
     ///
     /// Disabled users are validated for duplicate identities but are omitted
-    /// from the rendered Xray client list.
+    /// from the rendered Xray `settings.users` list. No enabled users produces
+    /// an empty list that revokes all VLESS identities.
     ///
     /// # Errors
     ///
-    /// Returns an error for empty, excessive, or duplicate collections and when
-    /// no enabled client would remain.
+    /// Returns an error for missing REALITY names/short IDs or excessive and
+    /// duplicate collections.
     pub fn build(mut self) -> Result<RenderedXrayConfig, ConfigBuildError> {
         validate_collection_sizes(&self)?;
 
@@ -353,9 +354,6 @@ impl VlessRealityConfigBuilder {
         validate_duplicates(&self)?;
 
         let enabled_users: Vec<_> = self.users.iter().filter(|user| user.enabled).collect();
-        if enabled_users.is_empty() {
-            return Err(ConfigBuildError::NoEnabledUsers);
-        }
 
         let target = self.target.authority();
         let encoded_private_key = self.private_key.encoded();
@@ -371,7 +369,7 @@ impl VlessRealityConfigBuilder {
                 port: self.listen_port,
                 protocol: "vless",
                 settings: InboundSettings {
-                    clients: enabled_users
+                    users: enabled_users
                         .into_iter()
                         .map(|user| Client {
                             id: user.id,
@@ -488,15 +486,9 @@ pub enum ConfigBuildError {
     /// The canonical short-ID list contained a duplicate.
     #[error("REALITY short IDs must be unique")]
     DuplicateShortId,
-    /// No user was supplied.
-    #[error("at least one VLESS user is required")]
-    NoUsers,
     /// Too many users were supplied.
     #[error("too many VLESS users")]
     TooManyUsers,
-    /// Every supplied user was disabled.
-    #[error("at least one enabled VLESS user is required")]
-    NoEnabledUsers,
     /// Multiple users had the same UUID.
     #[error("VLESS user UUIDs must be unique")]
     DuplicateUserId,
@@ -555,10 +547,8 @@ fn validate_collection_sizes(builder: &VlessRealityConfigBuilder) -> Result<(), 
         length if length > MAX_SHORT_IDS => return Err(ConfigBuildError::TooManyShortIds),
         _ => {}
     }
-    match builder.users.len() {
-        0 => return Err(ConfigBuildError::NoUsers),
-        length if length > MAX_USERS => return Err(ConfigBuildError::TooManyUsers),
-        _ => {}
+    if builder.users.len() > MAX_USERS {
+        return Err(ConfigBuildError::TooManyUsers);
     }
     Ok(())
 }
@@ -617,7 +607,7 @@ struct Inbound<'a> {
 
 #[derive(Serialize)]
 struct InboundSettings<'a> {
-    clients: Vec<Client<'a>>,
+    users: Vec<Client<'a>>,
     decryption: &'a str,
 }
 
@@ -752,11 +742,11 @@ mod tests {
             Some(&Value::from("www.example.com:443"))
         );
         assert_eq!(
-            json.pointer("/inbounds/0/settings/clients/0/email"),
+            json.pointer("/inbounds/0/settings/users/0/email"),
             Some(&Value::from("friend-a@example.com"))
         );
         assert_eq!(
-            json.pointer("/inbounds/0/settings/clients")
+            json.pointer("/inbounds/0/settings/users")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(2)
@@ -764,13 +754,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_and_duplicate_users() {
+    fn permits_empty_access_and_rejects_duplicate_users() {
         let empty = builder()
             .server_name(ServerName::parse("www.example.com").expect("valid name"))
             .short_id(ShortId::parse("aabbccdd").expect("valid short ID"))
             .build()
-            .expect_err("empty users must fail");
-        assert_eq!(empty, ConfigBuildError::NoUsers);
+            .expect("empty access list must revoke every VLESS identity");
+        let empty_json: Value = serde_json::from_str(empty.expose_json()).unwrap();
+        assert_eq!(
+            empty_json
+                .pointer("/inbounds/0/settings/users")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
 
         let id = "11111111-1111-4111-8111-111111111111";
         let duplicate = builder()
@@ -834,8 +831,15 @@ mod tests {
                 false,
             ))
             .build()
-            .expect_err("all-disabled config must fail");
-        assert_eq!(all_disabled, ConfigBuildError::NoEnabledUsers);
+            .expect("all-disabled access list must render");
+        let disabled_json: Value = serde_json::from_str(all_disabled.expose_json()).unwrap();
+        assert_eq!(
+            disabled_json
+                .pointer("/inbounds/0/settings/users")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
     }
 
     #[test]

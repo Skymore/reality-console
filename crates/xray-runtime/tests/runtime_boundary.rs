@@ -82,6 +82,20 @@ fn rendered_config() -> xray_runtime::RenderedXrayConfig {
     .expect("valid rendered config")
 }
 
+fn rendered_empty_access_config() -> xray_runtime::RenderedXrayConfig {
+    VlessRealityConfigBuilder::new(
+        "127.0.0.1".parse().expect("valid IP"),
+        18443,
+        RealityTarget::new("www.example.com", 443).expect("valid target"),
+        RealityPrivateKey::parse(&URL_SAFE_NO_PAD.encode([8_u8; 32])).expect("valid private key"),
+    )
+    .expect("valid builder")
+    .server_name(ServerName::parse("www.example.com").expect("valid server name"))
+    .short_id(ShortId::parse("1122334455667788").expect("valid short ID"))
+    .build()
+    .expect("empty access config")
+}
+
 fn short_limits() -> ExecutionLimits {
     ExecutionLimits::new(Duration::from_secs(1), 1024).expect("valid limits")
 }
@@ -263,6 +277,24 @@ async fn runtime_revalidates_checksum_before_each_spawn() {
         error,
         RuntimeError::BinaryValidation(BinaryValidationError::ChecksumMismatch)
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires XRAY_RUNTIME_REAL_BINARY pointing to a trusted current Xray executable"]
+async fn current_xray_accepts_generated_user_and_empty_access_configs() {
+    let path = std::env::var_os("XRAY_RUNTIME_REAL_BINARY")
+        .map(PathBuf::from)
+        .expect("XRAY_RUNTIME_REAL_BINARY");
+    let contents = fs::read(&path).expect("read real Xray binary");
+    let binary = XrayBinarySpec::new(path, digest(&contents))
+        .expect("absolute path")
+        .verify()
+        .expect("verified real Xray binary");
+    for config in [rendered_config(), rendered_empty_access_config()] {
+        test_config(&binary, &config, ExecutionLimits::default())
+            .await
+            .expect("current Xray must accept generated config");
+    }
 }
 
 #[test]

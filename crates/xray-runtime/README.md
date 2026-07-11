@@ -18,7 +18,8 @@ agent. It is a standalone Rust 1.80 crate.
   REALITY private key, or child stdout/stderr contents.
 
 Disabled users are checked for duplicate UUIDs and emails but omitted from the
-rendered client list. Server names, short IDs, and users are sorted before
+rendered `settings.users` list. An empty enabled set is valid and revokes all
+VLESS identities. Server names, short IDs, and users are sorted before
 serialization so equivalent input sets produce identical JSON.
 
 ## Explicitly not included
