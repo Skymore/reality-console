@@ -55,6 +55,12 @@ pub enum ErrorCode {
     Conflict,
     /// The caller exceeded a configured request rate.
     RateLimited,
+    /// No resource exists at the requested path or identity.
+    NotFound,
+    /// The HTTP method is not supported by the matched resource.
+    MethodNotAllowed,
+    /// The request body exceeds the service's configured bound.
+    RequestTooLarge,
     /// A transient dependency or service is unavailable.
     ServiceUnavailable,
     /// An unexpected internal failure occurred.
@@ -89,6 +95,9 @@ impl ErrorCode {
             Self::TelemetrySequenceGap => "telemetry_sequence_gap",
             Self::Conflict => "conflict",
             Self::RateLimited => "rate_limited",
+            Self::NotFound => "not_found",
+            Self::MethodNotAllowed => "method_not_allowed",
+            Self::RequestTooLarge => "request_too_large",
             Self::ServiceUnavailable => "service_unavailable",
             Self::Internal => "internal",
             Self::Unknown(code) => code,
@@ -118,6 +127,9 @@ impl ErrorCode {
             "telemetry_sequence_gap" => Self::TelemetrySequenceGap,
             "conflict" => Self::Conflict,
             "rate_limited" => Self::RateLimited,
+            "not_found" => Self::NotFound,
+            "method_not_allowed" => Self::MethodNotAllowed,
+            "request_too_large" => Self::RequestTooLarge,
             "service_unavailable" => Self::ServiceUnavailable,
             "internal" => Self::Internal,
             _ => Self::Unknown(code),

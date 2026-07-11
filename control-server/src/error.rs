@@ -1,0 +1,114 @@
+use crate::protocol::RequestId;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use control_protocol::error::{ApiError as ErrorBody, ErrorCode, ErrorEnvelope};
+use std::collections::BTreeMap;
+
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    body: ErrorEnvelope,
+}
+
+impl ApiError {
+    #[must_use]
+    pub fn authentication_failed(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::AuthenticationFailed,
+            "Authentication failed.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn not_found(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "The requested resource was not found.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn method_not_allowed(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            ErrorCode::MethodNotAllowed,
+            "The request method is not allowed for this resource.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn body_too_large(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            ErrorCode::RequestTooLarge,
+            "The request body exceeds the service limit.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn timeout(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            ErrorCode::ServiceUnavailable,
+            "The request exceeded the service time limit.",
+            request_id,
+            true,
+        )
+    }
+
+    #[must_use]
+    pub fn internal(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "The service could not complete the request.",
+            request_id,
+            false,
+        )
+    }
+
+    fn new(
+        status: StatusCode,
+        code: ErrorCode,
+        message: &'static str,
+        request_id: RequestId,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            status,
+            body: ErrorEnvelope {
+                error: ErrorBody {
+                    code,
+                    message: message.to_string(),
+                    request_id,
+                    retryable,
+                    details: BTreeMap::new(),
+                },
+            },
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let request_id = self.body.error.request_id.to_string();
+        let mut response = (self.status, Json(self.body)).into_response();
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            response.headers_mut().insert(REQUEST_ID_HEADER, value);
+        }
+        response
+    }
+}
