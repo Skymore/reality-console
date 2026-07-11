@@ -220,7 +220,15 @@ desired-state fetch. It records heartbeat and complete-cycle timestamps locally 
 nonce for every request. A `200` response is accepted only after closed-schema identity,
 monotonicity, and pinned controller-signature verification. The immutable envelope and its digests
 are committed before a signed `received` result is sent; an interrupted result remains queued and
-is retried before the next heartbeat. This stage does not yet render, validate, or activate Xray.
+is retried before the next heartbeat. When a pinned runtime is available, Node Host checks the
+minimum agent version, renders typed deterministic Xray JSON with the managed inbound bound only to
+`127.0.0.1`, and runs the pinned binary's bounded offline config test. Success stores a 0600
+immutable candidate plus its config and historical binary digests before reporting `validated`.
+An unsupported minimum agent version, invalid desired config, or Xray config-test rejection reports
+a stable secret-free `rejected`; binary mutation, timeout, spawn, and local I/O failures remain at
+`received` for retry. On restart, queued `received` is sent first, but `validated` is not sent until
+the candidate file and digest have been rechecked. This stage still does not activate or start
+Xray.
 
 The current headless `run` command already wraps that cycle in a resilient foreground service. It
 synchronizes immediately, uses a 30-second success interval with bounded jitter, retries failures

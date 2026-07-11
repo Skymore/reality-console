@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use control_protocol::crypto::{Ed25519PublicKey, Ed25519Signature};
 use control_protocol::desired::desired_state_transcript;
+use control_protocol::error::ErrorCode;
 use control_protocol::id::{
     ControllerInstanceId, CredentialId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, RequestId,
     Revision, SigningKeyId, Timestamp, UserId,
@@ -21,16 +22,101 @@ use control_protocol::request_auth::{
 };
 use control_protocol::secret::Secret;
 use ed25519_dalek::{Signer as _, SigningKey};
+#[cfg(unix)]
+use node_host::configure_xray;
 use node_host::{initialize, run_until, status, sync_once, EnrollmentState, SyncLoopOptions};
 use rusqlite::{params, Connection};
 use serde_json::json;
+#[cfg(unix)]
+use sha2::{Digest as _, Sha256};
+#[cfg(unix)]
+use std::fmt::Write as _;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 use time::{Duration, OffsetDateTime};
 
 const SECRET_RESPONSE_TEXT: &str = "controller-private-debug-secret";
+#[cfg(unix)]
+const SECRET_XRAY_OUTPUT: &str = "xray-private-config-debug-secret";
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum FakeConfigMode {
+    Valid,
+    Reject,
+}
+
+#[cfg(unix)]
+struct FakeXray {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    digest: String,
+    script: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl FakeXray {
+    fn new(mode: FakeConfigMode) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xray");
+        let config_exit = match mode {
+            FakeConfigMode::Valid => 0,
+            FakeConfigMode::Reject => 42,
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$#\" -eq 1 ] && [ \"$1\" = \"version\" ]; then\n\
+               printf 'Xray 25.7.1\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$#\" -eq 4 ] && [ \"$1\" = \"run\" ] && [ \"$2\" = \"-test\" ] && [ \"$3\" = \"-config\" ] && [ -r \"$4\" ]; then\n\
+               printf '{SECRET_XRAY_OUTPUT}\\n' >&2\n\
+               exit {config_exit}\n\
+             fi\n\
+             exit 64\n"
+        )
+        .into_bytes();
+        write_executable(&path, &script);
+        Self {
+            _directory: directory,
+            path,
+            digest: sha256_hex(&script),
+            script,
+        }
+    }
+
+    fn tamper(&self) {
+        let mut tampered = self.script.clone();
+        tampered.extend_from_slice(b"# modified after pinning\n");
+        write_executable(&self.path, &tampered);
+    }
+
+    fn restore(&self) {
+        write_executable(&self.path, &self.script);
+    }
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, contents: &[u8]) {
+    fs::write(path, contents).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+fn sha256_hex(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").unwrap();
+            output
+        })
+}
 
 #[derive(Debug, Clone, Copy)]
 enum ResponseMode {
@@ -103,6 +189,10 @@ impl MockController {
 
     fn captured(&self) -> Vec<CapturedRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn clear_captured(&self) {
+        self.requests.lock().unwrap().clear();
     }
 
     fn set_desired(&self, desired: SignedDesiredState) {
@@ -304,7 +394,7 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     assert!(synced.last_heartbeat_at.is_some());
     assert!(synced.last_sync_at.is_some());
     assert_eq!(synced.desired_revision_cursor, 0);
-    assert_eq!(synced.schema_version, 5);
+    assert_eq!(synced.schema_version, 6);
 
     let captured = controller.captured();
     assert_eq!(captured.len(), 2);
@@ -539,6 +629,184 @@ async fn verified_desired_state_is_persisted_reported_and_not_fetched_twice() {
     assert_eq!(captured[3].method, Method::POST);
     assert_eq!(captured[4].method, Method::GET);
     assert!(captured[4].path_and_query.ends_with("afterRevision=1"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_runtime_validates_and_persists_an_immutable_candidate() {
+    let controller = MockController::start(ResponseMode::VerifiedDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let registration = install_registration(&data_dir, &controller.origin);
+    let public_key = status(&data_dir).unwrap().identity_public_key;
+    let fake = FakeXray::new(FakeConfigMode::Valid);
+    configure_xray(&data_dir, &fake.path, &fake.digest, false)
+        .await
+        .unwrap();
+    controller.set_desired(signed_desired(&data_dir, registration, 1));
+
+    let synced = sync_once(&data_dir).await.unwrap();
+    assert_eq!(synced.desired_revision_cursor, 1);
+    let captured = controller.captured();
+    assert_eq!(captured.len(), 4);
+    assert_eq!(captured[2].method, Method::PUT);
+    assert_eq!(captured[3].method, Method::PUT);
+    let received: RevisionResult = serde_json::from_slice(&captured[2].body).unwrap();
+    let validated: RevisionResult = serde_json::from_slice(&captured[3].body).unwrap();
+    assert_eq!(received.state, RevisionResultState::Received);
+    assert_eq!(validated.state, RevisionResultState::Validated);
+    assert!(validated.config_digest.is_some());
+    for request in &captured {
+        verify_captured(request, &public_key, registration);
+    }
+
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    let stored: (String, String, String) = connection
+        .query_row(
+            "SELECT relative_path, config_digest, binary_digest
+             FROM rendered_xray_configs WHERE revision = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored.0, "configs/revision-1.json");
+    assert_eq!(stored.1, validated.config_digest.unwrap().as_str());
+    assert_eq!(stored.2, fake.digest);
+    assert!(connection
+        .execute(
+            "UPDATE rendered_xray_configs SET validated_at = 0 WHERE revision = 1",
+            [],
+        )
+        .is_err());
+    drop(connection);
+
+    let config_path = data_dir.join(&stored.0);
+    let mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let directory_mode = fs::metadata(data_dir.join("configs"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(directory_mode, 0o700);
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
+    assert_eq!(config["inbounds"][0]["port"], 443);
+    assert_eq!(
+        config["inbounds"][0]["settings"]["users"][0]["id"],
+        "2f55c837-7be6-4752-b58a-a7f51401bd89"
+    );
+
+    sync_once(&data_dir).await.unwrap();
+    let captured = controller.captured();
+    assert_eq!(captured.len(), 6);
+    let heartbeat: NodeHeartbeat = serde_json::from_slice(&captured[4].body).unwrap();
+    assert_eq!(heartbeat.xray_version.as_deref(), Some("Xray 25.7.1"));
+    assert_eq!(heartbeat.revisions.desired_revision.unwrap().get(), 1);
+    assert_eq!(heartbeat.revisions.received_revision.unwrap().get(), 1);
+    assert_eq!(heartbeat.revisions.validated_revision.unwrap().get(), 1);
+    assert!(heartbeat.revisions.applied_revision.is_none());
+
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE local_revision_results SET reported_at = NULL
+             WHERE revision = 1 AND state = 'validated'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    fs::write(&config_path, b"{}\n").unwrap();
+    controller.clear_captured();
+
+    let error = sync_once(&data_dir).await.unwrap_err();
+    assert!(format!("{error:#}").contains("config digest is invalid"));
+    assert!(controller.captured().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn xray_config_rejection_is_terminal_but_redacted() {
+    let controller = MockController::start(ResponseMode::VerifiedDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let registration = install_registration(&data_dir, &controller.origin);
+    let fake = FakeXray::new(FakeConfigMode::Reject);
+    configure_xray(&data_dir, &fake.path, &fake.digest, false)
+        .await
+        .unwrap();
+    controller.set_desired(signed_desired(&data_dir, registration, 1));
+
+    let synced = sync_once(&data_dir).await.unwrap();
+    assert!(synced.last_sync_at.is_some());
+    let captured = controller.captured();
+    assert_eq!(captured.len(), 4);
+    let rejected: RevisionResult = serde_json::from_slice(&captured[3].body).unwrap();
+    assert_eq!(rejected.state, RevisionResultState::Rejected);
+    assert_eq!(rejected.error_code, Some(ErrorCode::ValidationFailed));
+    assert!(rejected.config_digest.is_none());
+    assert!(!String::from_utf8_lossy(&captured[3].body).contains(SECRET_XRAY_OUTPUT));
+
+    let database_path = data_dir.join("node-host.sqlite3");
+    let connection = Connection::open(&database_path).unwrap();
+    let rendered_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM rendered_xray_configs", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rendered_count, 0);
+    drop(connection);
+    assert!(!contains_bytes(
+        &fs::read(database_path).unwrap(),
+        SECRET_XRAY_OUTPUT.as_bytes()
+    ));
+    assert!(!data_dir.join("configs").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transient_binary_failure_stays_received_and_recovers_before_heartbeat() {
+    let controller = MockController::start(ResponseMode::VerifiedDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let registration = install_registration(&data_dir, &controller.origin);
+    let fake = FakeXray::new(FakeConfigMode::Valid);
+    configure_xray(&data_dir, &fake.path, &fake.digest, false)
+        .await
+        .unwrap();
+    fake.tamper();
+    controller.set_desired(signed_desired(&data_dir, registration, 1));
+
+    let error = sync_once(&data_dir).await.unwrap_err();
+    assert!(format!("{error:#}").contains("checksum mismatch"));
+    let captured = controller.captured();
+    assert_eq!(captured.len(), 3);
+    let received: RevisionResult = serde_json::from_slice(&captured[2].body).unwrap();
+    assert_eq!(received.state, RevisionResultState::Received);
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    let states: Vec<String> = connection
+        .prepare("SELECT state FROM local_revision_results ORDER BY state")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(states, vec!["received"]);
+    drop(connection);
+
+    fake.restore();
+    let recovered = sync_once(&data_dir).await.unwrap();
+    assert!(recovered.last_sync_at.is_some());
+    let captured = controller.captured();
+    assert_eq!(captured.len(), 6);
+    assert_eq!(captured[3].method, Method::PUT);
+    let validated: RevisionResult = serde_json::from_slice(&captured[3].body).unwrap();
+    assert_eq!(validated.state, RevisionResultState::Validated);
+    assert!(captured[4].path_and_query.ends_with("/heartbeat"));
+    let heartbeat: NodeHeartbeat = serde_json::from_slice(&captured[4].body).unwrap();
+    assert_eq!(heartbeat.revisions.validated_revision.unwrap().get(), 1);
+    assert!(captured[5].path_and_query.ends_with("afterRevision=1"));
 }
 
 #[tokio::test]

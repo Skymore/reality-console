@@ -34,13 +34,14 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
 const MIGRATION_3_NAME: &str = "node_control_sync_state";
 const MIGRATION_4_NAME: &str = "node_desired_state_receipt";
 const MIGRATION_5_NAME: &str = "node_xray_runtime_configuration";
+const MIGRATION_6_NAME: &str = "node_rendered_xray_configs";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -144,6 +145,36 @@ const MIGRATION_5: &str = "
         configured_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     ) STRICT;
+";
+
+const MIGRATION_6: &str = "
+    CREATE TABLE rendered_xray_configs (
+        revision INTEGER PRIMARY KEY
+            REFERENCES desired_state_artifacts(revision) ON DELETE RESTRICT,
+        relative_path TEXT NOT NULL CHECK (length(relative_path) BETWEEN 1 AND 4096),
+        config_digest TEXT NOT NULL CHECK (
+            length(config_digest) = 71
+            AND substr(config_digest, 1, 7) = 'sha256:'
+            AND substr(config_digest, 8) NOT GLOB '*[^0-9a-f]*'
+        ),
+        binary_digest TEXT NOT NULL CHECK (
+            length(binary_digest) = 64
+            AND binary_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        validated_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TRIGGER rendered_xray_configs_no_update
+    BEFORE UPDATE ON rendered_xray_configs
+    BEGIN
+        SELECT RAISE(ABORT, 'rendered Xray configs are immutable');
+    END;
+
+    CREATE TRIGGER rendered_xray_configs_no_delete
+    BEFORE DELETE ON rendered_xray_configs
+    BEGIN
+        SELECT RAISE(ABORT, 'rendered Xray configs are immutable');
+    END;
 ";
 
 pub use enrollment::join;
@@ -327,6 +358,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 3, MIGRATION_3_NAME, MIGRATION_3)?;
     apply_migration(&transaction, 4, MIGRATION_4_NAME, MIGRATION_4)?;
     apply_migration(&transaction, 5, MIGRATION_5_NAME, MIGRATION_5)?;
+    apply_migration(&transaction, 6, MIGRATION_6_NAME, MIGRATION_6)?;
     transaction.commit()?;
     Ok(())
 }
@@ -390,6 +422,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (3, MIGRATION_3_NAME, MIGRATION_3),
         (4, MIGRATION_4_NAME, MIGRATION_4),
         (5, MIGRATION_5_NAME, MIGRATION_5),
+        (6, MIGRATION_6_NAME, MIGRATION_6),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");

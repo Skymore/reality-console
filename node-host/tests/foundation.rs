@@ -68,12 +68,51 @@ fn migrations_are_recorded_once_and_pragmas_are_enabled() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("migration metadata");
-    assert_eq!(count, 5);
+    assert_eq!(count, 6);
     assert_eq!(journal_mode, "wal");
-    assert_eq!(user_version, 5);
+    assert_eq!(user_version, 6);
     assert_eq!(migration.0, "node_host_foundation");
     assert_eq!(migration.1.len(), 64);
     assert!(migration.2 > 0);
+}
+
+#[test]
+fn schema_five_upgrades_without_recreating_node_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path().join("state");
+    let original = node_host::initialize(&data_dir, "https://controller.example")
+        .expect("initialize current schema");
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).expect("open database");
+    connection
+        .execute_batch(
+            "DROP TRIGGER rendered_xray_configs_no_update;
+             DROP TRIGGER rendered_xray_configs_no_delete;
+             DROP TABLE rendered_xray_configs;
+             DELETE FROM schema_migrations WHERE version = 6;
+             PRAGMA user_version = 5;",
+        )
+        .expect("create coherent schema-five fixture");
+    drop(connection);
+
+    let upgraded = node_host::initialize(&data_dir, "https://controller.example")
+        .expect("upgrade existing schema");
+    assert_eq!(upgraded.schema_version, 6);
+    assert_eq!(
+        upgraded.identity_public_key.as_str(),
+        original.identity_public_key.as_str()
+    );
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).expect("open upgraded");
+    let has_rendered_table: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type = 'table' AND name = 'rendered_xray_configs'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rendered table exists");
+    assert!(has_rendered_table);
 }
 
 #[test]

@@ -1,19 +1,36 @@
 use crate::{
-    build_status, load_or_create_seed, load_seed, migrate, open_database, parse_controller,
+    build_status, ensure_owner_only, load_or_create_seed, load_seed, migrate, open_database,
+    parse_controller, set_create_owner_only, set_directory_owner_only, set_owner_only,
     unix_timestamp, DataDirLock, HostStatus, Identity, SecretSeed, REALITY_X25519_SEED_FILE,
 };
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use control_protocol::crypto::X25519PublicKey;
+use control_protocol::crypto::{Sha256Digest as ProtocolSha256Digest, X25519PublicKey};
+use control_protocol::error::ErrorCode;
+use control_protocol::id::{Revision, Timestamp};
+use control_protocol::node::{RevisionResult, RevisionResultState, SignedDesiredState};
+use rand_core::{OsRng, RngCore as _};
 use rusqlite::{params, Connection, OptionalExtension as _, TransactionBehavior};
+use semver::Version;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write as _;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
+use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519DalekPublicKey, StaticSecret};
 use xray_runtime::{
-    probe_version, ExecutionLimits, RealityPrivateKey, Sha256Digest, ShortId, XrayBinarySpec,
+    probe_version, test_config, ExecutionLimits, RealityPrivateKey, RealityTarget,
+    RenderedXrayConfig, RuntimeError, ServerName, Sha256Digest as RuntimeSha256Digest, ShortId,
+    UserEmail, VlessRealityConfigBuilder, VlessUser, XrayBinarySpec,
 };
+use zeroize::Zeroizing;
+
+const CONFIG_DIRECTORY: &str = "configs";
+const MAX_STORED_CONFIG_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct XrayRuntimeStatus {
@@ -55,7 +72,7 @@ pub async fn configure_xray(
     let controller = parse_controller(&controller_value)?;
     let identity = Identity::load(data_dir)?;
 
-    let digest = Sha256Digest::from_hex(expected_sha256)
+    let digest = RuntimeSha256Digest::from_hex(expected_sha256)
         .context("expected Xray SHA-256 must contain 64 hexadecimal characters")?;
     let binary_path = binary_path
         .to_str()
@@ -115,6 +132,83 @@ pub async fn configure_xray(
     build_status(&connection, data_dir, controller, &identity)
 }
 
+/// Renders and validates one verified desired-state artifact without activating it.
+///
+/// A missing local Xray runtime leaves the revision in `received`. Deterministic
+/// incompatibility or configuration failures append a terminal `rejected`
+/// result. Local binary, process, and filesystem failures remain retryable and
+/// therefore do not rewrite controller state as a permanent rejection.
+pub(crate) async fn validate_desired_state(
+    data_dir: &Path,
+    connection: &mut Connection,
+    envelope: &SignedDesiredState,
+) -> Result<()> {
+    let revision = envelope.document.revision;
+    if validation_is_complete(connection, data_dir, revision)? {
+        return Ok(());
+    }
+
+    let Some(runtime) = load_runtime_row(connection)? else {
+        return Ok(());
+    };
+    let started_at = Timestamp::from_datetime(OffsetDateTime::now_utc());
+    if let Some(error_code) = minimum_agent_version_error(&envelope.document.min_agent_version)? {
+        append_rejected_result(connection, revision, started_at, error_code)?;
+        return Ok(());
+    }
+
+    let runtime_digest = RuntimeSha256Digest::from_hex(&runtime.expected_sha256)
+        .context("stored Xray runtime checksum is invalid")?;
+    let spec = XrayBinarySpec::new(runtime.binary_path.clone(), runtime_digest)
+        .context("stored Xray runtime path is invalid")?;
+    let verified = tokio::task::spawn_blocking(move || spec.verify())
+        .await
+        .context("Xray binary verification task failed")?
+        .context("pinned Xray binary verification failed")?;
+
+    let reality_seed = load_seed(&data_dir.join(REALITY_X25519_SEED_FILE))
+        .context("stored REALITY identity is unavailable")?;
+    validate_reality_seed(&reality_seed)?;
+    let Ok(rendered) = render_desired_config(envelope, &reality_seed) else {
+        append_rejected_result(
+            connection,
+            revision,
+            started_at,
+            ErrorCode::ValidationFailed,
+        )?;
+        return Ok(());
+    };
+
+    match test_config(&verified, &rendered, ExecutionLimits::default()).await {
+        Ok(_) => {}
+        Err(RuntimeError::NonZeroExit { .. } | RuntimeError::ConfigTooLarge) => {
+            append_rejected_result(
+                connection,
+                revision,
+                started_at,
+                ErrorCode::ValidationFailed,
+            )?;
+            return Ok(());
+        }
+        Err(error) => return Err(error).context("pinned Xray config test failed"),
+    }
+
+    let config_digest = protocol_digest(rendered.expose_json().as_bytes());
+    let relative_path = persist_immutable_config(data_dir, revision, &rendered, &config_digest)?;
+    append_validated_result(
+        connection,
+        revision,
+        started_at,
+        &relative_path,
+        &config_digest,
+        &runtime.expected_sha256,
+    )
+}
+
+pub(crate) fn configured_xray_version(connection: &Connection) -> Result<Option<String>> {
+    Ok(load_runtime_row(connection)?.map(|runtime| runtime.version))
+}
+
 pub(crate) fn load_xray_runtime_status(
     connection: &Connection,
     data_dir: &Path,
@@ -169,6 +263,369 @@ fn load_runtime_row(connection: &Connection) -> Result<Option<StoredRuntimeRow>>
         .map_err(Into::into)
 }
 
+fn minimum_agent_version_error(required: &str) -> Result<Option<ErrorCode>> {
+    let current = Version::parse(env!("CARGO_PKG_VERSION"))
+        .context("Node Host package version is not semantic")?;
+    let Ok(required) = Version::parse(required) else {
+        return Ok(Some(ErrorCode::SchemaUnsupported));
+    };
+    Ok((required > current).then_some(ErrorCode::SchemaUnsupported))
+}
+
+fn render_desired_config(
+    envelope: &SignedDesiredState,
+    reality_seed: &SecretSeed,
+) -> Result<RenderedXrayConfig> {
+    let encoded_private_key = Zeroizing::new(URL_SAFE_NO_PAD.encode(reality_seed.0));
+    let private_key = RealityPrivateKey::parse(&encoded_private_key)
+        .context("stored REALITY private key is invalid")?;
+    let (_, short_id) = reality_public_material(reality_seed)?;
+    let short_id = ShortId::parse(&short_id).context("stored REALITY short ID is invalid")?;
+    let (target_host, target_port) = envelope
+        .document
+        .xray
+        .target
+        .rsplit_once(':')
+        .context("desired REALITY target is invalid")?;
+    let target_port = target_port
+        .parse::<u16>()
+        .context("desired REALITY target port is invalid")?;
+    let target = RealityTarget::new(target_host, target_port)
+        .context("desired REALITY target is invalid")?;
+    let mut builder = VlessRealityConfigBuilder::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        envelope.document.xray.listen_port,
+        target,
+        private_key,
+    )?
+    .short_id(short_id);
+
+    for server_name in &envelope.document.xray.server_names {
+        builder = builder.server_name(
+            ServerName::parse(server_name).context("desired REALITY server name is invalid")?,
+        );
+    }
+    for desired_user in &envelope.document.users {
+        let user_id = Uuid::parse_str(desired_user.vless_uuid.expose_secret())
+            .context("desired VLESS UUID is invalid")?;
+        let email = UserEmail::parse(&format!("user-{}", desired_user.user_id))
+            .context("desired user identity cannot be represented safely")?;
+        builder = builder.user(VlessUser::new(user_id, email, desired_user.enabled)?);
+    }
+    builder
+        .build()
+        .context("desired state cannot be rendered as an Xray configuration")
+}
+
+fn validation_is_complete(
+    connection: &Connection,
+    data_dir: &Path,
+    revision: Revision,
+) -> Result<bool> {
+    let reports = load_revision_results(connection, revision)?;
+    let Some((_, first)) = reports.first() else {
+        bail!("desired-state revision is missing its received result");
+    };
+    if first.state != RevisionResultState::Received {
+        bail!("desired-state revision result history does not begin with received");
+    }
+    let mut previous: Option<&RevisionResult> = None;
+    for (_, report) in &reports {
+        report
+            .validate_transition_from(previous)
+            .context("stored revision result transition is invalid")?;
+        previous = Some(report);
+    }
+    let latest = reports.last().expect("received result exists").1.clone();
+    match latest.state {
+        RevisionResultState::Received => Ok(false),
+        RevisionResultState::Validated | RevisionResultState::Applied => {
+            verify_rendered_config(connection, data_dir, revision, &latest)?;
+            Ok(true)
+        }
+        RevisionResultState::Rejected | RevisionResultState::RolledBack => Ok(true),
+    }
+}
+
+fn load_revision_results(
+    connection: &Connection,
+    revision: Revision,
+) -> Result<Vec<(String, RevisionResult)>> {
+    let mut statement = connection.prepare(
+        "SELECT report_json, report_digest
+         FROM local_revision_results
+         WHERE revision = ?1
+         ORDER BY CASE state
+             WHEN 'received' THEN 10
+             WHEN 'validated' THEN 20
+             ELSE 30
+         END, state",
+    )?;
+    let rows = statement
+        .query_map([revision.get()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(report_json, stored_digest)| {
+            if protocol_digest(report_json.as_bytes()).as_str() != stored_digest {
+                bail!("stored revision result digest is invalid");
+            }
+            let report: RevisionResult =
+                serde_json::from_str(&report_json).context("stored revision result is invalid")?;
+            report
+                .validate(revision)
+                .context("stored revision result failed validation")?;
+            Ok((stored_digest, report))
+        })
+        .collect()
+}
+
+fn verify_rendered_config(
+    connection: &Connection,
+    data_dir: &Path,
+    revision: Revision,
+    report: &RevisionResult,
+) -> Result<()> {
+    let stored = connection
+        .query_row(
+            "SELECT relative_path, config_digest, binary_digest
+             FROM rendered_xray_configs WHERE revision = ?1",
+            [revision.get()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .context("validated revision is missing its rendered Xray config metadata")?;
+    let expected_relative = config_relative_path(revision);
+    if Path::new(&stored.0) != expected_relative {
+        bail!("stored rendered Xray config path is invalid");
+    }
+    if report
+        .config_digest
+        .as_ref()
+        .map(ProtocolSha256Digest::as_str)
+        != Some(stored.1.as_str())
+    {
+        bail!("validated revision config digest is inconsistent");
+    }
+    RuntimeSha256Digest::from_hex(&stored.2)
+        .context("validated revision has an invalid historical Xray binary digest")?;
+    verify_config_file(&data_dir.join(expected_relative), &stored.1)
+}
+
+fn append_rejected_result(
+    connection: &mut Connection,
+    revision: Revision,
+    started_at: Timestamp,
+    error_code: ErrorCode,
+) -> Result<()> {
+    let result = RevisionResult {
+        state: RevisionResultState::Rejected,
+        config_digest: None,
+        started_at,
+        completed_at: Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        error_code: Some(error_code),
+        rollback_revision: None,
+    };
+    append_revision_result(connection, revision, &result)
+}
+
+fn append_validated_result(
+    connection: &mut Connection,
+    revision: Revision,
+    started_at: Timestamp,
+    relative_path: &Path,
+    config_digest: &ProtocolSha256Digest,
+    binary_digest: &str,
+) -> Result<()> {
+    let completed_at = Timestamp::from_datetime(OffsetDateTime::now_utc());
+    let result = RevisionResult {
+        state: RevisionResultState::Validated,
+        config_digest: Some(config_digest.clone()),
+        started_at,
+        completed_at,
+        error_code: None,
+        rollback_revision: None,
+    };
+    result
+        .validate(revision)
+        .context("generated validated revision result is invalid")?;
+    let report_json =
+        serde_json::to_string(&result).context("failed to encode validated revision result")?;
+    let report_digest = protocol_digest(report_json.as_bytes());
+    let relative_path = relative_path
+        .to_str()
+        .context("rendered Xray config path is not UTF-8")?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_result_transition(&transaction, revision, &result)?;
+    transaction.execute(
+        "INSERT INTO rendered_xray_configs(
+            revision, relative_path, config_digest, binary_digest, validated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            revision.get(),
+            relative_path,
+            config_digest.as_str(),
+            binary_digest,
+            completed_at.as_datetime().unix_timestamp(),
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO local_revision_results(
+            revision, state, report_json, report_digest, reported_at, created_at
+         ) VALUES (?1, 'validated', ?2, ?3, NULL, ?4)",
+        params![
+            revision.get(),
+            report_json,
+            report_digest.as_str(),
+            completed_at.as_datetime().unix_timestamp(),
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn append_revision_result(
+    connection: &mut Connection,
+    revision: Revision,
+    result: &RevisionResult,
+) -> Result<()> {
+    result
+        .validate(revision)
+        .context("generated revision result is invalid")?;
+    let report_json = serde_json::to_string(result).context("failed to encode revision result")?;
+    let report_digest = protocol_digest(report_json.as_bytes());
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_result_transition(&transaction, revision, result)?;
+    transaction.execute(
+        "INSERT INTO local_revision_results(
+            revision, state, report_json, report_digest, reported_at, created_at
+         ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+        params![
+            revision.get(),
+            revision_state_name(result.state),
+            report_json,
+            report_digest.as_str(),
+            result.completed_at.as_datetime().unix_timestamp(),
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_result_transition(
+    connection: &Connection,
+    revision: Revision,
+    candidate: &RevisionResult,
+) -> Result<()> {
+    let previous = load_revision_results(connection, revision)?
+        .last()
+        .map(|(_, report)| report.clone());
+    candidate
+        .validate_transition_from(previous.as_ref())
+        .context("revision result transition is invalid")
+}
+
+fn persist_immutable_config(
+    data_dir: &Path,
+    revision: Revision,
+    config: &RenderedXrayConfig,
+    digest: &ProtocolSha256Digest,
+) -> Result<PathBuf> {
+    let directory = data_dir.join(CONFIG_DIRECTORY);
+    ensure_private_directory(&directory)?;
+    let relative_path = config_relative_path(revision);
+    let final_path = data_dir.join(&relative_path);
+    if final_path.try_exists()? {
+        verify_config_file(&final_path, digest.as_str())?;
+        return Ok(relative_path);
+    }
+
+    let mut random = [0_u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let temporary = directory.join(format!(
+        ".revision-{}-{}.tmp",
+        revision.get(),
+        u64::from_ne_bytes(random)
+    ));
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        set_create_owner_only(&mut options);
+        let mut file = options.open(&temporary)?;
+        set_owner_only(&temporary)?;
+        file.write_all(config.expose_json().as_bytes())?;
+        file.sync_all()?;
+        match fs::hard_link(&temporary, &final_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verify_config_file(&final_path, digest.as_str())?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        fs::remove_file(&temporary)?;
+        File::open(&directory)?.sync_all()?;
+        verify_config_file(&final_path, digest.as_str())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.context("failed to persist immutable rendered Xray config")?;
+    Ok(relative_path)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!("rendered Xray config directory is unsafe");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(path)?,
+        Err(error) => return Err(error.into()),
+    }
+    set_directory_owner_only(path)
+}
+
+fn verify_config_file(path: &Path, expected_digest: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).context("failed to inspect rendered Xray config")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("rendered Xray config must be a regular non-symlink file");
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_STORED_CONFIG_BYTES {
+        bail!("rendered Xray config size is invalid");
+    }
+    ensure_owner_only(path)?;
+    let contents = Zeroizing::new(fs::read(path).context("failed to read rendered Xray config")?);
+    if protocol_digest(&contents).as_str() != expected_digest {
+        bail!("rendered Xray config digest is invalid");
+    }
+    Ok(())
+}
+
+fn config_relative_path(revision: Revision) -> PathBuf {
+    PathBuf::from(CONFIG_DIRECTORY).join(format!("revision-{}.json", revision.get()))
+}
+
+fn protocol_digest(value: &[u8]) -> ProtocolSha256Digest {
+    ProtocolSha256Digest::from_bytes(Sha256::digest(value).into())
+}
+
+const fn revision_state_name(state: RevisionResultState) -> &'static str {
+    match state {
+        RevisionResultState::Received => "received",
+        RevisionResultState::Validated => "validated",
+        RevisionResultState::Applied => "applied",
+        RevisionResultState::Rejected => "rejected",
+        RevisionResultState::RolledBack => "rolledBack",
+    }
+}
+
 fn normalize_version(output: &str) -> Result<String> {
     let version = output.lines().next().unwrap_or_default().trim();
     let release = version
@@ -221,7 +678,8 @@ fn reality_public_material(seed: &SecretSeed) -> Result<(X25519PublicKey, String
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_version;
+    use super::{minimum_agent_version_error, normalize_version};
+    use control_protocol::error::ErrorCode;
 
     #[test]
     fn version_output_uses_one_bounded_safe_line() {
@@ -233,5 +691,18 @@ mod tests {
         assert!(normalize_version("Xray\t25").is_err());
         assert!(normalize_version("not-xray 25.7.1").is_err());
         assert!(normalize_version("Xray 25.7").is_err());
+    }
+
+    #[test]
+    fn minimum_agent_version_is_closed_and_semantic() {
+        assert_eq!(minimum_agent_version_error("0.1.0").unwrap(), None);
+        assert_eq!(
+            minimum_agent_version_error("999.0.0").unwrap(),
+            Some(ErrorCode::SchemaUnsupported)
+        );
+        assert_eq!(
+            minimum_agent_version_error("latest").unwrap(),
+            Some(ErrorCode::SchemaUnsupported)
+        );
     }
 }

@@ -21,18 +21,19 @@ profile and supervise a pinned Xray sidecar. Control Service now supports secure
 invitations and proof-of-possession enrollment. Node Host has durable owner-only identities and a
 headless `init`/`join`/`sync-once`/`status` flow that verifies the controller response before
 persisting its registration. Authenticated heartbeat and empty desired-state polling are
-implemented. Node Host can also verify, durably retain, and acknowledge signed desired-state
-envelopes without applying them to Xray yet. Control Service exposes redacted node summaries plus
+implemented. Node Host can also verify and durably retain signed desired-state envelopes, render a
+deterministic loopback-only Xray candidate, run the checksum-pinned binary's offline config test,
+and acknowledge `received` plus `validated` or `rejected` without activating Xray. Control Service
+exposes redacted node summaries plus
 explicit approve, disable, and revoke operations; it can publish immutable signed revisions and
 record monotonic receive/validate/apply/rollback results. Enrollment and heartbeat never activate
 a node implicitly or overwrite controller-owned desired state. Node Host also has a resilient
 outbound sync loop with jitter, bounded retry backoff, and graceful process shutdown. Its installer
 integration can verify and pin an explicit Xray binary, probe its version, and create a separate
-owner-only REALITY identity without starting the process. The Xray runtime crate builds
-deterministic `VLESS + REALITY`
-configuration, verifies an explicit checksum-pinned binary, and runs bounded version/config tests
-without starting a listener. Native service installers, atomic Xray activation/supervision,
-account synchronization, and relay fallback remain under active implementation.
+owner-only REALITY identity without starting the process. Candidate files are immutable,
+owner-only, digest-checked on restart, and never replace a known-good configuration during
+validation. Native service installers, atomic Xray activation/supervision, account synchronization,
+and relay fallback remain under active implementation.
 
 ## Authoritative Documentation
 

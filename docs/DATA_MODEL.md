@@ -392,6 +392,15 @@ contract and migration table.
 - `xray_runtime_config`: installer-supplied absolute binary path, trusted SHA-256, bounded version
   probe result, and configuration/update times. The separate REALITY private seed remains in the
   owner-only secret store; only its public key and derived short ID are exposed by safe status.
+- `desired_state_artifacts` and `local_revision_results`: the current receive/validation journal.
+  Signed envelopes and lifecycle result payloads are immutable; only a result's nullable delivery
+  acknowledgement may change. Results are uploaded in explicit lifecycle order rather than text
+  sort order.
+- `rendered_xray_configs`: one immutable row per validated revision containing only the private
+  candidate's relative path, `sha256:` config digest, historical pinned-binary digest, and
+  validation time. The corresponding 0600 JSON is under a 0700 node data subdirectory, is created
+  without overwriting an existing artifact, and is digest-checked before a queued `validated`
+  result can be retried.
 - `apply_journal`: one row per revision with envelope artifact reference/digest, state
   (`received`, `validated`, `activating`, `applied`, `rejected`, `rolling_back`, `rolled_back`),
   rendered config digest, predecessor revision, timestamps, attempt count, and error code. State
