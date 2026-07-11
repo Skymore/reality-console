@@ -23,9 +23,11 @@ headless `init`/`join`/`sync-once`/`status` flow that verifies the controller re
 persisting its registration. Authenticated heartbeat and empty desired-state polling are
 implemented. Node Host can also verify, durably retain, and acknowledge signed desired-state
 envelopes without applying them to Xray yet. Control Service exposes redacted node summaries plus
-explicit approve, disable, and revoke operations; enrollment and heartbeat never activate a node
-implicitly. Node Host also has a resilient outbound sync loop with jitter, bounded retry backoff,
-and graceful process shutdown. The Xray runtime crate builds deterministic `VLESS + REALITY`
+explicit approve, disable, and revoke operations; it can publish immutable signed revisions and
+record monotonic receive/validate/apply/rollback results. Enrollment and heartbeat never activate
+a node implicitly or overwrite controller-owned desired state. Node Host also has a resilient
+outbound sync loop with jitter, bounded retry backoff, and graceful process shutdown. The Xray
+runtime crate builds deterministic `VLESS + REALITY`
 configuration, verifies an explicit checksum-pinned binary, and runs bounded version/config tests
 without starting a listener. Native service installers, atomic Xray activation/supervision,
 account synchronization, and relay fallback remain under active implementation.

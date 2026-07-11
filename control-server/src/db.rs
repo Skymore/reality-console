@@ -1,19 +1,24 @@
 use crate::config::{validate_network_name, ConfigError};
+use crate::desired::{
+    build_signed_desired_state, verify_stored_desired_state, DesiredStateDraft, DesiredStateError,
+    StoredDesiredState,
+};
 use crate::identity::{set_owner_only, ControllerIdentity, IdentityError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use control_protocol::crypto::Ed25519PublicKey;
+use control_protocol::crypto::{Ed25519PublicKey, Sha256Digest};
 use control_protocol::enrollment::{
     enrollment_request_transcript, enrollment_response_transcript, verify_enrollment_proof,
     EnrollmentCryptoError, EnrollmentInvitation,
 };
 use control_protocol::id::{
-    ControllerInstanceId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision, Timestamp,
+    ControllerInstanceId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision, SigningKeyId,
+    Timestamp,
 };
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
     EnrollNodeResponse, NodeAuthenticationMode, NodeCapability, NodeCredential, NodeHeartbeat,
-    PairingPurpose,
+    PairingPurpose, RevisionResult, RevisionResultState, SignedDesiredState,
 };
 use control_protocol::request_auth::{
     verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
@@ -34,7 +39,7 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
@@ -176,6 +181,132 @@ CREATE TABLE node_reported_endpoints (
 ) STRICT, WITHOUT ROWID;
 ";
 
+const MIGRATION_4_SQL: &str = r"
+ALTER TABLE nodes ADD COLUMN reported_desired_revision INTEGER
+    CHECK(reported_desired_revision > 0);
+
+-- Version 3 accepted heartbeat cursors as authority. They cannot be imported
+-- into the signed revision journal, so discard them during the trust upgrade.
+UPDATE nodes
+SET desired_revision = NULL,
+    received_revision = NULL,
+    validated_revision = NULL,
+    applied_revision = NULL;
+
+CREATE TABLE config_revisions (
+    network_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    parent_revision INTEGER,
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    node_id TEXT NOT NULL,
+    artifact_json TEXT NOT NULL
+        CHECK(json_valid(artifact_json) AND length(artifact_json) BETWEEN 2 AND 1048576),
+    artifact_sha256 TEXT NOT NULL
+        CHECK(length(artifact_sha256) = 71
+            AND substr(artifact_sha256, 1, 7) = 'sha256:'
+            AND substr(artifact_sha256, 8) NOT GLOB '*[^0-9a-f]*'),
+    transcript_sha256 TEXT NOT NULL
+        CHECK(length(transcript_sha256) = 71
+            AND substr(transcript_sha256, 1, 7) = 'sha256:'
+            AND substr(transcript_sha256, 8) NOT GLOB '*[^0-9a-f]*'),
+    signature TEXT NOT NULL CHECK(length(signature) = 86),
+    signing_key_id TEXT NOT NULL CHECK(length(signing_key_id) = 36),
+    controller_instance_id TEXT NOT NULL CHECK(length(controller_instance_id) = 36),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, revision),
+    UNIQUE(network_id, revision, node_id),
+    CHECK((revision = 1 AND parent_revision IS NULL)
+        OR (revision > 1 AND parent_revision = revision - 1)),
+    FOREIGN KEY(network_id) REFERENCES networks(network_id) ON DELETE CASCADE,
+    FOREIGN KEY(network_id, node_id) REFERENCES nodes(network_id, node_id),
+    FOREIGN KEY(network_id, parent_revision)
+        REFERENCES config_revisions(network_id, revision)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE node_revision_targets (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id, revision),
+    UNIQUE(network_id, revision),
+    FOREIGN KEY(network_id, revision, node_id)
+        REFERENCES config_revisions(network_id, revision, node_id),
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX node_revision_targets_latest
+    ON node_revision_targets(network_id, node_id, revision DESC);
+
+CREATE TABLE node_revision_results (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    state TEXT NOT NULL
+        CHECK(state IN ('received', 'validated', 'applied', 'rejected', 'rolledBack')),
+    state_rank INTEGER NOT NULL CHECK(
+        (state = 'received' AND state_rank = 10)
+        OR (state = 'validated' AND state_rank = 20)
+        OR (state IN ('applied', 'rejected', 'rolledBack') AND state_rank = 30)
+    ),
+    result_json TEXT NOT NULL
+        CHECK(json_valid(result_json) AND length(result_json) BETWEEN 2 AND 8192),
+    config_digest TEXT CHECK(config_digest IS NULL OR (
+        length(config_digest) = 71
+        AND substr(config_digest, 1, 7) = 'sha256:'
+        AND substr(config_digest, 8) NOT GLOB '*[^0-9a-f]*'
+    )),
+    rollback_revision INTEGER CHECK(
+        rollback_revision IS NULL
+        OR (rollback_revision > 0 AND rollback_revision < revision)
+    ),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id, revision, state),
+    FOREIGN KEY(network_id, node_id, revision)
+        REFERENCES node_revision_targets(network_id, node_id, revision)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX node_revision_results_latest
+    ON node_revision_results(network_id, node_id, revision, state_rank DESC);
+
+CREATE TRIGGER config_revisions_no_update
+BEFORE UPDATE ON config_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'config revisions are immutable');
+END;
+
+CREATE TRIGGER config_revisions_no_delete
+BEFORE DELETE ON config_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'config revisions are immutable');
+END;
+
+CREATE TRIGGER node_revision_targets_no_update
+BEFORE UPDATE ON node_revision_targets
+BEGIN
+    SELECT RAISE(ABORT, 'node revision targets are immutable');
+END;
+
+CREATE TRIGGER node_revision_targets_no_delete
+BEFORE DELETE ON node_revision_targets
+BEGIN
+    SELECT RAISE(ABORT, 'node revision targets are immutable');
+END;
+
+CREATE TRIGGER node_revision_results_no_update
+BEFORE UPDATE ON node_revision_results
+BEGIN
+    SELECT RAISE(ABORT, 'node revision results are immutable');
+END;
+
+CREATE TRIGGER node_revision_results_no_delete
+BEFORE DELETE ON node_revision_results
+BEGIN
+    SELECT RAISE(ABORT, 'node revision results are immutable');
+END;
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -197,6 +328,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "node_request_auth_and_heartbeat",
         sql: MIGRATION_3_SQL,
+    },
+    Migration {
+        version: 4,
+        name: "signed_desired_state_revisions",
+        sql: MIGRATION_4_SQL,
     },
 ];
 
@@ -459,6 +595,55 @@ impl Database {
         .map_err(DatabaseError::Worker)?
     }
 
+    /// Publishes one immutable signed desired-state revision for an active node.
+    pub(crate) async fn publish_desired_state(
+        &self,
+        node_id: NodeId,
+        draft: DesiredStateDraft,
+    ) -> Result<SignedDesiredState, DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            publish_desired_state(&mut guard.connection, &identity, node_id, draft)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Loads and verifies the latest desired state newer than the node cursor.
+    pub(crate) async fn desired_state_after(
+        &self,
+        node_id: NodeId,
+        after_revision: i64,
+    ) -> Result<Option<SignedDesiredState>, DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            desired_state_after(&guard.connection, &identity, node_id, after_revision)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Appends a monotonic result for one targeted desired-state revision.
+    pub(crate) async fn record_revision_result(
+        &self,
+        node_id: NodeId,
+        revision: Revision,
+        result: RevisionResult,
+    ) -> Result<(), DatabaseError> {
+        result.validate(revision)?;
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            record_revision_result(&mut guard.connection, node_id, revision, &result)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
     #[must_use]
     pub fn controller_identity(&self) -> ControllerIdentity {
         self.controller_identity.clone()
@@ -569,10 +754,9 @@ fn record_heartbeat(
         "UPDATE nodes
          SET agent_version = ?1, xray_version = ?2, runtime_state = ?3,
              provider_paused = ?4, last_seen_at = ?5,
-             desired_revision = ?6, received_revision = ?7,
-             validated_revision = ?8, applied_revision = ?9,
-             telemetry_cursor = ?10, updated_at = ?5
-         WHERE network_id = ?11 AND node_id = ?12 AND status IN ('pending', 'active')",
+             reported_desired_revision = ?6,
+             telemetry_cursor = ?7, updated_at = ?5
+         WHERE network_id = ?8 AND node_id = ?9 AND status IN ('pending', 'active')",
         params![
             heartbeat.agent_version,
             heartbeat.xray_version,
@@ -582,18 +766,6 @@ fn record_heartbeat(
             heartbeat
                 .revisions
                 .desired_revision
-                .map(control_protocol::id::Revision::get),
-            heartbeat
-                .revisions
-                .received_revision
-                .map(control_protocol::id::Revision::get),
-            heartbeat
-                .revisions
-                .validated_revision
-                .map(control_protocol::id::Revision::get),
-            heartbeat
-                .revisions
-                .applied_revision
                 .map(control_protocol::id::Revision::get),
             heartbeat.telemetry_cursor.get(),
             network.network_id,
@@ -634,59 +806,678 @@ fn validate_reported_progress(
     node_id: NodeId,
     heartbeat: &NodeHeartbeat,
 ) -> Result<(), DatabaseError> {
-    let previous: (
-        String,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        i64,
-    ) = transaction
+    struct ReportedProgressRecord {
+        status: String,
+        target: Option<i64>,
+        reported_target: Option<i64>,
+        received: Option<i64>,
+        validated: Option<i64>,
+        applied: Option<i64>,
+        telemetry_cursor: i64,
+    }
+
+    let previous = transaction
         .query_row(
-            "SELECT status, desired_revision, received_revision, validated_revision,
-                    applied_revision, telemetry_cursor
+            "SELECT status, desired_revision, reported_desired_revision,
+                    received_revision, validated_revision, applied_revision,
+                    telemetry_cursor
              FROM nodes WHERE network_id = ?1 AND node_id = ?2",
             params![network_id, node_id.to_string()],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
+                Ok(ReportedProgressRecord {
+                    status: row.get(0)?,
+                    target: row.get(1)?,
+                    reported_target: row.get(2)?,
+                    received: row.get(3)?,
+                    validated: row.get(4)?,
+                    applied: row.get(5)?,
+                    telemetry_cursor: row.get(6)?,
+                })
             },
         )
         .optional()?
         .ok_or(DatabaseError::NodeRevoked)?;
-    if !matches!(previous.0.as_str(), "pending" | "active") {
+    if !matches!(previous.status.as_str(), "pending" | "active") {
         return Err(DatabaseError::NodeRevoked);
     }
-    for (stored, reported) in [
+    let reported_desired = heartbeat.revisions.desired_revision.map(Revision::get);
+    validate_reported_desired_revision(
+        transaction,
+        network_id,
+        node_id,
+        previous.target,
+        previous.reported_target,
+        reported_desired,
+    )?;
+    for (authoritative, reported) in [
         (
-            previous.1,
-            heartbeat.revisions.desired_revision.map(Revision::get),
-        ),
-        (
-            previous.2,
+            previous.received,
             heartbeat.revisions.received_revision.map(Revision::get),
         ),
         (
-            previous.3,
+            previous.validated,
             heartbeat.revisions.validated_revision.map(Revision::get),
         ),
         (
-            previous.4,
+            previous.applied,
             heartbeat.revisions.applied_revision.map(Revision::get),
         ),
     ] {
-        ensure_monotonic_cursor(stored, reported)?;
+        ensure_authoritative_progress(authoritative, reported)?;
     }
-    if heartbeat.telemetry_cursor.get() < previous.5 {
+    if heartbeat.telemetry_cursor.get() < previous.telemetry_cursor {
         return Err(DatabaseError::NodeProgressRegressed);
     }
     Ok(())
+}
+
+fn validate_reported_desired_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    target: Option<i64>,
+    previous_reported: Option<i64>,
+    reported: Option<i64>,
+) -> Result<(), DatabaseError> {
+    ensure_monotonic_cursor(previous_reported, reported)?;
+    let Some(reported) = reported else {
+        return Ok(());
+    };
+    if match target {
+        Some(target) => reported > target,
+        None => true,
+    } {
+        return Err(DatabaseError::NodeProgressConflict);
+    }
+    let targeted = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM node_revision_targets
+            WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3
+         )",
+        params![network_id, node_id.to_string(), reported],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !targeted {
+        return Err(DatabaseError::NodeProgressConflict);
+    }
+    Ok(())
+}
+
+fn ensure_authoritative_progress(
+    authoritative: Option<i64>,
+    reported: Option<i64>,
+) -> Result<(), DatabaseError> {
+    if authoritative == reported {
+        return Ok(());
+    }
+    match (authoritative, reported) {
+        (Some(_), None) => Err(DatabaseError::NodeProgressRegressed),
+        (Some(authoritative), Some(reported)) if reported < authoritative => {
+            Err(DatabaseError::NodeProgressRegressed)
+        }
+        _ => Err(DatabaseError::NodeProgressConflict),
+    }
+}
+
+fn publish_desired_state(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    node_id: NodeId,
+    draft: DesiredStateDraft,
+) -> Result<SignedDesiredState, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let node_id_text = node_id.to_string();
+    let node_status = transaction
+        .query_row(
+            "SELECT status FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id_text],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeNotFound)?;
+    if node_status != "active" {
+        insert_audit_event(
+            &transaction,
+            Some(&network.network_id),
+            "admin",
+            None,
+            "node.desired-state-publication-rejected",
+            "node",
+            Some(&node_id_text),
+            "rejected",
+            &serde_json::json!({ "nodeStatus": node_status }),
+            now,
+        )?;
+        transaction.commit()?;
+        return Err(DatabaseError::DesiredStatePublicationConflict {
+            current_status: node_status,
+        });
+    }
+
+    let next_revision = network
+        .last_revision
+        .checked_add(1)
+        .and_then(|value| Revision::new(value).ok())
+        .ok_or(DatabaseError::RevisionOverflow)?;
+    let network_id = network
+        .network_id
+        .parse::<NetworkId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let controller_instance_id = network
+        .controller_epoch
+        .parse::<ControllerInstanceId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let artifact = build_signed_desired_state(
+        identity,
+        network_id,
+        node_id,
+        next_revision,
+        timestamp(now)?,
+        controller_instance_id,
+        draft,
+    )
+    .map_err(map_desired_state_publication_error)?;
+    insert_desired_revision(&transaction, &network, &node_id_text, &artifact, now)?;
+
+    let revision = next_revision.get();
+    let node_updated = transaction.execute(
+        "UPDATE nodes SET desired_revision = ?1, updated_at = ?2
+         WHERE network_id = ?3 AND node_id = ?4 AND status = 'active'",
+        params![revision, now, network.network_id, node_id_text],
+    )?;
+    let network_updated = transaction.execute(
+        "UPDATE networks SET last_revision = ?1, updated_at = ?2
+         WHERE network_id = ?3 AND last_revision = ?4",
+        params![revision, now, network.network_id, network.last_revision],
+    )?;
+    if node_updated != 1 || network_updated != 1 {
+        return Err(DatabaseError::DesiredStatePublicationConflict {
+            current_status: node_status,
+        });
+    }
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "admin",
+        None,
+        "node.desired-state-published",
+        "node",
+        Some(&node_id_text),
+        "success",
+        &serde_json::json!({
+            "parentRevision": (revision > 1).then_some(revision - 1),
+            "revision": revision,
+            "schemaVersion": artifact.envelope.document.schema_version
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(artifact.envelope)
+}
+
+fn insert_desired_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    network: &NetworkRecord,
+    node_id: &str,
+    artifact: &crate::desired::PublishedDesiredState,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let document = &artifact.envelope.document;
+    let revision = document.revision.get();
+    transaction.execute(
+        "INSERT INTO config_revisions(
+            network_id, revision, parent_revision, schema_version, node_id,
+            artifact_json, artifact_sha256, transcript_sha256, signature,
+            signing_key_id, controller_instance_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            network.network_id,
+            revision,
+            (revision > 1).then_some(revision - 1),
+            i64::from(document.schema_version),
+            node_id,
+            artifact.artifact_json,
+            artifact.artifact_digest.as_str(),
+            artifact.transcript_digest.as_str(),
+            artifact.envelope.signature.as_str(),
+            document.signing_key_id.to_string(),
+            document.controller_instance_id.to_string(),
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO node_revision_targets(network_id, node_id, revision, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![network.network_id, node_id, revision, now],
+    )?;
+    Ok(())
+}
+
+fn map_desired_state_publication_error(error: DesiredStateError) -> DatabaseError {
+    match error {
+        DesiredStateError::Validation(error) => DatabaseError::Validation(error),
+        error => DatabaseError::DesiredState(error),
+    }
+}
+
+struct StoredDesiredRevision {
+    schema_version: i64,
+    node_id: String,
+    revision: i64,
+    artifact_json: String,
+    artifact_digest: String,
+    transcript_digest: String,
+    signature: String,
+    signing_key_id: String,
+    controller_instance_id: String,
+    created_at: i64,
+}
+
+fn desired_state_after(
+    connection: &Connection,
+    identity: &ControllerIdentity,
+    node_id: NodeId,
+    after_revision: i64,
+) -> Result<Option<SignedDesiredState>, DatabaseError> {
+    let network = load_network(connection)?;
+    let node_id_text = node_id.to_string();
+    let desired_revision = connection
+        .query_row(
+            "SELECT desired_revision FROM nodes
+             WHERE network_id = ?1 AND node_id = ?2 AND status IN ('pending', 'active')",
+            params![network.network_id, node_id_text],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeRevoked)?;
+    let Some(desired_revision) = desired_revision.filter(|value| *value > after_revision) else {
+        return Ok(None);
+    };
+    let stored = load_stored_desired_revision(
+        connection,
+        &network.network_id,
+        &node_id_text,
+        desired_revision,
+    )?
+    .ok_or(DatabaseError::StoredDesiredStateCorrupt)?;
+    verify_desired_revision(identity, &network, node_id, &stored).map(Some)
+}
+
+fn load_stored_desired_revision(
+    connection: &Connection,
+    network_id: &str,
+    node_id: &str,
+    revision: i64,
+) -> Result<Option<StoredDesiredRevision>, DatabaseError> {
+    connection
+        .query_row(
+            "SELECT c.schema_version, c.node_id, c.revision, c.artifact_json,
+                    c.artifact_sha256, c.transcript_sha256, c.signature,
+                    c.signing_key_id, c.controller_instance_id, c.created_at
+             FROM node_revision_targets AS t
+             JOIN config_revisions AS c
+               ON c.network_id = t.network_id AND c.revision = t.revision
+              AND c.node_id = t.node_id
+             WHERE t.network_id = ?1 AND t.node_id = ?2 AND t.revision = ?3",
+            params![network_id, node_id, revision],
+            |row| {
+                Ok(StoredDesiredRevision {
+                    schema_version: row.get(0)?,
+                    node_id: row.get(1)?,
+                    revision: row.get(2)?,
+                    artifact_json: row.get(3)?,
+                    artifact_digest: row.get(4)?,
+                    transcript_digest: row.get(5)?,
+                    signature: row.get(6)?,
+                    signing_key_id: row.get(7)?,
+                    controller_instance_id: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(DatabaseError::from)
+}
+
+fn verify_desired_revision(
+    identity: &ControllerIdentity,
+    network: &NetworkRecord,
+    node_id: NodeId,
+    stored: &StoredDesiredRevision,
+) -> Result<SignedDesiredState, DatabaseError> {
+    if stored.schema_version != 1
+        || stored.node_id != node_id.to_string()
+        || stored.controller_instance_id != network.controller_epoch
+    {
+        return Err(DatabaseError::StoredDesiredStateCorrupt);
+    }
+    let network_id = network
+        .network_id
+        .parse::<NetworkId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let revision =
+        Revision::new(stored.revision).map_err(|_| DatabaseError::StoredDesiredStateCorrupt)?;
+    let controller_instance_id = stored
+        .controller_instance_id
+        .parse::<ControllerInstanceId>()
+        .map_err(|_| DatabaseError::StoredDesiredStateCorrupt)?;
+    let signing_key_id = stored
+        .signing_key_id
+        .parse::<SigningKeyId>()
+        .map_err(|_| DatabaseError::StoredDesiredStateCorrupt)?;
+    verify_stored_desired_state(
+        identity,
+        &StoredDesiredState {
+            network_id,
+            node_id,
+            revision,
+            created_at: timestamp(stored.created_at)?,
+            controller_instance_id,
+            signing_key_id,
+            artifact_json: &stored.artifact_json,
+            artifact_digest: &stored.artifact_digest,
+            transcript_digest: &stored.transcript_digest,
+            signature: &stored.signature,
+        },
+    )
+    .map_err(DatabaseError::DesiredState)
+}
+
+fn record_revision_result(
+    connection: &mut Connection,
+    node_id: NodeId,
+    revision: Revision,
+    result: &RevisionResult,
+) -> Result<(), DatabaseError> {
+    result.validate(revision)?;
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    validate_result_target(&transaction, &network.network_id, node_id, revision)?;
+    let previous =
+        load_latest_revision_result(&transaction, &network.network_id, node_id, revision)?;
+    result
+        .validate_transition_from(previous.as_ref())
+        .map_err(|_| DatabaseError::RevisionResultConflict)?;
+    if previous.as_ref() == Some(result) {
+        transaction.commit()?;
+        return Ok(());
+    }
+    validate_result_dependencies(&transaction, &network.network_id, node_id, revision, result)?;
+    append_revision_result(
+        &transaction,
+        &network.network_id,
+        node_id,
+        revision,
+        result,
+        now,
+    )?;
+    update_revision_progress_cache(
+        &transaction,
+        &network.network_id,
+        node_id,
+        revision,
+        result,
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_result_target(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    revision: Revision,
+) -> Result<(), DatabaseError> {
+    let desired_revision = transaction
+        .query_row(
+            "SELECT desired_revision FROM nodes
+             WHERE network_id = ?1 AND node_id = ?2 AND status IN ('pending', 'active')",
+            params![network_id, node_id.to_string()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeRevoked)?;
+    if desired_revision.is_some_and(|target| revision.get() > target) {
+        return Err(DatabaseError::RevisionResultConflict);
+    }
+    let targeted = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM node_revision_targets
+            WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3
+         )",
+        params![network_id, node_id.to_string(), revision.get()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !targeted {
+        return Err(DatabaseError::RevisionTargetNotFound);
+    }
+    Ok(())
+}
+
+fn validate_result_dependencies(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    revision: Revision,
+    result: &RevisionResult,
+) -> Result<(), DatabaseError> {
+    if matches!(
+        result.state,
+        RevisionResultState::Applied | RevisionResultState::RolledBack
+    ) {
+        let validated = load_revision_result_state(
+            transaction,
+            network_id,
+            node_id,
+            revision,
+            RevisionResultState::Validated,
+        )?
+        .ok_or(DatabaseError::RevisionResultConflict)?;
+        if result.state == RevisionResultState::Applied
+            && validated.config_digest != result.config_digest
+        {
+            return Err(DatabaseError::RevisionResultConflict);
+        }
+    }
+    if result.state == RevisionResultState::RolledBack {
+        let rollback = result
+            .rollback_revision
+            .ok_or(DatabaseError::RevisionResultConflict)?;
+        let applied = load_revision_result_state(
+            transaction,
+            network_id,
+            node_id,
+            rollback,
+            RevisionResultState::Applied,
+        )?
+        .ok_or(DatabaseError::RevisionResultConflict)?;
+        if applied.config_digest != result.config_digest {
+            return Err(DatabaseError::RevisionResultConflict);
+        }
+    }
+    Ok(())
+}
+
+struct StoredRevisionResult {
+    state: String,
+    state_rank: i64,
+    result_json: String,
+    config_digest: Option<String>,
+    rollback_revision: Option<i64>,
+}
+
+fn load_latest_revision_result(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    revision: Revision,
+) -> Result<Option<RevisionResult>, DatabaseError> {
+    let row = transaction
+        .query_row(
+            "SELECT state, state_rank, result_json, config_digest, rollback_revision
+             FROM node_revision_results
+             WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3
+             ORDER BY state_rank DESC LIMIT 1",
+            params![network_id, node_id.to_string(), revision.get()],
+            stored_revision_result,
+        )
+        .optional()?;
+    row.as_ref()
+        .map(|row| parse_stored_revision_result(row, revision))
+        .transpose()
+}
+
+fn load_revision_result_state(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    revision: Revision,
+    state: RevisionResultState,
+) -> Result<Option<RevisionResult>, DatabaseError> {
+    let state = enum_wire(&state)?;
+    let row = transaction
+        .query_row(
+            "SELECT state, state_rank, result_json, config_digest, rollback_revision
+             FROM node_revision_results
+             WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3 AND state = ?4",
+            params![network_id, node_id.to_string(), revision.get(), state],
+            stored_revision_result,
+        )
+        .optional()?;
+    row.as_ref()
+        .map(|row| parse_stored_revision_result(row, revision))
+        .transpose()
+}
+
+fn stored_revision_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRevisionResult> {
+    Ok(StoredRevisionResult {
+        state: row.get(0)?,
+        state_rank: row.get(1)?,
+        result_json: row.get(2)?,
+        config_digest: row.get(3)?,
+        rollback_revision: row.get(4)?,
+    })
+}
+
+fn parse_stored_revision_result(
+    stored: &StoredRevisionResult,
+    revision: Revision,
+) -> Result<RevisionResult, DatabaseError> {
+    let result: RevisionResult = serde_json::from_str(&stored.result_json)
+        .map_err(|_| DatabaseError::StoredRevisionResultCorrupt)?;
+    result
+        .validate(revision)
+        .map_err(|_| DatabaseError::StoredRevisionResultCorrupt)?;
+    let config_digest = result
+        .config_digest
+        .as_ref()
+        .map(|digest| digest.as_str().to_owned());
+    if enum_wire(&result.state)? != stored.state
+        || revision_result_rank(result.state) != stored.state_rank
+        || config_digest != stored.config_digest
+        || result.rollback_revision.map(Revision::get) != stored.rollback_revision
+    {
+        return Err(DatabaseError::StoredRevisionResultCorrupt);
+    }
+    Ok(result)
+}
+
+fn append_revision_result(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    revision: Revision,
+    result: &RevisionResult,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "INSERT INTO node_revision_results(
+            network_id, node_id, revision, state, state_rank, result_json,
+            config_digest, rollback_revision, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            network_id,
+            node_id.to_string(),
+            revision.get(),
+            enum_wire(&result.state)?,
+            revision_result_rank(result.state),
+            serde_json::to_string(result)?,
+            result.config_digest.as_ref().map(Sha256Digest::as_str),
+            result.rollback_revision.map(Revision::get),
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_revision_progress_cache(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    revision: Revision,
+    result: &RevisionResult,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let revision = revision.get();
+    transaction.execute(
+        "UPDATE nodes
+         SET reported_desired_revision = max(COALESCE(reported_desired_revision, 0), ?1),
+             received_revision = max(COALESCE(received_revision, 0), ?1),
+             updated_at = ?2
+         WHERE network_id = ?3 AND node_id = ?4",
+        params![revision, now, network_id, node_id.to_string()],
+    )?;
+    if matches!(
+        result.state,
+        RevisionResultState::Validated
+            | RevisionResultState::Applied
+            | RevisionResultState::RolledBack
+    ) {
+        transaction.execute(
+            "UPDATE nodes
+             SET validated_revision = max(COALESCE(validated_revision, 0), ?1)
+             WHERE network_id = ?2 AND node_id = ?3",
+            params![revision, network_id, node_id.to_string()],
+        )?;
+    }
+    match result.state {
+        RevisionResultState::Applied => {
+            transaction.execute(
+                "UPDATE nodes
+                 SET applied_revision = max(COALESCE(applied_revision, 0), ?1)
+                 WHERE network_id = ?2 AND node_id = ?3",
+                params![revision, network_id, node_id.to_string()],
+            )?;
+        }
+        RevisionResultState::RolledBack => {
+            let rollback = result
+                .rollback_revision
+                .ok_or(DatabaseError::RevisionResultConflict)?;
+            transaction.execute(
+                "UPDATE nodes SET applied_revision = ?1
+                 WHERE network_id = ?2 AND node_id = ?3",
+                params![rollback.get(), network_id, node_id.to_string()],
+            )?;
+        }
+        RevisionResultState::Received
+        | RevisionResultState::Validated
+        | RevisionResultState::Rejected => {}
+    }
+    Ok(())
+}
+
+const fn revision_result_rank(state: RevisionResultState) -> i64 {
+    match state {
+        RevisionResultState::Received => 10,
+        RevisionResultState::Validated => 20,
+        RevisionResultState::Applied
+        | RevisionResultState::Rejected
+        | RevisionResultState::RolledBack => 30,
+    }
 }
 
 fn ensure_monotonic_cursor(
@@ -1819,6 +2610,8 @@ pub enum DatabaseError {
     NodeRequestNonceReplayed,
     #[error("the node reported progress older than its durable progress")]
     NodeProgressRegressed,
+    #[error("the node reported progress not supported by the revision journal")]
+    NodeProgressConflict,
     #[error("the node request signature is invalid")]
     InvalidNodeRequestSignature,
     #[error("the node was not found")]
@@ -1828,6 +2621,20 @@ pub enum DatabaseError {
         action: &'static str,
         current_status: String,
     },
+    #[error("cannot publish desired state for a node in status {current_status}")]
+    DesiredStatePublicationConflict { current_status: String },
+    #[error("the revision is not targeted to this node")]
+    RevisionTargetNotFound,
+    #[error("the revision result conflicts with its durable result journal")]
+    RevisionResultConflict,
+    #[error("the stored desired-state artifact is corrupt")]
+    StoredDesiredStateCorrupt,
+    #[error("the stored revision result is corrupt")]
+    StoredRevisionResultCorrupt,
+    #[error("the network revision sequence is exhausted")]
+    RevisionOverflow,
+    #[error(transparent)]
+    DesiredState(#[from] DesiredStateError),
     #[error("the controller identity no longer matches the invitation")]
     ControllerIdentityMismatch,
     #[error("a stored protocol value is invalid")]
@@ -1852,11 +2659,80 @@ mod tests {
     use super::{
         lock_path, migration_checksum, Database, DatabaseError, MIGRATIONS, SCHEMA_VERSION,
     };
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection, TransactionBehavior};
     use tempfile::TempDir;
+
+    type OptionalRevisionProgress = (
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
 
     fn database_path(temp: &TempDir) -> std::path::PathBuf {
         temp.path().join("control.sqlite3")
+    }
+
+    fn create_legacy_v3_database(path: &std::path::Path) -> String {
+        let mut connection = Connection::open(path).unwrap();
+        super::configure_connection(&connection).unwrap();
+        super::validate_application_id(&connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    checksum TEXT NOT NULL,
+                    applied_at INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for migration in MIGRATIONS.iter().take(3) {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Exclusive)
+                .unwrap();
+            transaction.execute_batch(migration.sql).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO schema_migrations(version, name, checksum, applied_at)
+                     VALUES (?1, ?2, ?3, 1)",
+                    params![
+                        migration.version,
+                        migration.name,
+                        migration_checksum(migration)
+                    ],
+                )
+                .unwrap();
+            transaction
+                .pragma_update(None, "user_version", migration.version)
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        super::bootstrap_network(&mut connection, "Friends").unwrap();
+        let network_id: String = connection
+            .query_row("SELECT network_id FROM networks", [], |row| row.get(0))
+            .unwrap();
+        let node_id = uuid::Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO nodes(
+                    node_id, network_id, display_name, status, agent_version, platform,
+                    capabilities_json, identity_public_key, encryption_public_key,
+                    consent_policy_version, consent_host_owner, consent_exit_ip,
+                    consent_accepted_at, created_at, updated_at, xray_version,
+                    runtime_state, provider_paused, last_seen_at, desired_revision,
+                    received_revision, validated_revision, applied_revision, telemetry_cursor
+                 ) VALUES (
+                    ?1, ?2, 'Legacy node', 'active', '0.1.0', 'macos-arm64',
+                    '[\"xray\"]', 'legacy-identity', 'legacy-encryption',
+                    'legacy-policy', 1, 1, 1, 1, 1, 'legacy-xray',
+                    'serving', 0, 1, 7, 7, 7, 7, 9
+                 )",
+                params![node_id, network_id],
+            )
+            .unwrap();
+        node_id
     }
 
     #[test]
@@ -1921,6 +2797,64 @@ mod tests {
             assert_eq!(stored.0, migration.name);
             assert_eq!(stored.1, migration_checksum(migration));
         }
+    }
+
+    #[test]
+    fn v3_upgrade_discards_untrusted_heartbeat_progress_and_builds_revision_journal() {
+        let temp = TempDir::new().unwrap();
+        let path = database_path(&temp);
+        let node_id = create_legacy_v3_database(&path);
+
+        let database = Database::open(&path, "Friends").unwrap();
+        let guard = database.inner.lock().unwrap();
+        let progress: OptionalRevisionProgress = guard
+            .connection
+            .query_row(
+                "SELECT desired_revision, reported_desired_revision, received_revision,
+                        validated_revision, applied_revision
+                 FROM nodes WHERE node_id = ?1",
+                [node_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(progress, (None, None, None, None, None));
+        let schema: (i64, i64, i64) = guard
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT user_version FROM pragma_user_version),
+                    (SELECT COUNT(*) FROM schema_migrations),
+                    (SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'table' AND name IN (
+                        'config_revisions', 'node_revision_targets', 'node_revision_results'
+                     ))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(schema, (SCHEMA_VERSION, 4, 3));
+        let immutable_triggers: i64 = guard
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'trigger' AND name IN (
+                    'config_revisions_no_update', 'config_revisions_no_delete',
+                    'node_revision_targets_no_update', 'node_revision_targets_no_delete',
+                    'node_revision_results_no_update', 'node_revision_results_no_delete'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(immutable_triggers, 6);
     }
 
     #[test]

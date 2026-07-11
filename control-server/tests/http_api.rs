@@ -2,17 +2,23 @@ use axum::body::{Body, Bytes};
 use axum::http::{header, Request, StatusCode};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use control_protocol::crypto::{Ed25519PublicKey, Ed25519Signature, Nonce, X25519PublicKey};
+use control_protocol::crypto::{
+    Ed25519PublicKey, Ed25519Signature, Nonce, Sha256Digest, X25519PublicKey,
+};
+use control_protocol::desired::verify_desired_state_signature;
 use control_protocol::enrollment::{
     enrollment_request_transcript, enrollment_response_transcript, EnrollmentInvitation,
 };
+use control_protocol::error::ErrorCode;
 use control_protocol::id::{
-    ControllerInstanceId, NodeId, NodeKeyId, Revision, SequenceNumber, Timestamp,
+    ControllerInstanceId, CredentialId, NodeId, NodeKeyId, Revision, SequenceNumber, Timestamp,
+    UserId,
 };
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointMode, EndpointStatus,
     EnrollNodeRequest, EnrollNodeResponse, NodeCapability, NodeEndpointStatus, NodeHeartbeat,
-    NodeRuntimeState, ProviderConsent, RevisionProgress,
+    NodeRuntimeState, ProviderConsent, RevisionProgress, RevisionResult, RevisionResultState,
+    SignedDesiredState,
 };
 use control_protocol::request_auth::NodeRequestSigningInput;
 use control_server::{build_router, AppState, Database, ServiceConfig};
@@ -311,16 +317,15 @@ fn nonce(byte: u8) -> Nonce {
 }
 
 fn heartbeat() -> NodeHeartbeat {
-    let revision = Revision::new(4).unwrap();
     NodeHeartbeat {
         agent_version: "0.2.0".to_string(),
         xray_version: Some("26.7.11".to_string()),
         state: NodeRuntimeState::Serving,
         revisions: RevisionProgress {
-            desired_revision: Some(revision),
-            received_revision: Some(revision),
-            validated_revision: Some(revision),
-            applied_revision: Some(revision),
+            desired_revision: None,
+            received_revision: None,
+            validated_revision: None,
+            applied_revision: None,
         },
         provider_paused: false,
         endpoints: vec![NodeEndpointStatus {
@@ -331,6 +336,239 @@ fn heartbeat() -> NodeHeartbeat {
         }],
         telemetry_cursor: SequenceNumber::new(9).unwrap(),
     }
+}
+
+fn desired_state_body() -> Value {
+    serde_json::json!({
+        "minAgentVersion": "0.2.0",
+        "users": [
+            {
+                "userId": UserId::new(),
+                "credentialId": CredentialId::new(),
+                "vlessUuid": Uuid::new_v4(),
+                "enabled": true
+            },
+            {
+                "userId": UserId::new(),
+                "credentialId": CredentialId::new(),
+                "vlessUuid": Uuid::new_v4(),
+                "enabled": false
+            }
+        ],
+        "xray": {
+            "listenPort": 443,
+            "serverNames": ["z.example.test", "a.example.test"],
+            "target": "a.example.test:443"
+        }
+    })
+}
+
+async fn publish_desired(app: &TestApp, node_id: NodeId, body: &Value) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/admin/nodes/{node_id}/desired-state"))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn approve_and_publish(app: &TestApp, node: &SignedNode, body: &Value) -> SignedDesiredState {
+    assert_eq!(
+        admin_node_action(app, node.node_id, "approve")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let response = publish_desired(app, node.node_id, body).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    serde_json::from_value(json(response).await).unwrap()
+}
+
+async fn fetch_desired(
+    app: &TestApp,
+    node: &SignedNode,
+    after_revision: i64,
+    nonce_byte: u8,
+) -> axum::response::Response {
+    let path = format!(
+        "/v1/nodes/{}/desired?afterRevision={after_revision}",
+        node.node_id
+    );
+    let request = signed_node_request(
+        node,
+        "GET",
+        &path,
+        Vec::new(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &nonce(nonce_byte),
+    );
+    app.router.clone().oneshot(request).await.unwrap()
+}
+
+async fn report_result(
+    app: &TestApp,
+    node: &SignedNode,
+    revision: Revision,
+    result: &RevisionResult,
+    nonce_byte: u8,
+) -> axum::response::Response {
+    let path = format!(
+        "/v1/nodes/{}/revisions/{}/result",
+        node.node_id,
+        revision.get()
+    );
+    let body = serde_json::to_vec(result).unwrap();
+    let request = signed_node_request(
+        node,
+        "PUT",
+        &path,
+        body,
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &nonce(nonce_byte),
+    );
+    app.router.clone().oneshot(request).await.unwrap()
+}
+
+async fn post_heartbeat(
+    app: &TestApp,
+    node: &SignedNode,
+    heartbeat: &NodeHeartbeat,
+    nonce_byte: u8,
+) -> axum::response::Response {
+    let path = format!("/v1/nodes/{}/heartbeat", node.node_id);
+    let request = signed_node_request(
+        node,
+        "POST",
+        &path,
+        serde_json::to_vec(heartbeat).unwrap(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &nonce(nonce_byte),
+    );
+    app.router.clone().oneshot(request).await.unwrap()
+}
+
+fn assert_revision_journal_progress(app: &TestApp, node_id: NodeId) {
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let progress: (i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT desired_revision, reported_desired_revision, received_revision,
+                    validated_revision, applied_revision
+             FROM nodes WHERE node_id = ?1",
+            [node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(progress, (1, 1, 1, 1, 1));
+    let journal_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM node_revision_results WHERE node_id = ?1",
+            [node_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(journal_count, 3);
+    assert!(connection
+        .execute(
+            "UPDATE node_revision_results SET created_at = created_at + 1",
+            [],
+        )
+        .is_err());
+    assert!(connection
+        .execute("DELETE FROM node_revision_results", [])
+        .is_err());
+}
+
+fn assert_cached_progress(
+    app: &TestApp,
+    node_id: NodeId,
+    expected: (i64, i64, i64, Option<i64>, Option<i64>),
+) {
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let progress = connection
+        .query_row(
+            "SELECT desired_revision, reported_desired_revision, received_revision,
+                    validated_revision, applied_revision
+             FROM nodes WHERE node_id = ?1",
+            [node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(progress, expected);
+}
+
+fn revision_result(
+    state: RevisionResultState,
+    digest_byte: u8,
+    rollback_revision: Option<Revision>,
+) -> RevisionResult {
+    let has_digest = matches!(
+        state,
+        RevisionResultState::Validated
+            | RevisionResultState::Applied
+            | RevisionResultState::RolledBack
+    );
+    let has_error = matches!(
+        state,
+        RevisionResultState::Rejected | RevisionResultState::RolledBack
+    );
+    RevisionResult {
+        state,
+        config_digest: has_digest.then(|| Sha256Digest::from_bytes([digest_byte; 32])),
+        started_at: "2026-07-11T20:00:01Z".parse().unwrap(),
+        completed_at: "2026-07-11T20:00:02Z".parse().unwrap(),
+        error_code: has_error.then_some(ErrorCode::ValidationFailed),
+        rollback_revision,
+    }
+}
+
+async fn report_applied_revision(
+    app: &TestApp,
+    node: &SignedNode,
+    revision: Revision,
+    digest_byte: u8,
+    nonce_bytes: [u8; 3],
+) {
+    for (state, nonce_byte) in [
+        (RevisionResultState::Received, nonce_bytes[0]),
+        (RevisionResultState::Validated, nonce_bytes[1]),
+        (RevisionResultState::Applied, nonce_bytes[2]),
+    ] {
+        let result = revision_result(state, digest_byte, None);
+        assert_eq!(
+            report_result(app, node, revision, &result, nonce_byte)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
+async fn approve_node(app: &TestApp, node_id: NodeId) {
+    assert_eq!(
+        admin_node_action(app, node_id, "approve").await.status(),
+        StatusCode::NO_CONTENT
+    );
 }
 
 #[tokio::test]
@@ -452,10 +690,10 @@ async fn admin_node_list_is_complete_and_redacts_key_material() {
     assert!(summary["lastSeenAt"].is_string());
     assert_eq!(summary["runtimeState"], "serving");
     assert_eq!(summary["providerPaused"], false);
-    assert_eq!(summary["revisions"]["desiredRevision"], 4);
-    assert_eq!(summary["revisions"]["receivedRevision"], 4);
-    assert_eq!(summary["revisions"]["validatedRevision"], 4);
-    assert_eq!(summary["revisions"]["appliedRevision"], 4);
+    assert!(summary["revisions"]["desiredRevision"].is_null());
+    assert!(summary["revisions"]["receivedRevision"].is_null());
+    assert!(summary["revisions"]["validatedRevision"].is_null());
+    assert!(summary["revisions"]["appliedRevision"].is_null());
     assert_eq!(summary["telemetryCursor"], 9);
     assert!(summary["createdAt"].is_string());
     assert!(summary["updatedAt"].is_string());
@@ -900,7 +1138,7 @@ async fn authenticated_heartbeat_persists_state_and_replaces_endpoints() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
-    let stored: (String, String, String, i64, i64, i64) = connection
+    let stored: (String, String, String, Option<i64>, i64, i64) = connection
         .query_row(
             "SELECT status, agent_version, xray_version, applied_revision,
                     telemetry_cursor, provider_paused
@@ -920,7 +1158,14 @@ async fn authenticated_heartbeat_persists_state_and_replaces_endpoints() {
         .unwrap();
     assert_eq!(
         stored,
-        ("pending".into(), "0.2.0".into(), "26.7.11".into(), 4, 9, 0)
+        (
+            "pending".into(),
+            "0.2.0".into(),
+            "26.7.11".into(),
+            None,
+            9,
+            0
+        )
     );
     let endpoints: i64 = connection
         .query_row(
@@ -989,14 +1234,7 @@ async fn heartbeat_cannot_approve_a_node_or_regress_durable_progress() {
         StatusCode::NO_CONTENT
     );
 
-    let revision = Revision::new(3).unwrap();
     let mut regressed = heartbeat();
-    regressed.revisions = RevisionProgress {
-        desired_revision: Some(revision),
-        received_revision: Some(revision),
-        validated_revision: Some(revision),
-        applied_revision: Some(revision),
-    };
     regressed.telemetry_cursor = SequenceNumber::new(8).unwrap();
     let request = signed_node_request(
         &node,
@@ -1011,14 +1249,14 @@ async fn heartbeat_cannot_approve_a_node_or_regress_durable_progress() {
     assert_eq!(json(response).await["error"]["code"], "state_stale");
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
-    let stored: (String, i64, i64) = connection
+    let stored: (String, Option<i64>, i64) = connection
         .query_row(
             "SELECT status, applied_revision, telemetry_cursor FROM nodes WHERE node_id = ?1",
             [node.node_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(stored, ("pending".to_string(), 4, 9));
+    assert_eq!(stored, ("pending".to_string(), None, 9));
 }
 
 #[tokio::test]
@@ -1266,4 +1504,515 @@ async fn expired_nonces_are_pruned_by_the_next_authenticated_request() {
         )
         .unwrap();
     assert_eq!(stale_count, 0);
+}
+
+#[tokio::test]
+async fn desired_publication_is_signed_canonical_monotonic_and_immutable() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let body = desired_state_body();
+
+    let pending = publish_desired(&app, node.node_id, &body).await;
+    assert_eq!(pending.status(), StatusCode::CONFLICT);
+    assert_eq!(json(pending).await["error"]["code"], "state_conflict");
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let before: (i64, i64) = connection
+        .query_row(
+            "SELECT last_revision, (SELECT COUNT(*) FROM config_revisions) FROM networks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(before, (0, 0));
+    drop(connection);
+
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "approve")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let first_response = publish_desired(&app, node.node_id, &body).await;
+    assert_eq!(first_response.status(), StatusCode::CREATED);
+    let first: SignedDesiredState = serde_json::from_value(json(first_response).await).unwrap();
+    verify_desired_state_signature(
+        &first.document,
+        &first.signature,
+        &app.controller_public_key,
+    )
+    .unwrap();
+    assert_eq!(first.document.schema_version, 1);
+    assert_eq!(first.document.node_id, node.node_id);
+    assert_eq!(first.document.revision.get(), 1);
+    assert_eq!(
+        first.document.xray.server_names,
+        vec!["a.example.test".to_string(), "z.example.test".to_string()]
+    );
+    assert!(first
+        .document
+        .users
+        .windows(2)
+        .all(|pair| pair[0].user_id <= pair[1].user_id));
+
+    let second_response = publish_desired(&app, node.node_id, &body).await;
+    assert_eq!(second_response.status(), StatusCode::CREATED);
+    let second: SignedDesiredState = serde_json::from_value(json(second_response).await).unwrap();
+    assert_eq!(second.document.revision.get(), 2);
+    assert_eq!(
+        second.document.signing_key_id,
+        first.document.signing_key_id
+    );
+    verify_desired_state_signature(
+        &second.document,
+        &second.signature,
+        &app.controller_public_key,
+    )
+    .unwrap();
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let revisions: Vec<(i64, Option<i64>)> = connection
+        .prepare("SELECT revision, parent_revision FROM config_revisions ORDER BY revision")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(revisions, vec![(1, None), (2, Some(1))]);
+    let (last_revision, desired_revision): (i64, i64) = connection
+        .query_row(
+            "SELECT nw.last_revision, n.desired_revision
+             FROM networks AS nw JOIN nodes AS n ON n.network_id = nw.network_id
+             WHERE n.node_id = ?1",
+            [node.node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((last_revision, desired_revision), (2, 2));
+    assert!(connection
+        .execute(
+            "UPDATE config_revisions SET created_at = created_at + 1 WHERE revision = 1",
+            [],
+        )
+        .is_err());
+    assert!(connection
+        .execute("DELETE FROM node_revision_targets WHERE revision = 1", [],)
+        .is_err());
+    let audit: String = connection
+        .query_row(
+            "SELECT group_concat(details_json, '') FROM audit_events
+             WHERE event_type LIKE 'node.desired-state-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for user in &first.document.users {
+        assert!(!audit.contains(user.vless_uuid.expose_secret()));
+    }
+}
+
+#[tokio::test]
+async fn desired_publication_paths_require_known_canonical_node_ids() {
+    let app = TestApp::new();
+    let body = desired_state_body();
+    for node_id in [
+        "not-a-uuid".to_string(),
+        "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA".to_string(),
+        NodeId::new().to_string(),
+    ] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::post(format!("/v1/admin/nodes/{node_id}/desired-state"))
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json(response).await["error"]["code"], "not_found");
+    }
+}
+
+#[tokio::test]
+async fn desired_fetch_returns_verified_latest_state_or_strict_empty_204() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let first = approve_and_publish(&app, &node, &desired_state_body()).await;
+
+    let response = fetch_desired(&app, &node, 0, 70).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched: SignedDesiredState = serde_json::from_value(json(response).await).unwrap();
+    assert_eq!(fetched, first);
+
+    let response = fetch_desired(&app, &node, 1, 71).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .is_empty());
+
+    let second_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
+    let second: SignedDesiredState = serde_json::from_value(json(second_response).await).unwrap();
+    let response = fetch_desired(&app, &node, 1, 72).await;
+    let fetched: SignedDesiredState = serde_json::from_value(json(response).await).unwrap();
+    assert_eq!(fetched, second);
+
+    for (query, nonce_byte) in [
+        ("afterRevision=01", 73),
+        ("afterRevision=1&extra=true", 74),
+        ("afterRevision=99999999999999999999", 75),
+    ] {
+        let path = format!("/v1/nodes/{}/desired?{query}", node.node_id);
+        let request = signed_node_request(
+            &node,
+            "GET",
+            &path,
+            Vec::new(),
+            Timestamp::from_datetime(OffsetDateTime::now_utc()),
+            &nonce(nonce_byte),
+        );
+        let response = app.router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json(response).await["error"]["code"], "validation_failed");
+    }
+
+    let wrong_path = format!("/v1/nodes/{}/desired?afterRevision=0", NodeId::new());
+    let request = signed_node_request(
+        &node,
+        "GET",
+        &wrong_path,
+        Vec::new(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &nonce(76),
+    );
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json(response).await["error"]["code"],
+        "authentication_failed"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_desired_artifacts_fail_closed() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    approve_and_publish(&app, &node, &desired_state_body()).await;
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER config_revisions_no_update;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE config_revisions
+             SET artifact_json = replace(artifact_json, '0.2.0', '9.9.9')
+             WHERE revision = 1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let response = fetch_desired(&app, &node, 0, 77).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(json(response).await["error"]["code"], "internal");
+}
+
+#[tokio::test]
+async fn revision_results_are_monotonic_idempotent_and_digest_bound() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let desired = approve_and_publish(&app, &node, &desired_state_body()).await;
+    let revision = desired.document.revision;
+    let received = revision_result(RevisionResultState::Received, 0, None);
+    assert_eq!(
+        report_result(&app, &node, revision, &received, 80)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        report_result(&app, &node, revision, &received, 81)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let mut conflicting_received = received.clone();
+    conflicting_received.completed_at = "2026-07-11T20:00:03Z".parse().unwrap();
+    let response = report_result(&app, &node, revision, &conflicting_received, 82).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(response).await["error"]["code"],
+        "invalid_state_transition"
+    );
+
+    let validated = revision_result(RevisionResultState::Validated, 7, None);
+    assert_eq!(
+        report_result(&app, &node, revision, &validated, 83)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let wrong_digest = revision_result(RevisionResultState::Applied, 8, None);
+    let response = report_result(&app, &node, revision, &wrong_digest, 84).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(response).await["error"]["code"],
+        "invalid_state_transition"
+    );
+    let applied = revision_result(RevisionResultState::Applied, 7, None);
+    assert_eq!(
+        report_result(&app, &node, revision, &applied, 85)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let response = report_result(&app, &node, revision, &validated, 86).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(response).await["error"]["code"],
+        "invalid_state_transition"
+    );
+
+    let beyond_target = Revision::new(2).unwrap();
+    let response = report_result(&app, &node, beyond_target, &received, 87).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    assert_revision_journal_progress(&app, node.node_id);
+
+    let path = format!("/v1/nodes/{}/revisions/01/result", node.node_id);
+    let request = signed_node_request(
+        &node,
+        "PUT",
+        &path,
+        serde_json::to_vec(&received).unwrap(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &nonce(88),
+    );
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json(response).await["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn rollback_requires_validation_and_an_earlier_target_for_the_same_node() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let other = enroll_signed_node(&app).await;
+    approve_node(&app, node.node_id).await;
+    approve_node(&app, other.node_id).await;
+    let first_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
+    let first: SignedDesiredState = serde_json::from_value(json(first_response).await).unwrap();
+    let other_response = publish_desired(&app, other.node_id, &desired_state_body()).await;
+    let other_revision: SignedDesiredState =
+        serde_json::from_value(json(other_response).await).unwrap();
+    let third_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
+    let third: SignedDesiredState = serde_json::from_value(json(third_response).await).unwrap();
+    assert_eq!(
+        (
+            first.document.revision.get(),
+            other_revision.document.revision.get(),
+            third.document.revision.get()
+        ),
+        (1, 2, 3)
+    );
+
+    report_applied_revision(&app, &node, first.document.revision, 7, [96, 97, 98]).await;
+
+    let validated = revision_result(RevisionResultState::Validated, 9, None);
+    assert_eq!(
+        report_result(&app, &node, third.document.revision, &validated, 90)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let wrong_target = revision_result(
+        RevisionResultState::RolledBack,
+        7,
+        Some(other_revision.document.revision),
+    );
+    let response = report_result(&app, &node, third.document.revision, &wrong_target, 91).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let valid_rollback = revision_result(
+        RevisionResultState::RolledBack,
+        7,
+        Some(first.document.revision),
+    );
+    assert_eq!(
+        report_result(&app, &node, third.document.revision, &valid_rollback, 92,)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_cached_progress(&app, node.node_id, (3, 3, 3, Some(3), Some(1)));
+
+    let mut rolled_back_heartbeat = heartbeat();
+    rolled_back_heartbeat.revisions = RevisionProgress {
+        desired_revision: Some(third.document.revision),
+        received_revision: Some(third.document.revision),
+        validated_revision: Some(third.document.revision),
+        applied_revision: Some(first.document.revision),
+    };
+    assert_eq!(
+        post_heartbeat(&app, &node, &rolled_back_heartbeat, 99)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let non_target = revision_result(RevisionResultState::Received, 0, None);
+    let response = report_result(
+        &app,
+        &node,
+        other_revision.document.revision,
+        &non_target,
+        93,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json(response).await["error"]["code"], "not_found");
+
+    let fourth_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
+    let fourth: SignedDesiredState = serde_json::from_value(json(fourth_response).await).unwrap();
+    let received = revision_result(RevisionResultState::Received, 0, None);
+    assert_eq!(
+        report_result(&app, &node, fourth.document.revision, &received, 94)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let rollback_without_validation = revision_result(
+        RevisionResultState::RolledBack,
+        7,
+        Some(third.document.revision),
+    );
+    let response = report_result(
+        &app,
+        &node,
+        fourth.document.revision,
+        &rollback_without_validation,
+        95,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let first = approve_and_publish(&app, &node, &desired_state_body()).await;
+    assert_eq!(
+        post_heartbeat(&app, &node, &heartbeat(), 100)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let mut forged = heartbeat();
+    forged.revisions = RevisionProgress {
+        desired_revision: Some(first.document.revision),
+        received_revision: Some(first.document.revision),
+        validated_revision: None,
+        applied_revision: None,
+    };
+    let response = post_heartbeat(&app, &node, &forged, 101).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json(response).await["error"]["code"], "state_conflict");
+
+    let mut fetched_only = heartbeat();
+    fetched_only.revisions.desired_revision = Some(first.document.revision);
+    assert_eq!(
+        post_heartbeat(&app, &node, &fetched_only, 102)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let received = revision_result(RevisionResultState::Received, 0, None);
+    assert_eq!(
+        report_result(&app, &node, first.document.revision, &received, 103)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let second_response = publish_desired(&app, node.node_id, &desired_state_body()).await;
+    let second: SignedDesiredState = serde_json::from_value(json(second_response).await).unwrap();
+    let mut old_progress = heartbeat();
+    old_progress.revisions = RevisionProgress {
+        desired_revision: Some(first.document.revision),
+        received_revision: Some(first.document.revision),
+        validated_revision: None,
+        applied_revision: None,
+    };
+    assert_eq!(
+        post_heartbeat(&app, &node, &old_progress, 104)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let mut forged_second = old_progress;
+    forged_second.revisions.desired_revision = Some(second.document.revision);
+    forged_second.revisions.received_revision = Some(second.document.revision);
+    let response = post_heartbeat(&app, &node, &forged_second, 105).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_cached_progress(&app, node.node_id, (2, 1, 1, None, None));
+}
+
+#[tokio::test]
+async fn desired_state_and_result_journal_survive_restart() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let desired = approve_and_publish(&app, &node, &desired_state_body()).await;
+    let received = revision_result(RevisionResultState::Received, 0, None);
+    assert_eq!(
+        report_result(&app, &node, desired.document.revision, &received, 110)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let expected_public_key = app.controller_public_key.clone();
+    let app = app.restart();
+    assert_eq!(app.controller_public_key, expected_public_key);
+    let response = fetch_desired(&app, &node, 0, 111).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fetched: SignedDesiredState = serde_json::from_value(json(response).await).unwrap();
+    assert_eq!(fetched, desired);
+    assert_eq!(
+        report_result(&app, &node, desired.document.revision, &received, 112)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT user_version FROM pragma_user_version),
+                (SELECT COUNT(*) FROM schema_migrations),
+                (SELECT COUNT(*) FROM config_revisions),
+                (SELECT COUNT(*) FROM node_revision_results),
+                (SELECT received_revision FROM nodes WHERE node_id = ?1)",
+            [node.node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(durable, (4, 4, 1, 1, 1));
 }

@@ -182,6 +182,31 @@ does not reactivate a disabled node; that requires a future explicit credential-
 
 ## 5. Desired State API
 
+### Publish
+
+`POST /v1/admin/nodes/{nodeId}/desired-state`
+
+```json
+{
+  "minAgentVersion": "0.1.0",
+  "users": [
+    {"userId": "uuid", "credentialId": "uuid", "vlessUuid": "secret", "enabled": true}
+  ],
+  "xray": {
+    "listenPort": 443,
+    "serverNames": ["www.microsoft.com"],
+    "target": "www.microsoft.com:443"
+  }
+}
+```
+
+Only an `active` node can receive a revision. Control Service canonicalizes ordered fields,
+allocates the next network revision, signs the exact node document, stores its artifact and
+digests immutably, updates that node's authoritative desired revision, and writes a secret-free
+audit event in one transaction. The initial low-level endpoint returns `201 Created`; later account
+and assignment mutations compile the same document rather than exposing raw desired-state editing
+as the primary operator workflow.
+
 ### Fetch
 
 `GET /v1/nodes/{nodeId}/desired?afterRevision=11`
@@ -244,7 +269,9 @@ the immutable envelope plus envelope/transcript digests, advances its durable cu
 Valid states are `received`, `validated`, `applied`, `rejected`, and `rolledBack`. State transitions
 are monotonic for a `(nodeId, revision)` result. Repeating the same result is idempotent. If a
 result request fails after local receipt, Node Host retains it and retries it before sending a
-heartbeat that advertises the new revision.
+heartbeat that advertises the new revision. `applied` must use the digest reported by `validated`.
+`rolledBack` requires the failed revision to have reached `validated` and the restored earlier
+revision to have reached `applied` with the same restored-config digest.
 
 ## 6. Member And Bundle API
 

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+mod desired;
 pub mod error;
 pub mod http;
 pub mod identity;

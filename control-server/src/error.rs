@@ -169,6 +169,28 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn state_conflict(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::StateConflict,
+            "The reported state conflicts with authoritative server state.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn invalid_state_transition(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::InvalidStateTransition,
+            "The requested state transition is not monotonic.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
     pub fn conflict(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::CONFLICT,

@@ -3,6 +3,7 @@ use crate::db::{
     AuthenticatedNode, Database, DatabaseError, NetworkRecord, NodeLifecycleAction,
     NodeSummaryRecord, SCHEMA_VERSION,
 };
+use crate::desired::DesiredStateDraft;
 use crate::error::{ApiError, REQUEST_ID_HEADER};
 use crate::protocol::RequestId;
 use axum::body::Body;
@@ -10,12 +11,12 @@ use axum::extract::{Extension, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use control_protocol::id::NodeId;
+use control_protocol::id::{NodeId, Revision};
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
-    EnrollNodeResponse, NodeCapability, NodeHeartbeat,
+    EnrollNodeResponse, NodeCapability, NodeHeartbeat, RevisionResult, SignedDesiredState,
 };
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
 use http_body_util::BodyExt as _;
@@ -63,10 +64,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/admin/nodes/{node_id}/approve", post(approve_node))
         .route("/v1/admin/nodes/{node_id}/disable", post(disable_node))
         .route("/v1/admin/nodes/{node_id}/revoke", post(revoke_node))
+        .route(
+            "/v1/admin/nodes/{node_id}/desired-state",
+            post(publish_desired_state),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let authenticated_node_routes = Router::new()
         .route("/v1/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route("/v1/nodes/{node_id}/desired", get(fetch_desired_state))
+        .route(
+            "/v1/nodes/{node_id}/revisions/{revision}/result",
+            put(report_revision_result),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authenticate_node,
@@ -165,25 +174,59 @@ async fn node_heartbeat(
 }
 
 async fn fetch_desired_state(
+    State(state): State<AppState>,
     Path(path_node_id): Path<String>,
     Extension(request_id): Extension<RequestId>,
     Extension(authenticated): Extension<AuthenticatedNode>,
     uri: Uri,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     if path_node_id != authenticated.node_id.to_string() {
         return Err(ApiError::authentication_failed(request_id));
     }
-    parse_after_revision(uri.query()).ok_or_else(|| ApiError::validation_failed(request_id))?;
-    Ok(StatusCode::NO_CONTENT)
+    let after_revision =
+        parse_after_revision(uri.query()).ok_or_else(|| ApiError::validation_failed(request_id))?;
+    let desired = state
+        .database
+        .desired_state_after(authenticated.node_id, after_revision)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(match desired {
+        Some(desired) => Json(desired).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
 }
 
 fn parse_after_revision(query: Option<&str>) -> Option<i64> {
     let value = query?.strip_prefix("afterRevision=")?;
-    if value.is_empty() || value.contains('&') {
+    if value.is_empty() || value.len() > 19 || value.contains('&') {
         return None;
     }
     let revision = value.parse::<i64>().ok()?;
     (revision >= 0 && revision.to_string() == value).then_some(revision)
+}
+
+async fn report_revision_result(
+    State(state): State<AppState>,
+    Path((path_node_id, path_revision)): Path<(String, String)>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(authenticated): Extension<AuthenticatedNode>,
+    Extension(body): Extension<SignedBody>,
+) -> Result<StatusCode, ApiError> {
+    if path_node_id != authenticated.node_id.to_string() {
+        return Err(ApiError::authentication_failed(request_id));
+    }
+    let revision = parse_revision(&path_revision).ok_or_else(|| ApiError::not_found(request_id))?;
+    let result: RevisionResult =
+        serde_json::from_slice(&body.0).map_err(|_| ApiError::validation_failed(request_id))?;
+    result
+        .validate(revision)
+        .map_err(|_| ApiError::validation_failed(request_id))?;
+    state
+        .database
+        .record_revision_result(authenticated.node_id, revision, result)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_node_invitation(
@@ -264,7 +307,14 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::NodeRequestClockSkew => ApiError::clock_skew(request_id),
         DatabaseError::NodeRequestNonceReplayed => ApiError::nonce_replayed(request_id),
         DatabaseError::NodeProgressRegressed => ApiError::state_stale(request_id),
-        DatabaseError::NodeNotFound => ApiError::not_found(request_id),
+        DatabaseError::NodeProgressConflict
+        | DatabaseError::DesiredStatePublicationConflict { .. } => {
+            ApiError::state_conflict(request_id)
+        }
+        DatabaseError::NodeNotFound | DatabaseError::RevisionTargetNotFound => {
+            ApiError::not_found(request_id)
+        }
+        DatabaseError::RevisionResultConflict => ApiError::invalid_state_transition(request_id),
         DatabaseError::NodeLifecycleConflict { .. } => ApiError::conflict(request_id),
         other => {
             tracing::error!(request_id = %request_id, error = %other, "database request failed");
@@ -433,6 +483,22 @@ async fn get_nodes(
     Ok(Json(NodeListResponse { nodes }))
 }
 
+async fn publish_desired_state(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(StatusCode, Json<SignedDesiredState>), ApiError> {
+    let node_id = parse_node_id(&path_node_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    let draft: DesiredStateDraft = parse_bounded_json(request, request_id).await?;
+    let desired = state
+        .database
+        .publish_desired_state(node_id, draft)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok((StatusCode::CREATED, Json(desired)))
+}
+
 async fn approve_node(
     State(state): State<AppState>,
     Path(path_node_id): Path<String>,
@@ -495,6 +561,16 @@ fn parse_node_id(value: &str) -> Option<NodeId> {
         return None;
     }
     value.parse().ok()
+}
+
+fn parse_revision(value: &str) -> Option<Revision> {
+    if value.is_empty() || value.len() > 19 {
+        return None;
+    }
+    let parsed = value.parse::<i64>().ok()?;
+    (parsed.to_string() == value)
+        .then(|| Revision::new(parsed).ok())
+        .flatten()
 }
 
 fn format_timestamp(value: i64) -> Result<String, time::error::ComponentRange> {
