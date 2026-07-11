@@ -1,3 +1,4 @@
+mod config_store;
 mod db;
 
 use serde::{Deserialize, Serialize};
@@ -122,6 +123,8 @@ struct RealityLinkContext {
 struct LoadedConfig {
     path: PathBuf,
     metadata_path: PathBuf,
+    original_config: Vec<u8>,
+    original_metadata: Option<Vec<u8>>,
     root: Value,
     metadata: UserMetadataStore,
     link_context: RealityLinkContext,
@@ -129,6 +132,7 @@ struct LoadedConfig {
 
 static PUBLIC_IPV4_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
 static PUBLIC_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const PUBLIC_IPV4_TTL: Duration = Duration::from_secs(5 * 60);
 
 async fn run_blocking<T, F>(task: F) -> Result<T, String>
@@ -232,11 +236,22 @@ async fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult,
 }
 
 fn create_vless_user_sync(input: CreateUserInput) -> Result<UserMutationResult, String> {
+    let _write_guard = lock_config_writes()?;
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
     let timestamp = unix_timestamp();
-    let label = next_user_label(&loaded.root, input.label.as_deref());
-    let note = input.note.and_then(|value| normalize_optional(&value));
+    let preferred_label = input
+        .label
+        .as_deref()
+        .map(validate_user_label)
+        .transpose()?;
+    let label = next_user_label(&loaded.root, preferred_label.as_deref());
+    let note = input
+        .note
+        .as_deref()
+        .map(validate_user_note)
+        .transpose()?
+        .flatten();
     let user_id = Uuid::new_v4().to_string();
     let client = json!({
         "id": user_id,
@@ -276,6 +291,9 @@ fn update_user_label_sync(
     user_id: String,
     new_label: String,
 ) -> Result<UserMutationResult, String> {
+    let _write_guard = lock_config_writes()?;
+    validate_user_id(&user_id)?;
+    let new_label = validate_user_label(&new_label)?;
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
     let clients = clients_mut(&mut loaded.root)?;
@@ -286,7 +304,7 @@ fn update_user_label_sync(
 
     match found {
         Some(client) => {
-            client["email"] = json!(new_label.trim());
+            client["email"] = json!(new_label);
         }
         None => return Err("User was not found in the current config.".to_string()),
     }
@@ -306,6 +324,9 @@ async fn update_user_note(user_id: String, new_note: String) -> Result<UserMutat
 }
 
 fn update_user_note_sync(user_id: String, new_note: String) -> Result<UserMutationResult, String> {
+    let _write_guard = lock_config_writes()?;
+    validate_user_id(&user_id)?;
+    let new_note = validate_user_note(&new_note)?;
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
 
@@ -317,18 +338,13 @@ fn update_user_note_sync(user_id: String, new_note: String) -> Result<UserMutati
         return Err("User was not found in the current config.".to_string());
     }
 
-    let trimmed = new_note.trim();
     let entry = loaded.metadata.users.entry(user_id).or_default();
-    entry.note = if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    };
+    entry.note = new_note;
 
-    write_metadata(&loaded.metadata_path, &loaded.metadata)?;
+    let backup_path = persist_config_and_metadata(&loaded)?;
 
     Ok(UserMutationResult {
-        backup_path: loaded.metadata_path.to_string_lossy().into_owned(),
+        backup_path,
         users: collect_users(&loaded.root, &loaded.metadata, &loaded.link_context)?,
     })
 }
@@ -347,6 +363,8 @@ async fn update_config(input: ConfigUpdate) -> Result<String, String> {
 }
 
 fn update_config_sync(input: ConfigUpdate) -> Result<String, String> {
+    let _write_guard = lock_config_writes()?;
+    validate_config_update(&input)?;
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip)?;
 
@@ -365,21 +383,16 @@ fn update_config_sync(input: ConfigUpdate) -> Result<String, String> {
         inbound["port"] = json!(port);
     }
 
-    if let Some(ref target) = input.reality_target {
-        if let Some(reality) = inbound
+    if input.reality_target.is_some() || input.server_name.is_some() {
+        let reality = inbound
             .get_mut("streamSettings")
             .and_then(|s| s.get_mut("realitySettings"))
-        {
-            reality["target"] = json!(target);
+            .ok_or_else(|| "Could not find REALITY settings in VLESS inbound.".to_string())?;
+        if let Some(ref target) = input.reality_target {
+            reality["target"] = json!(target.trim());
         }
-    }
-
-    if let Some(ref sni) = input.server_name {
-        if let Some(reality) = inbound
-            .get_mut("streamSettings")
-            .and_then(|s| s.get_mut("realitySettings"))
-        {
-            reality["serverNames"] = json!([sni]);
+        if let Some(ref sni) = input.server_name {
+            reality["serverNames"] = json!([sni.trim()]);
         }
     }
 
@@ -393,6 +406,7 @@ async fn service_action(action: String) -> Result<String, String> {
 }
 
 fn service_action_sync(action: String) -> Result<String, String> {
+    let _write_guard = lock_config_writes()?;
     let valid = ["start", "stop", "restart"];
     if !valid.contains(&action.as_str()) {
         return Err(format!("Invalid action: {action}"));
@@ -621,6 +635,8 @@ async fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String
 }
 
 fn delete_vless_user_sync(user_id: String) -> Result<UserMutationResult, String> {
+    let _write_guard = lock_config_writes()?;
+    validate_user_id(&user_id)?;
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
     let clients = clients_mut(&mut loaded.root)?;
@@ -683,18 +699,20 @@ fn load_config_with_ip(public_ipv4: Option<String>) -> Result<LoadedConfig, Stri
         .map(PathBuf::from)
         .ok_or_else(|| "No known Xray config path was found.".to_string())?;
 
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read config file: {error}"))?;
-    let root: Value = serde_json::from_str(&contents)
+    let contents =
+        fs::read(&path).map_err(|error| format!("Failed to read config file: {error}"))?;
+    let root: Value = serde_json::from_slice(&contents)
         .map_err(|error| format!("Failed to parse config JSON: {error}"))?;
 
     let metadata_path = metadata_path_for(&path)?;
-    let metadata = read_metadata(&metadata_path)?;
+    let (metadata, original_metadata) = read_metadata(&metadata_path)?;
     let link_context = build_link_context(&root, public_ipv4);
 
     Ok(LoadedConfig {
         path,
         metadata_path,
+        original_config: contents,
+        original_metadata,
         root,
         metadata,
         link_context,
@@ -704,24 +722,92 @@ fn load_config_with_ip(public_ipv4: Option<String>) -> Result<LoadedConfig, Stri
 fn persist_config_and_metadata(loaded: &LoadedConfig) -> Result<String, String> {
     let candidate = serde_json::to_string_pretty(&loaded.root)
         .map_err(|error| format!("Failed to serialize updated config: {error}"))?;
+    let metadata = serde_json::to_string_pretty(&loaded.metadata)
+        .map_err(|error| format!("Failed to serialize metadata: {error}"))?;
+    config_store::persist_validated_pair(
+        &loaded.path,
+        &loaded.metadata_path,
+        &loaded.original_config,
+        loaded.original_metadata.as_deref(),
+        candidate.as_bytes(),
+        metadata.as_bytes(),
+        validate_xray_config,
+    )
+    .map(|path| path.to_string_lossy().into_owned())
+}
 
-    let temp_path = temporary_path_for(&loaded.path);
-    fs::write(&temp_path, candidate)
-        .map_err(|error| format!("Failed to write temp config: {error}"))?;
+fn lock_config_writes() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    CONFIG_WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "The config write lock is unavailable.".to_string())
+}
 
-    if let Err(error) = validate_xray_config(&temp_path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
+fn validate_user_id(value: &str) -> Result<(), String> {
+    Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| "User ID must be a valid UUID.".to_string())
+}
+
+fn validate_user_label(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("User label cannot be empty.".to_string());
     }
+    if value.chars().count() > 80 {
+        return Err("User label cannot exceed 80 characters.".to_string());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("User label cannot contain control characters.".to_string());
+    }
+    Ok(value.to_string())
+}
 
-    let backup_path = create_backup(&loaded.path)?;
+fn validate_user_note(value: &str) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > 1000 {
+        return Err("User note cannot exceed 1000 characters.".to_string());
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err("User note contains unsupported control characters.".to_string());
+    }
+    Ok(Some(value.to_string()))
+}
 
-    fs::rename(&temp_path, &loaded.path)
-        .map_err(|error| format!("Failed to replace config file: {error}"))?;
-
-    write_metadata(&loaded.metadata_path, &loaded.metadata)?;
-
-    Ok(backup_path)
+fn validate_config_update(input: &ConfigUpdate) -> Result<(), String> {
+    if input.listen_port == Some(0) {
+        return Err("Listen port must be between 1 and 65535.".to_string());
+    }
+    if let Some(target) = input.reality_target.as_deref() {
+        let target = target.trim();
+        let (host, port) = target
+            .rsplit_once(':')
+            .ok_or_else(|| "REALITY target must use host:port format.".to_string())?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| "REALITY target has an invalid port.".to_string())?;
+        if host.is_empty() || port == 0 || target.chars().any(char::is_whitespace) {
+            return Err("REALITY target must contain a valid host and port.".to_string());
+        }
+    }
+    if let Some(server_name) = input.server_name.as_deref() {
+        let server_name = server_name.trim();
+        if server_name.is_empty()
+            || server_name.len() > 253
+            || server_name.chars().any(char::is_whitespace)
+            || server_name.contains('/')
+            || server_name.contains(':')
+        {
+            return Err("REALITY server name is invalid.".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn collect_users(
@@ -902,57 +988,29 @@ fn metadata_path_for(config_path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join("reality-console.users.json"))
 }
 
-fn read_metadata(path: &Path) -> Result<UserMetadataStore, String> {
+fn read_metadata(path: &Path) -> Result<(UserMetadataStore, Option<Vec<u8>>), String> {
     if !path.exists() {
-        return Ok(UserMetadataStore {
-            version: 1,
-            users: HashMap::new(),
-        });
+        return Ok((
+            UserMetadataStore {
+                version: 1,
+                users: HashMap::new(),
+            },
+            None,
+        ));
     }
 
-    let contents = fs::read_to_string(path)
-        .map_err(|error| format!("Failed to read metadata file: {error}"))?;
-    let metadata: UserMetadataStore = serde_json::from_str(&contents)
+    let contents =
+        fs::read(path).map_err(|error| format!("Failed to read metadata file: {error}"))?;
+    let metadata: UserMetadataStore = serde_json::from_slice(&contents)
         .map_err(|error| format!("Failed to parse metadata JSON: {error}"))?;
+    if metadata.version != 1 {
+        return Err(format!(
+            "Unsupported metadata version: {}.",
+            metadata.version
+        ));
+    }
 
-    Ok(metadata)
-}
-
-fn write_metadata(path: &Path, metadata: &UserMetadataStore) -> Result<(), String> {
-    let contents = serde_json::to_string_pretty(metadata)
-        .map_err(|error| format!("Failed to serialize metadata: {error}"))?;
-    fs::write(path, contents).map_err(|error| format!("Failed to write metadata file: {error}"))
-}
-
-fn create_backup(path: &Path) -> Result<String, String> {
-    let timestamp = unix_timestamp();
-    let file_stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("config");
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("json");
-    let backup_name = format!("{file_stem}.backup-{timestamp}.{extension}");
-    let backup_path = path
-        .parent()
-        .ok_or_else(|| "Config path has no parent directory.".to_string())?
-        .join(backup_name);
-
-    fs::copy(path, &backup_path).map_err(|error| format!("Failed to create backup: {error}"))?;
-
-    Ok(backup_path.to_string_lossy().into_owned())
-}
-
-fn temporary_path_for(path: &Path) -> PathBuf {
-    let timestamp = unix_timestamp();
-    let stem = path
-        .file_stem()
-        .and_then(|v| v.to_str())
-        .unwrap_or("config");
-    let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("json");
-    path.with_file_name(format!("{stem}.tmp-{timestamp}.{ext}"))
+    Ok((metadata, Some(contents)))
 }
 
 fn validate_xray_config(path: &Path) -> Result<(), String> {
@@ -1237,4 +1295,53 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_and_normalizes_user_fields() {
+        assert_eq!(validate_user_label("  Friend  ").unwrap(), "Friend");
+        assert!(validate_user_label(" ").is_err());
+        assert!(validate_user_label(&"x".repeat(81)).is_err());
+        assert_eq!(
+            validate_user_note("  first line\nsecond line  ").unwrap(),
+            Some("first line\nsecond line".to_string())
+        );
+        assert_eq!(validate_user_note("  ").unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_invalid_config_updates() {
+        assert!(validate_config_update(&ConfigUpdate {
+            listen_port: Some(0),
+            reality_target: None,
+            server_name: None,
+        })
+        .is_err());
+        assert!(validate_config_update(&ConfigUpdate {
+            listen_port: None,
+            reality_target: Some("missing-port".to_string()),
+            server_name: None,
+        })
+        .is_err());
+        assert!(validate_config_update(&ConfigUpdate {
+            listen_port: None,
+            reality_target: None,
+            server_name: Some("bad name".to_string()),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_current_reality_settings() {
+        assert!(validate_config_update(&ConfigUpdate {
+            listen_port: Some(443),
+            reality_target: Some("www.example.com:443".to_string()),
+            server_name: Some("www.example.com".to_string()),
+        })
+        .is_ok());
+    }
 }
