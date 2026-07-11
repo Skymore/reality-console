@@ -208,10 +208,14 @@ summary and explicitly approves it through Control Service. Heartbeat cannot app
 the node immediately blocks control authentication; revoking it also atomically revokes all of its
 node credentials.
 
-`sync-once` performs one outbound signed heartbeat and one signed desired-state fetch. It records
-heartbeat and complete-cycle timestamps locally, uses a fresh nonce for every request, and accepts
-only the empty `204` desired-state response in the current slice. A later service loop will run the
-same operation with jitter and backoff after signed desired-state apply is complete.
+`sync-once` performs outbound signed result retries, one signed heartbeat, and one signed
+desired-state fetch. It records heartbeat and complete-cycle timestamps locally and uses a fresh
+nonce for every request. A `200` response is accepted only after closed-schema identity,
+monotonicity, and pinned controller-signature verification. The immutable envelope and its digests
+are committed before a signed `received` result is sent; an interrupted result remains queued and
+is retried before the next heartbeat. This stage does not yet render, validate, or activate Xray.
+A later service loop will run the same operation with jitter and backoff after signed desired-state
+apply is complete.
 
 ## 7. Outbound-Only Control Sync
 

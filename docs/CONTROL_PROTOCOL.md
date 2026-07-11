@@ -221,9 +221,10 @@ controller epoch, revision, publication time, agent floor, ordered users, ordere
 closed Xray fields, and signing-key ID. Changing or reordering any covered value invalidates the
 signature.
 
-The initial sync slice implements the authenticated `204` path. Node Host rejects a `200` desired
-state until signature verification and atomic apply are implemented; it never treats an unsigned
-document as configuration.
+Node Host accepts `200` only as JSON matching the closed schema and only after exact network, node,
+controller epoch, monotonic revision, and controller-signature verification. It atomically stores
+the immutable envelope plus envelope/transcript digests, advances its durable cursor, and reports
+`received`. Receipt does not imply validation or Xray activation.
 
 ### Report result
 
@@ -241,7 +242,9 @@ document as configuration.
 ```
 
 Valid states are `received`, `validated`, `applied`, `rejected`, and `rolledBack`. State transitions
-are monotonic for a `(nodeId, revision)` result. Repeating the same result is idempotent.
+are monotonic for a `(nodeId, revision)` result. Repeating the same result is idempotent. If a
+result request fails after local receipt, Node Host retains it and retries it before sending a
+heartbeat that advertises the new revision.
 
 ## 6. Member And Bundle API
 

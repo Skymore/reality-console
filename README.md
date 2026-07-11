@@ -21,10 +21,11 @@ profile and supervise a pinned Xray sidecar. Control Service now supports secure
 invitations and proof-of-possession enrollment. Node Host has durable owner-only identities and a
 headless `init`/`join`/`sync-once`/`status` flow that verifies the controller response before
 persisting its registration. Authenticated heartbeat and empty desired-state polling are
-implemented. Control Service also exposes redacted node summaries plus explicit approve, disable,
-and revoke operations; enrollment and heartbeat never activate a node implicitly. Automatic
-polling, signed desired-state apply, account synchronization, and relay fallback remain under
-active implementation.
+implemented. Node Host can also verify, durably retain, and acknowledge signed desired-state
+envelopes without applying them to Xray yet. Control Service exposes redacted node summaries plus
+explicit approve, disable, and revoke operations; enrollment and heartbeat never activate a node
+implicitly. Automatic polling, validated Xray activation, account synchronization, and relay
+fallback remain under active implementation.
 
 ## Authoritative Documentation
 

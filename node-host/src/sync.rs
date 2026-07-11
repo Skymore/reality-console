@@ -1,42 +1,49 @@
 use crate::enrollment::{control_http_client, read_bounded_response};
 use crate::{
     build_status, load_sync_registration, migrate, open_database, parse_controller, unix_timestamp,
-    DataDirLock, HostStatus, Identity,
+    DataDirLock, HostStatus, Identity, SyncRegistration,
 };
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use control_protocol::crypto::Nonce;
+use control_protocol::crypto::{Nonce, Sha256Digest};
+use control_protocol::desired::{desired_state_transcript, verify_desired_state_signature};
 use control_protocol::error::ErrorEnvelope;
-use control_protocol::id::{SequenceNumber, Timestamp};
-use control_protocol::node::{NodeHeartbeat, NodeRuntimeState, RevisionProgress};
+use control_protocol::id::{Revision, SequenceNumber, Timestamp};
+use control_protocol::node::{
+    NodeHeartbeat, NodeRuntimeState, RevisionProgress, RevisionResult, RevisionResultState,
+    SignedDesiredState,
+};
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
 use rand_core::{OsRng, RngCore as _};
 use reqwest::{Method, StatusCode};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension as _, TransactionBehavior};
+use sha2::{Digest as _, Sha256};
 use std::path::Path;
 use std::str::FromStr as _;
 use time::OffsetDateTime;
 use url::Url;
 
 const NONCE_BYTES: usize = 32;
+const SUPPORTED_DESIRED_SCHEMAS: &[u16] = &[1];
+const MAX_PENDING_REPORTS_PER_SYNC: i64 = 64;
 const NODE_ID_HEADER: &str = "X-Node-Id";
 const NODE_KEY_ID_HEADER: &str = "X-Node-Key-Id";
 const NODE_TIMESTAMP_HEADER: &str = "X-Node-Timestamp";
 const NODE_NONCE_HEADER: &str = "X-Node-Nonce";
 const NODE_SIGNATURE_HEADER: &str = "X-Node-Signature";
 
-/// Performs one authenticated heartbeat and desired-state fetch.
+/// Performs one authenticated heartbeat and desired-state synchronization cycle.
 ///
-/// This phase intentionally accepts only `204 No Content` from the desired
-/// endpoint. The shared protocol does not yet define desired-state signature
-/// verification, so a document cannot be accepted safely.
+/// A verified desired-state envelope is durably recorded before the node reports
+/// `received`. Failed reports remain queued and are retried before the next
+/// heartbeat, so a transport interruption cannot lose lifecycle progress.
 ///
 /// # Errors
 ///
-/// Returns an error when the host is not enrolled, credentials are invalid,
-/// request signing or transport fails, or the controller returns anything
-/// other than an acknowledged heartbeat followed by no desired state.
+/// Returns an error when local state is inconsistent, the host is not enrolled,
+/// a controller artifact fails identity/signature checks, or any signed control
+/// request is rejected.
 pub async fn sync_once(data_dir: &Path) -> Result<HostStatus> {
     let _lock = DataDirLock::acquire(data_dir, false)?;
     let mut connection = open_database(data_dir, false)?;
@@ -51,16 +58,21 @@ pub async fn sync_once(data_dir: &Path) -> Result<HostStatus> {
     let controller = parse_controller(&controller_value)?;
     let identity = Identity::load(data_dir)?;
     let registration = load_sync_registration(&connection)?;
-    let sync_state = crate::load_sync_status(&connection)?;
-    if sync_state.desired_revision_cursor != 0 {
-        bail!("this node host version cannot synchronize a non-zero desired revision cursor");
-    }
+    let client = control_http_client().context("failed to initialize sync HTTP client")?;
 
-    let heartbeat = initial_heartbeat()?;
+    let sync_state = crate::load_sync_status(&connection)?;
+    verify_persisted_desired_state(
+        &connection,
+        &registration,
+        sync_state.desired_revision_cursor,
+    )?;
+    report_unreported_results(&client, &controller, &connection, &registration, &identity).await?;
+
+    let sync_state = crate::load_sync_status(&connection)?;
+    let heartbeat = current_heartbeat(sync_state.desired_revision_cursor)?;
     let heartbeat_body =
         serde_json::to_vec(&heartbeat).context("failed to serialize node heartbeat")?;
     let heartbeat_target = format!("/v1/nodes/{}/heartbeat", registration.node);
-    let client = control_http_client().context("failed to initialize sync HTTP client")?;
     let heartbeat_response = send_signed_request(
         &client,
         &controller,
@@ -86,7 +98,10 @@ pub async fn sync_once(data_dir: &Path) -> Result<HostStatus> {
     }
     persist_heartbeat_success(&connection)?;
 
-    let desired_target = format!("/v1/nodes/{}/desired?afterRevision=0", registration.node);
+    let desired_target = format!(
+        "/v1/nodes/{}/desired?afterRevision={}",
+        registration.node, sync_state.desired_revision_cursor
+    );
     let desired_response = send_signed_request(
         &client,
         &controller,
@@ -99,34 +114,48 @@ pub async fn sync_once(data_dir: &Path) -> Result<HostStatus> {
     .await
     .context("controller desired-state request failed")?;
     let desired_status = desired_response.status();
+    let desired_is_json = response_is_json(&desired_response);
     let desired_body = read_bounded_response(desired_response).await?;
     match desired_status {
-        StatusCode::NO_CONTENT if desired_body.is_empty() => {
-            persist_sync_success(&connection)?;
+        StatusCode::NO_CONTENT if desired_body.is_empty() => {}
+        StatusCode::NO_CONTENT => bail!("controller returned a body with no desired state"),
+        StatusCode::OK if desired_is_json => {
+            persist_verified_desired_state(
+                &mut connection,
+                &registration,
+                sync_state.desired_revision_cursor,
+                &desired_body,
+            )?;
+            report_unreported_results(&client, &controller, &connection, &registration, &identity)
+                .await?;
         }
-        StatusCode::NO_CONTENT => {
-            bail!("controller returned a body with no desired state");
-        }
-        StatusCode::OK => {
-            bail!("controller returned desired state that this node host cannot verify");
-        }
+        StatusCode::OK => bail!("controller desired-state response is not JSON"),
         status if !status.is_success() => {
             return Err(controller_error("desired-state", status, &desired_body));
         }
         _ => bail!("controller returned unexpected desired-state success status {desired_status}"),
     }
 
+    persist_sync_success(&connection)?;
     build_status(&connection, controller, &identity)
 }
 
-fn initial_heartbeat() -> Result<NodeHeartbeat> {
+fn current_heartbeat(desired_revision_cursor: i64) -> Result<NodeHeartbeat> {
+    let received_revision = if desired_revision_cursor == 0 {
+        None
+    } else {
+        Some(
+            Revision::new(desired_revision_cursor)
+                .context("stored desired revision cursor is invalid")?,
+        )
+    };
     let heartbeat = NodeHeartbeat {
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         xray_version: None,
         state: NodeRuntimeState::Idle,
         revisions: RevisionProgress {
-            desired_revision: None,
-            received_revision: None,
+            desired_revision: received_revision,
+            received_revision,
             validated_revision: None,
             applied_revision: None,
         },
@@ -140,17 +169,259 @@ fn initial_heartbeat() -> Result<NodeHeartbeat> {
     Ok(heartbeat)
 }
 
+fn persist_verified_desired_state(
+    connection: &mut Connection,
+    registration: &SyncRegistration,
+    previous_revision_cursor: i64,
+    body: &[u8],
+) -> Result<()> {
+    let envelope: SignedDesiredState =
+        serde_json::from_slice(body).context("controller returned invalid desired-state JSON")?;
+    let previous_revision = if previous_revision_cursor == 0 {
+        None
+    } else {
+        Some(
+            Revision::new(previous_revision_cursor)
+                .context("stored desired revision cursor is invalid")?,
+        )
+    };
+    envelope
+        .validate_for(
+            registration.network,
+            registration.node,
+            registration.controller_instance,
+            previous_revision,
+            SUPPORTED_DESIRED_SCHEMAS,
+        )
+        .context("controller desired-state document failed validation")?;
+    verify_desired_state_signature(
+        &envelope.document,
+        &envelope.signature,
+        &registration.controller_signing_public_key,
+    )
+    .context("controller desired-state signature is invalid")?;
+
+    let canonical_envelope =
+        serde_json::to_string(&envelope).context("failed to encode desired-state artifact")?;
+    let transcript = desired_state_transcript(&envelope.document)
+        .context("failed to encode desired-state transcript")?;
+    let envelope_digest = sha256_digest(canonical_envelope.as_bytes());
+    let transcript_digest = sha256_digest(&transcript);
+    let now = unix_timestamp()?;
+    let timestamp = Timestamp::from_datetime(OffsetDateTime::from_unix_timestamp(now)?);
+    let result = RevisionResult {
+        state: RevisionResultState::Received,
+        config_digest: None,
+        started_at: timestamp,
+        completed_at: timestamp,
+        error_code: None,
+        rollback_revision: None,
+    };
+    result
+        .validate(envelope.document.revision)
+        .context("generated revision result is invalid")?;
+    let report_json = serde_json::to_string(&result).context("failed to encode revision result")?;
+    let report_digest = sha256_digest(report_json.as_bytes());
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stored_cursor: i64 = transaction.query_row(
+        "SELECT desired_revision_cursor FROM control_sync_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if stored_cursor != previous_revision_cursor {
+        bail!("desired revision cursor changed during synchronization");
+    }
+    transaction.execute(
+        "INSERT INTO desired_state_artifacts(
+            revision, network_id, node_id, controller_instance_id, signing_key_id,
+            envelope_json, envelope_digest, transcript_digest, received_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            envelope.document.revision.get(),
+            envelope.document.network_id.to_string(),
+            envelope.document.node_id.to_string(),
+            envelope.document.controller_instance_id.to_string(),
+            envelope.document.signing_key_id.to_string(),
+            canonical_envelope,
+            envelope_digest.as_str(),
+            transcript_digest.as_str(),
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO local_revision_results(
+            revision, state, report_json, report_digest, reported_at, created_at
+         ) VALUES (?1, 'received', ?2, ?3, NULL, ?4)",
+        params![
+            envelope.document.revision.get(),
+            report_json,
+            report_digest.as_str(),
+            now,
+        ],
+    )?;
+    let updated = transaction.execute(
+        "UPDATE control_sync_state SET desired_revision_cursor = ?1 WHERE singleton = 1",
+        [envelope.document.revision.get()],
+    )?;
+    if updated != 1 {
+        bail!("control sync state is missing");
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn verify_persisted_desired_state(
+    connection: &Connection,
+    registration: &SyncRegistration,
+    desired_revision_cursor: i64,
+) -> Result<()> {
+    let highest_artifact: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(revision), 0) FROM desired_state_artifacts",
+        [],
+        |row| row.get(0),
+    )?;
+    if highest_artifact != desired_revision_cursor {
+        bail!("stored desired-state cursor does not match its immutable artifact");
+    }
+    if desired_revision_cursor == 0 {
+        return Ok(());
+    }
+
+    let stored = connection
+        .query_row(
+            "SELECT envelope_json, envelope_digest, transcript_digest
+             FROM desired_state_artifacts WHERE revision = ?1",
+            [desired_revision_cursor],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .context("stored desired-state artifact is missing")?;
+    let envelope: SignedDesiredState =
+        serde_json::from_str(&stored.0).context("stored desired-state artifact is invalid")?;
+    if envelope.document.revision.get() != desired_revision_cursor {
+        bail!("stored desired-state artifact revision is inconsistent");
+    }
+    envelope
+        .validate_for(
+            registration.network,
+            registration.node,
+            registration.controller_instance,
+            None,
+            SUPPORTED_DESIRED_SCHEMAS,
+        )
+        .context("stored desired-state document failed validation")?;
+    verify_desired_state_signature(
+        &envelope.document,
+        &envelope.signature,
+        &registration.controller_signing_public_key,
+    )
+    .context("stored desired-state signature is invalid")?;
+    let transcript = desired_state_transcript(&envelope.document)
+        .context("stored desired-state transcript is invalid")?;
+    if sha256_digest(stored.0.as_bytes()).as_str() != stored.1
+        || sha256_digest(&transcript).as_str() != stored.2
+    {
+        bail!("stored desired-state artifact digest is invalid");
+    }
+    Ok(())
+}
+
+async fn report_unreported_results(
+    client: &reqwest::Client,
+    controller: &Url,
+    connection: &Connection,
+    registration: &SyncRegistration,
+    identity: &Identity,
+) -> Result<()> {
+    let reports = {
+        let mut statement = connection.prepare(
+            "SELECT revision, report_json, report_digest
+             FROM local_revision_results
+             WHERE reported_at IS NULL
+             ORDER BY revision ASC, state ASC
+             LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([MAX_PENDING_REPORTS_PER_SYNC], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    for (revision_value, report_json, stored_digest) in reports {
+        let revision =
+            Revision::new(revision_value).context("stored revision result has invalid revision")?;
+        let report: RevisionResult =
+            serde_json::from_str(&report_json).context("stored revision result is invalid")?;
+        report
+            .validate(revision)
+            .context("stored revision result failed validation")?;
+        if sha256_digest(report_json.as_bytes()).as_str() != stored_digest {
+            bail!("stored revision result digest is invalid");
+        }
+
+        let target = format!(
+            "/v1/nodes/{}/revisions/{}/result",
+            registration.node, revision_value
+        );
+        let response = send_signed_request(
+            client,
+            controller,
+            Method::PUT,
+            &target,
+            report_json.into_bytes(),
+            registration,
+            identity,
+        )
+        .await
+        .context("controller revision-result request failed")?;
+        let status = response.status();
+        let body = read_bounded_response(response).await?;
+        if !status.is_success() {
+            return Err(controller_error("revision-result", status, &body));
+        }
+        if status != StatusCode::NO_CONTENT || !body.is_empty() {
+            bail!("controller returned unexpected revision-result success response");
+        }
+        let updated = connection.execute(
+            "UPDATE local_revision_results SET reported_at = ?1
+             WHERE revision = ?2 AND state = ?3 AND reported_at IS NULL",
+            params![
+                unix_timestamp()?,
+                revision_value,
+                revision_state_name(report.state)
+            ],
+        )?;
+        if updated != 1 {
+            bail!("stored revision result changed during synchronization");
+        }
+    }
+    Ok(())
+}
+
 async fn send_signed_request(
     client: &reqwest::Client,
     controller: &Url,
     method: Method,
     path_and_query: &str,
     body: Vec<u8>,
-    registration: &crate::SyncRegistration,
+    registration: &SyncRegistration,
     identity: &Identity,
 ) -> Result<reqwest::Response> {
     let method_name = method.as_str().to_owned();
-    let is_post = method == Method::POST;
+    let has_json_body = matches!(method, Method::POST | Method::PUT);
     let signing_input = NodeRequestSigningInput::from_body(&method_name, path_and_query, &body)
         .context("failed to construct signed request input")?;
     let timestamp = Timestamp::from_datetime(OffsetDateTime::now_utc());
@@ -181,7 +452,7 @@ async fn send_signed_request(
         .header(NODE_TIMESTAMP_HEADER, headers.timestamp().to_string())
         .header(NODE_NONCE_HEADER, headers.nonce().as_str())
         .header(NODE_SIGNATURE_HEADER, headers.signature().as_str());
-    if is_post {
+    if has_json_body {
         request = request.header(reqwest::header::CONTENT_TYPE, "application/json");
     }
     request
@@ -195,6 +466,29 @@ fn fresh_nonce() -> Result<Nonce> {
     let mut bytes = [0_u8; NONCE_BYTES];
     OsRng.fill_bytes(&mut bytes);
     Nonce::from_str(&URL_SAFE_NO_PAD.encode(bytes)).context("failed to encode request nonce")
+}
+
+fn response_is_json(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn sha256_digest(value: &[u8]) -> Sha256Digest {
+    Sha256Digest::from_bytes(Sha256::digest(value).into())
+}
+
+const fn revision_state_name(state: RevisionResultState) -> &'static str {
+    match state {
+        RevisionResultState::Received => "received",
+        RevisionResultState::Validated => "validated",
+        RevisionResultState::Applied => "applied",
+        RevisionResultState::Rejected => "rejected",
+        RevisionResultState::RolledBack => "rolledBack",
+    }
 }
 
 fn persist_heartbeat_success(connection: &Connection) -> Result<()> {

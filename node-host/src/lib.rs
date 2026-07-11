@@ -31,11 +31,12 @@ const LOCK_FILE: &str = "node-host.lock";
 const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
 const MIGRATION_3_NAME: &str = "node_control_sync_state";
+const MIGRATION_4_NAME: &str = "node_desired_state_receipt";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -71,6 +72,60 @@ const MIGRATION_3: &str = "
 
     INSERT INTO control_sync_state(singleton, desired_revision_cursor)
     VALUES (1, 0);
+";
+
+const MIGRATION_4: &str = "
+    CREATE TABLE desired_state_artifacts (
+        revision INTEGER PRIMARY KEY CHECK (revision > 0),
+        network_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        controller_instance_id TEXT NOT NULL,
+        signing_key_id TEXT NOT NULL,
+        envelope_json TEXT NOT NULL CHECK (json_valid(envelope_json)),
+        envelope_digest TEXT NOT NULL CHECK (length(envelope_digest) = 71),
+        transcript_digest TEXT NOT NULL CHECK (length(transcript_digest) = 71),
+        received_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE local_revision_results (
+        revision INTEGER NOT NULL REFERENCES desired_state_artifacts(revision) ON DELETE RESTRICT,
+        state TEXT NOT NULL CHECK (
+            state IN ('received', 'validated', 'applied', 'rejected', 'rolledBack')
+        ),
+        report_json TEXT NOT NULL CHECK (json_valid(report_json)),
+        report_digest TEXT NOT NULL CHECK (length(report_digest) = 71),
+        reported_at INTEGER,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(revision, state)
+    ) STRICT;
+
+    CREATE INDEX local_revision_results_unreported
+        ON local_revision_results(revision, state) WHERE reported_at IS NULL;
+
+    CREATE TRIGGER desired_state_artifacts_no_update
+    BEFORE UPDATE ON desired_state_artifacts
+    BEGIN
+        SELECT RAISE(ABORT, 'desired-state artifacts are immutable');
+    END;
+
+    CREATE TRIGGER desired_state_artifacts_no_delete
+    BEFORE DELETE ON desired_state_artifacts
+    BEGIN
+        SELECT RAISE(ABORT, 'desired-state artifacts are immutable');
+    END;
+
+    CREATE TRIGGER local_revision_result_payload_no_update
+    BEFORE UPDATE OF report_json, report_digest, revision, state, created_at
+    ON local_revision_results
+    BEGIN
+        SELECT RAISE(ABORT, 'revision result payloads are immutable');
+    END;
+
+    CREATE TRIGGER local_revision_results_no_delete
+    BEFORE DELETE ON local_revision_results
+    BEGIN
+        SELECT RAISE(ABORT, 'revision results are append-only');
+    END;
 ";
 
 pub use enrollment::join;
@@ -238,6 +293,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 1, MIGRATION_1_NAME, MIGRATION_1)?;
     apply_migration(&transaction, 2, MIGRATION_2_NAME, MIGRATION_2)?;
     apply_migration(&transaction, 3, MIGRATION_3_NAME, MIGRATION_3)?;
+    apply_migration(&transaction, 4, MIGRATION_4_NAME, MIGRATION_4)?;
     transaction.commit()?;
     Ok(())
 }
@@ -299,6 +355,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (1, MIGRATION_1_NAME, MIGRATION_1),
         (2, MIGRATION_2_NAME, MIGRATION_2),
         (3, MIGRATION_3_NAME, MIGRATION_3),
+        (4, MIGRATION_4_NAME, MIGRATION_4),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");
@@ -516,10 +573,12 @@ struct RegistrationRecord {
     credential_expires_at: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SyncRegistration {
+    network: control_protocol::id::NetworkId,
     node: NodeId,
     controller_instance: ControllerInstanceId,
+    controller_signing_public_key: Ed25519PublicKey,
     key: NodeKeyId,
 }
 
@@ -536,6 +595,10 @@ fn load_sync_registration(connection: &Connection) -> Result<SyncRegistration> {
         bail!("node host credential has expired");
     }
     Ok(SyncRegistration {
+        network: registration
+            .network_id
+            .parse()
+            .context("stored network ID is invalid")?,
         node: registration
             .node_id
             .parse()
@@ -544,6 +607,10 @@ fn load_sync_registration(connection: &Connection) -> Result<SyncRegistration> {
             .controller_instance_id
             .parse()
             .context("stored controller instance ID is invalid")?,
+        controller_signing_public_key: registration
+            .controller_signing_public_key
+            .parse()
+            .context("stored controller signing public key is invalid")?,
         key: registration
             .credential_key_id
             .parse()
