@@ -212,13 +212,13 @@ export function UsersPage({
                   <span className="min-w-0 truncate font-mono">{user.id}</span>
                   <span className="shrink-0 pl-3">
                     {(() => {
-                      const tr = trafficResponse?.users.find((u) => u.email === user.label)
+                      const tr = trafficResponse?.users.find((u) => u.userId === user.id)
                       return `↑${formatBytes(tr?.uplink ?? 0)} ↓${formatBytes(tr?.downlink ?? 0)}`
                     })()}
                   </span>
                 </div>
                 {(() => {
-                  const q = quotas.find((q) => q.userId === user.label)
+                  const q = quotas.find((q) => q.userId === user.id)
                   if (!q) return null
                   const pct = q.monthlyQuotaBytes > 0 ? Math.min(100, (q.usedThisMonth / q.monthlyQuotaBytes) * 100) : 0
                   const exceeded = q.usedThisMonth >= q.monthlyQuotaBytes
@@ -240,7 +240,7 @@ export function UsersPage({
                   {user.note || t("users.noNote")}
                 </p>
                 {(() => {
-                  const userLogs = connLogs.filter((l) => l.userEmail === user.label)
+                  const userLogs = connLogs.filter((l) => l.userId === user.id)
                   const lastLog = userLogs[0]
                   if (!lastLog) return null
                   return (
@@ -259,7 +259,7 @@ export function UsersPage({
                       variant="ghost"
                       size="icon-xs"
                       onClick={() => {
-                        const q = quotas.find((q) => q.userId === user.label)
+                        const q = quotas.find((q) => q.userId === user.id)
                         const quotaGb = q ? String(Math.round(q.monthlyQuotaBytes / 1_073_741_824)) : "50"
                         setEditingUser({ id: user.id, label: user.label, note: user.note ?? "", quotaGb })
                       }}

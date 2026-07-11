@@ -24,6 +24,7 @@ export type CreateUserInput = {
 }
 
 export type UserTraffic = {
+  userId?: string | null
   email: string
   uplink: number
   downlink: number
@@ -38,10 +39,12 @@ export type TrafficResponse = {
 
 export type ConnectionLog = {
   id: number
+  userId: string
   userEmail: string
   timestamp: string
   clientIp: string
   destination: string
+  network: string
 }
 
 export type UserQuota = {
@@ -54,4 +57,34 @@ export type UserQuota = {
 export type TrafficRefreshResponse = {
   traffic: TrafficResponse
   quotas: UserQuota[]
+}
+
+export type UserAnalyticsRange = "24h" | "7d" | "30d" | "90d" | "custom"
+
+export type UserAnalytics = {
+  nodeId: string
+  userId: string
+  from: number
+  to: number
+  uplinkBytes: number
+  downlinkBytes: number
+  connectionCount: number
+  uniqueClientIps: number
+  firstSeenAt?: number | null
+  lastSeenAt?: number | null
+  activeDays: number
+  recentlyActive: boolean
+  quota?: UserQuota | null
+  daily: Array<{
+    day: string
+    uplinkBytes: number
+    downlinkBytes: number
+    connectionCount: number
+    uniqueClientIps: number
+  }>
+  topClientIps: Array<{ value: string; count: number; lastSeenAt?: number | null }>
+  topDestinations: Array<{ value: string; count: number; lastSeenAt?: number | null }>
+  recentConnections: ConnectionLog[]
+  lastTrafficSampleAt?: number | null
+  lastLogImportAt?: number | null
 }

@@ -75,6 +75,8 @@ struct UserMetadataStore {
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 struct UserMetadataEntry {
+    #[serde(default)]
+    label: Option<String>,
     note: Option<String>,
     created_at: Option<u64>,
 }
@@ -82,6 +84,7 @@ struct UserMetadataEntry {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UserTraffic {
+    user_id: Option<String>,
     email: String,
     uplink: u64,
     downlink: u64,
@@ -245,7 +248,8 @@ fn create_vless_user_sync(input: CreateUserInput) -> Result<UserMutationResult, 
         .as_deref()
         .map(validate_user_label)
         .transpose()?;
-    let label = next_user_label(&loaded.root, preferred_label.as_deref());
+    let label = next_user_label(&loaded.root, &loaded.metadata, preferred_label.as_deref());
+    ensure_label_unique(&loaded.root, &loaded.metadata, &label, None)?;
     let note = input
         .note
         .as_deref()
@@ -253,18 +257,20 @@ fn create_vless_user_sync(input: CreateUserInput) -> Result<UserMutationResult, 
         .transpose()?
         .flatten();
     let user_id = Uuid::new_v4().to_string();
+    let xray_email = format!("user-{user_id}");
     let client = json!({
         "id": user_id,
         "flow": "xtls-rprx-vision",
-        "email": label
+        "email": xray_email
     });
 
     clients_mut(&mut loaded.root)?.push(client);
 
-    loaded.metadata.version = 1;
+    loaded.metadata.version = 2;
     loaded.metadata.users.insert(
         user_id.clone(),
         UserMetadataEntry {
+            label: Some(label),
             note,
             created_at: Some(timestamp),
         },
@@ -296,18 +302,15 @@ fn update_user_label_sync(
     let new_label = validate_user_label(&new_label)?;
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
-    let clients = clients_mut(&mut loaded.root)?;
-
-    let found = clients
-        .iter_mut()
-        .find(|client| client.get("id").and_then(Value::as_str) == Some(user_id.as_str()));
-
-    match found {
-        Some(client) => {
-            client["email"] = json!(new_label);
-        }
-        None => return Err("User was not found in the current config.".to_string()),
+    if !clients(&loaded.root)?
+        .iter()
+        .any(|client| client.get("id").and_then(Value::as_str) == Some(user_id.as_str()))
+    {
+        return Err("User was not found in the current config.".to_string());
     }
+    ensure_label_unique(&loaded.root, &loaded.metadata, &new_label, Some(&user_id))?;
+    loaded.metadata.version = 2;
+    loaded.metadata.users.entry(user_id).or_default().label = Some(new_label);
 
     let backup_path = persist_config_and_metadata(&loaded)?;
     let reloaded = load_config_with_ip(ip)?;
@@ -338,6 +341,7 @@ fn update_user_note_sync(user_id: String, new_note: String) -> Result<UserMutati
         return Err("User was not found in the current config.".to_string());
     }
 
+    loaded.metadata.version = 2;
     let entry = loaded.metadata.users.entry(user_id).or_default();
     entry.note = new_note;
 
@@ -541,12 +545,28 @@ async fn refresh_traffic(db: tauri::State<'_, Db>) -> Result<TrafficRefreshRespo
 }
 
 fn refresh_traffic_sync(db: &Db) -> Result<TrafficRefreshResponse, String> {
-    let traffic = get_user_traffic_sync();
+    let identities = load_current_identities()?;
+    db.sync_identities(&identities)?;
+    let identity_by_email: HashMap<&str, &str> = identities
+        .iter()
+        .map(|(user_id, email)| (email.as_str(), user_id.as_str()))
+        .collect();
+    let mut traffic = get_user_traffic_sync();
+    for entry in &mut traffic.users {
+        entry.user_id = identity_by_email
+            .get(entry.email.as_str())
+            .map(|user_id| (*user_id).to_string());
+    }
     let quotas = if traffic.available && traffic.error.is_none() {
-        let stats: Vec<(String, u64, u64)> = traffic
+        let stats: Vec<(String, String, u64, u64)> = traffic
             .users
             .iter()
-            .map(|entry| (entry.email.clone(), entry.uplink, entry.downlink))
+            .filter_map(|entry| {
+                entry
+                    .user_id
+                    .clone()
+                    .map(|user_id| (user_id, entry.email.clone(), entry.uplink, entry.downlink))
+            })
             .collect();
         let now = time_now();
         let current_month = format!("{}-{:02}", now.0, now.1);
@@ -577,6 +597,7 @@ fn pull_access_logs_sync(db: &Db) -> Result<usize, String> {
         fs::read_to_string(&config_path).map_err(|e| format!("Cannot read config: {e}"))?;
     let root: Value =
         serde_json::from_str(&contents).map_err(|e| format!("Cannot parse config: {e}"))?;
+    db.sync_identities(&identity_pairs(&root)?)?;
 
     let log_path = root
         .get("log")
@@ -590,11 +611,58 @@ fn pull_access_logs_sync(db: &Db) -> Result<usize, String> {
 #[tauri::command]
 async fn get_connection_logs(
     db: tauri::State<'_, Db>,
-    user_email: Option<String>,
+    user_id: Option<String>,
     limit: Option<i64>,
 ) -> Result<Vec<db::ConnectionLog>, String> {
     let db = db.inner().clone();
-    run_blocking(move || db.get_connections(user_email.as_deref(), limit.unwrap_or(50))).await
+    run_blocking(move || db.get_connections(user_id.as_deref(), limit.unwrap_or(50))).await
+}
+
+#[tauri::command]
+async fn get_user_analytics(
+    db: tauri::State<'_, Db>,
+    user_id: String,
+    range: Option<String>,
+    from: Option<i64>,
+    to: Option<i64>,
+) -> Result<db::UserAnalytics, String> {
+    let db = db.inner().clone();
+    run_blocking(move || {
+        let (from, to) = resolve_analytics_range(range.as_deref(), from, to)?;
+        db.get_user_analytics(&user_id, from, to)
+    })
+    .await
+}
+
+fn resolve_analytics_range(
+    range: Option<&str>,
+    from: Option<i64>,
+    to: Option<i64>,
+) -> Result<(i64, i64), String> {
+    if let (Some(from), Some(to)) = (from, to) {
+        if range.is_some() && range != Some("custom") {
+            return Err(
+                "Use either an analytics preset or an explicit range, not both.".to_string(),
+            );
+        }
+        if from >= to {
+            return Err("Analytics range must have `from` before `to`.".to_string());
+        }
+        return Ok((from, to));
+    }
+    if from.is_some() || to.is_some() || range == Some("custom") {
+        return Err("Explicit analytics ranges require both `from` and `to`.".to_string());
+    }
+
+    let seconds = match range.unwrap_or("24h") {
+        "24h" => 86_400,
+        "7d" => 7 * 86_400,
+        "30d" => 30 * 86_400,
+        "90d" => 90 * 86_400,
+        value => return Err(format!("Unsupported analytics range `{value}`.")),
+    };
+    let to = unix_timestamp() as i64;
+    Ok((to - seconds, to))
 }
 
 #[tauri::command]
@@ -825,17 +893,20 @@ fn collect_users(
             .ok_or_else(|| "Encountered a client without a valid UUID.".to_string())?
             .to_string();
 
-        let label = client
+        let xray_email = client
             .get("email")
             .and_then(Value::as_str)
             .map(ToString::to_string)
             .unwrap_or_else(|| id.clone());
+        let metadata_entry = metadata.users.get(&id).cloned().unwrap_or_default();
+        let label = metadata_entry
+            .label
+            .clone()
+            .unwrap_or_else(|| xray_email.clone());
         let flow = client
             .get("flow")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let metadata_entry = metadata.users.get(&id).cloned().unwrap_or_default();
-
         users.push(ManagedUser {
             id: id.clone(),
             label: label.clone(),
@@ -981,6 +1052,33 @@ fn clients_mut(root: &mut Value) -> Result<&mut Vec<Value>, String> {
         })
 }
 
+fn identity_pairs(root: &Value) -> Result<Vec<(String, String)>, String> {
+    clients(root)?
+        .iter()
+        .map(|client| {
+            let user_id = client
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Encountered a client without a valid UUID.".to_string())?;
+            let xray_email = client
+                .get("email")
+                .and_then(Value::as_str)
+                .filter(|email| !email.is_empty())
+                .unwrap_or(user_id);
+            Ok((user_id.to_string(), xray_email.to_string()))
+        })
+        .collect()
+}
+
+fn load_current_identities() -> Result<Vec<(String, String)>, String> {
+    let config_path = detect_config_path().ok_or("No Xray config found.")?;
+    let contents =
+        fs::read_to_string(config_path).map_err(|e| format!("Cannot read Xray config: {e}"))?;
+    let root: Value =
+        serde_json::from_str(&contents).map_err(|e| format!("Cannot parse Xray config: {e}"))?;
+    identity_pairs(&root)
+}
+
 fn metadata_path_for(config_path: &Path) -> Result<PathBuf, String> {
     let parent = config_path
         .parent()
@@ -992,7 +1090,7 @@ fn read_metadata(path: &Path) -> Result<(UserMetadataStore, Option<Vec<u8>>), St
     if !path.exists() {
         return Ok((
             UserMetadataStore {
-                version: 1,
+                version: 2,
                 users: HashMap::new(),
             },
             None,
@@ -1003,7 +1101,7 @@ fn read_metadata(path: &Path) -> Result<(UserMetadataStore, Option<Vec<u8>>), St
         fs::read(path).map_err(|error| format!("Failed to read metadata file: {error}"))?;
     let metadata: UserMetadataStore = serde_json::from_slice(&contents)
         .map_err(|error| format!("Failed to parse metadata JSON: {error}"))?;
-    if metadata.version != 1 {
+    if metadata.version != 1 && metadata.version != 2 {
         return Err(format!(
             "Unsupported metadata version: {}.",
             metadata.version
@@ -1061,19 +1159,13 @@ fn derive_public_key(private_key: &str) -> Option<String> {
     Some(public_key)
 }
 
-fn next_user_label(root: &Value, preferred: Option<&str>) -> String {
+fn next_user_label(root: &Value, metadata: &UserMetadataStore, preferred: Option<&str>) -> String {
     if let Some(preferred) = preferred.and_then(normalize_optional) {
         return preferred;
     }
 
-    let existing: Vec<String> = clients(root)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|client| client.get("email").and_then(Value::as_str))
-                .map(ToString::to_string)
-                .collect()
-        })
+    let existing = collect_users(root, metadata, &RealityLinkContext::default())
+        .map(|users| users.into_iter().map(|user| user.label).collect::<Vec<_>>())
         .unwrap_or_default();
 
     let mut index = 1;
@@ -1083,6 +1175,22 @@ fn next_user_label(root: &Value, preferred: Option<&str>) -> String {
             return candidate;
         }
         index += 1;
+    }
+}
+
+fn ensure_label_unique(
+    root: &Value,
+    metadata: &UserMetadataStore,
+    label: &str,
+    excluding_user_id: Option<&str>,
+) -> Result<(), String> {
+    let duplicate = collect_users(root, metadata, &RealityLinkContext::default())?
+        .into_iter()
+        .any(|user| user.id != excluding_user_id.unwrap_or_default() && user.label == label);
+    if duplicate {
+        Err("User label is already in use.".to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -1252,6 +1360,7 @@ fn parse_traffic_stats(output: &str) -> Vec<UserTraffic> {
     traffic_map
         .into_iter()
         .map(|(email, (uplink, downlink))| UserTraffic {
+            user_id: None,
             email,
             uplink,
             downlink,
@@ -1291,6 +1400,7 @@ pub fn run() {
             set_user_quota,
             pull_access_logs,
             get_connection_logs,
+            get_user_analytics,
             service_action
         ])
         .run(tauri::generate_context!())
@@ -1343,5 +1453,24 @@ mod tests {
             server_name: Some("www.example.com".to_string()),
         })
         .is_ok());
+    }
+
+    #[test]
+    fn resolves_analytics_presets_and_explicit_ranges() {
+        for (preset, seconds) in [
+            ("24h", 86_400),
+            ("7d", 7 * 86_400),
+            ("30d", 30 * 86_400),
+            ("90d", 90 * 86_400),
+        ] {
+            let (from, to) = resolve_analytics_range(Some(preset), None, None).unwrap();
+            assert_eq!(to - from, seconds);
+        }
+        assert_eq!(
+            resolve_analytics_range(Some("custom"), Some(10), Some(20)).unwrap(),
+            (10, 20)
+        );
+        assert!(resolve_analytics_range(None, Some(20), Some(10)).is_err());
+        assert!(resolve_analytics_range(Some("1y"), None, None).is_err());
     }
 }
