@@ -1,0 +1,28 @@
+:root {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #22201d;
+  background: #f4f0e8;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 42rem;
+  margin: 12vh auto;
+  padding: 2rem;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+}
+
+pre {
+  overflow: auto;
+  padding: 1rem;
+  border: 1px solid #c9c0b2;
+  border-radius: 0.5rem;
+  background: #fffaf2;
+}
