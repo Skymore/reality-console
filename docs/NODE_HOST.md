@@ -253,16 +253,32 @@ Native `launchd` and `systemd` installation remains a packaging step rather than
 
 Unlike `sync-once`, `run` also owns the managed Xray child. It revalidates both the explicit binary
 and 0600 candidate immediately before each no-shell spawn, waits up to 10 seconds for the expected
-loopback listener, then requires five seconds of process stability before atomically committing the
-active pointer and `applied` result. A replacement candidate failure restarts and health-checks the
-durable predecessor before reporting `rolledBack`. With no predecessor, startup is retried at most
-three times before a stable `rejected`. An interrupted switch keeps the predecessor pointer and is
-conservatively completed as rollback on restart. Current shutdown uses bounded forceful kill/reap;
-graceful termination remains a later process-boundary enhancement.
+loopback listener, then requires five seconds of process stability. For schema version 2 it next
+binds the signed public IPv4 port in an agent-owned byte-transparent admission gate and proves that
+a local connection through that gate reached Xray without sending protocol bytes. The gate has a
+default 16-stream concurrency ceiling, a bounded three-second backend connection timeout, and
+structured shutdown that aborts and reaps active stream tasks before Xray stops. Only then does the
+agent atomically commit the active pointer and `applied` result. A replacement candidate failure
+restarts and health-checks both parts of the durable predecessor before reporting `rolledBack`.
+With no predecessor, startup is retried at most three times before a stable `rejected`. An
+interrupted switch keeps the predecessor pointer and is conservatively completed as rollback on
+restart. Current Xray shutdown uses bounded forceful kill/reap; graceful termination remains a
+later process-boundary enhancement.
 
-This lifecycle does not yet make the node externally usable. Xray binds only to loopback and the
-planned admission gate, router mapping, external probe, and relay adapter are not implemented in
-this milestone. It therefore cannot bypass provider policy by exposing Xray directly.
+While serving, the supervisor rechecks the gate's loopback backend every 30 seconds without using a
+provider connection slot. A failed check closes the public listener and Xray before the next retry,
+so heartbeat cannot continue to report `serving` for a broken data path. Legacy schema-version-1
+revisions remain executable only for rollback compatibility; because they do not sign a public
+gate port, they stay loopback-only and report `degraded`. The current revision switch closes the
+old gate before binding the candidate, so a successful update can include a short service gap.
+Keeping a stable listener and atomically changing backend generations is a later availability
+optimization, not a correctness prerequisite for this best-effort friend network.
+
+The public listener alone does not prove internet reachability. Automatic router mapping,
+controller-originated external TCP and protocol probes, IPv6 admission, relay fallback, bandwidth
+shaping, and durable quota counters are not implemented in this milestone. Until mapping and probe
+convergence lands, a provider still needs a valid manual TCP forwarding rule and there is no
+controller claim that the node is externally reachable.
 
 ## 7. Outbound-Only Control Sync
 
@@ -984,6 +1000,8 @@ desired_policy_prohibited
 xray_config_invalid
 xray_start_failed
 xray_unhealthy
+admission_bind_failed
+admission_unhealthy
 rollback_failed
 mapping_not_supported
 mapping_conflict

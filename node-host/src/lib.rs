@@ -1,6 +1,7 @@
 //! Persistent local foundation for the Reality Console node host.
 
 mod activation;
+mod admission;
 mod bootstrap;
 mod enrollment;
 mod service;

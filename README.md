@@ -35,11 +35,12 @@ owner-only, digest-checked on restart, and never replace a known-good configurat
 validation. A friend-facing backend bootstrap accepts invitation JSON directly from a desktop
 wrapper, initializes stable local identity, verifies installer-bundled Xray before consuming the
 invitation, and completes enrollment as one idempotent retryable operation. The long-running
-`node-host run` service now owns a checksum-revalidated Xray child,
-activates only controller-acknowledged candidates, records the active pointer atomically with
-`applied`, and restores a proven predecessor after startup or loopback-health failure. It remains
-loopback-only: native service installers, the public admission gate, direct/relay reachability,
-account synchronization, and the friend-facing setup UI/package are still under implementation.
+`node-host run` service now owns both a checksum-revalidated Xray child and a byte-transparent IPv4
+admission gate. It activates only controller-acknowledged candidates, requires the signed public
+port to bind and reach Xray through a local canary before recording `applied`, and restores both
+parts of a proven predecessor after failure. Native service installers, automatic router mapping,
+controller-side external probes, relay reachability, account synchronization, and the friend-facing
+setup UI/package are still under implementation.
 
 ## Authoritative Documentation
 

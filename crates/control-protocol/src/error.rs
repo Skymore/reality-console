@@ -53,6 +53,10 @@ pub enum ErrorCode {
     XrayStartFailed,
     /// A started Xray candidate failed bounded local health checks.
     XrayUnhealthy,
+    /// The node could not bind the signed public admission port.
+    AdmissionBindFailed,
+    /// The public admission gate could not reach the candidate Xray listener.
+    AdmissionUnhealthy,
     /// The previously applied Xray revision could not be restored safely.
     RollbackFailed,
     /// An ordered telemetry batch contains a gap.
@@ -100,6 +104,8 @@ impl ErrorCode {
             Self::ValidationFailed => "validation_failed",
             Self::XrayStartFailed => "xray_start_failed",
             Self::XrayUnhealthy => "xray_unhealthy",
+            Self::AdmissionBindFailed => "admission_bind_failed",
+            Self::AdmissionUnhealthy => "admission_unhealthy",
             Self::RollbackFailed => "rollback_failed",
             Self::TelemetrySequenceGap => "telemetry_sequence_gap",
             Self::Conflict => "conflict",
@@ -135,6 +141,8 @@ impl ErrorCode {
             "validation_failed" => Self::ValidationFailed,
             "xray_start_failed" => Self::XrayStartFailed,
             "xray_unhealthy" => Self::XrayUnhealthy,
+            "admission_bind_failed" => Self::AdmissionBindFailed,
+            "admission_unhealthy" => Self::AdmissionUnhealthy,
             "rollback_failed" => Self::RollbackFailed,
             "telemetry_sequence_gap" => Self::TelemetrySequenceGap,
             "conflict" => Self::Conflict,
@@ -236,10 +244,12 @@ mod tests {
     }
 
     #[test]
-    fn xray_lifecycle_codes_have_stable_wire_values() {
+    fn node_runtime_lifecycle_codes_have_stable_wire_values() {
         for (code, expected) in [
             (ErrorCode::XrayStartFailed, "xray_start_failed"),
             (ErrorCode::XrayUnhealthy, "xray_unhealthy"),
+            (ErrorCode::AdmissionBindFailed, "admission_bind_failed"),
+            (ErrorCode::AdmissionUnhealthy, "admission_unhealthy"),
             (ErrorCode::RollbackFailed, "rollback_failed"),
         ] {
             assert_eq!(

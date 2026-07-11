@@ -49,6 +49,7 @@ pub(crate) struct ValidatedXrayCandidate {
     pub binary_path: PathBuf,
     pub binary_digest: RuntimeSha256Digest,
     pub listen_port: u16,
+    pub public_port: Option<u16>,
 }
 
 /// Verifies and records an installer-provided Xray runtime without starting it.
@@ -283,6 +284,7 @@ pub(crate) fn load_validated_candidate(
         binary_path: PathBuf::from(runtime.binary_path),
         binary_digest,
         listen_port: envelope.document.xray.listen_port,
+        public_port: envelope.document.xray.public_port,
     })
 }
 

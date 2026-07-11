@@ -1,3 +1,4 @@
+use crate::admission::{AdmissionGate, AdmissionOptions};
 use crate::xray::{insert_revision_result, load_validated_candidate, ValidatedXrayCandidate};
 use crate::{migrate, open_database, unix_timestamp};
 use anyhow::{bail, Context, Result};
@@ -19,6 +20,7 @@ use xray_runtime::{
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_STABILIZATION_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const RUNTIME_ADMISSION_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_ACTIVATION_ATTEMPTS_WITHOUT_PREDECESSOR: i64 = 3;
 const MAX_RUNTIME_DELAY: Duration = Duration::from_secs(5 * 60);
 
@@ -27,6 +29,7 @@ pub(crate) struct ActivationOptions {
     startup_timeout: Duration,
     stabilization_duration: Duration,
     probe_interval: Duration,
+    admission: AdmissionOptions,
 }
 
 impl Default for ActivationOptions {
@@ -35,6 +38,7 @@ impl Default for ActivationOptions {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             stabilization_duration: DEFAULT_STABILIZATION_DURATION,
             probe_interval: DEFAULT_PROBE_INTERVAL,
+            admission: AdmissionOptions::default(),
         }
     }
 }
@@ -50,13 +54,17 @@ impl ActivationOptions {
         {
             bail!("Xray activation timing options are invalid");
         }
+        self.admission.validate()?;
         Ok(self)
     }
 }
 
 pub(crate) struct XraySupervisor {
     child: Option<ManagedXrayChild>,
+    admission: Option<AdmissionGate>,
     running_revision: Option<Revision>,
+    running_public_port: Option<u16>,
+    last_admission_probe: Option<Instant>,
     options: ActivationOptions,
 }
 
@@ -108,7 +116,10 @@ impl XraySupervisor {
     pub(crate) fn new(options: ActivationOptions) -> Result<Self> {
         Ok(Self {
             child: None,
+            admission: None,
             running_revision: None,
+            running_public_port: None,
+            last_admission_probe: None,
             options: options.validate()?,
         })
     }
@@ -160,11 +171,15 @@ impl XraySupervisor {
         }
 
         let candidate = load_candidate(data_dir, revision)?;
-        let previous_revision = active.as_ref().map(|state| state.revision);
+        let previous = active
+            .as_ref()
+            .map(|state| load_candidate(data_dir, state.revision))
+            .transpose()?;
+        let previous_revision = previous.as_ref().map(|candidate| candidate.revision);
         let attempt = begin_activation(data_dir, revision, previous_revision)?;
-        if let Err(error) = self.stop_child().await {
+        if let Err(error) = self.stop_runtime().await {
             mark_recovery_required(data_dir, revision, &ErrorCode::RollbackFailed)?;
-            return Err(error).context("existing Xray child could not be stopped safely");
+            return Err(error).context("existing node runtime could not be stopped safely");
         }
 
         let child = match self.spawn_candidate(&candidate).await {
@@ -174,7 +189,7 @@ impl XraySupervisor {
                     .handle_activation_failure(
                         data_dir,
                         &candidate,
-                        previous_revision,
+                        previous.as_ref(),
                         attempt,
                         failure,
                     )
@@ -182,54 +197,116 @@ impl XraySupervisor {
             }
         };
         self.own_child(child);
-        update_journal_phase(data_dir, revision, JournalPhase::Stabilizing, None)?;
-        match self.prove_owned_child_healthy(candidate.listen_port).await {
+        self.stabilize_and_commit_candidate(data_dir, &candidate, previous.as_ref(), attempt)
+            .await
+    }
+
+    async fn stabilize_and_commit_candidate(
+        &mut self,
+        data_dir: &Path,
+        candidate: &ValidatedXrayCandidate,
+        previous: Option<&ValidatedXrayCandidate>,
+        attempt: i64,
+    ) -> Result<()> {
+        if let Err(journal_error) = update_journal_phase(
+            data_dir,
+            candidate.revision,
+            JournalPhase::Stabilizing,
+            None,
+        ) {
+            if let Err(restore_error) = self.restore_after_commit_failure(previous).await {
+                mark_recovery_required(data_dir, candidate.revision, &ErrorCode::RollbackFailed)?;
+                return Err(restore_error).with_context(|| {
+                    format!(
+                        "candidate journal transition also failed before rollback: {journal_error:#}"
+                    )
+                });
+            }
+            return Err(journal_error)
+                .context("candidate journal transition failed; previous runtime restored");
+        }
+        let activation_result = match self.prove_owned_child_healthy(candidate.listen_port).await {
+            Ok(()) => self.start_admission(candidate).await,
+            Err(failure) => Err(failure),
+        };
+        match activation_result {
             Ok(()) => {
-                finalize_applied(data_dir, &candidate)?;
-                self.running_revision = Some(revision);
+                if let Err(commit_error) = finalize_applied(data_dir, candidate) {
+                    return self
+                        .resolve_commit_failure(data_dir, candidate, previous, commit_error)
+                        .await;
+                }
+                self.mark_running(candidate);
                 Ok(())
             }
             Err(failure) => {
-                self.handle_activation_failure(
-                    data_dir,
-                    &candidate,
-                    previous_revision,
-                    attempt,
-                    failure,
-                )
-                .await
+                self.handle_activation_failure(data_dir, candidate, previous, attempt, failure)
+                    .await
             }
         }
     }
 
     pub(crate) async fn poll(&mut self, data_dir: &Path) -> Result<()> {
-        if self.observe_runtime_state()? == control_protocol::node::NodeRuntimeState::Serving {
-            Ok(())
-        } else {
-            self.ensure_active_running(data_dir).await
+        let state = self.observe_runtime_state()?;
+        if matches!(
+            state,
+            control_protocol::node::NodeRuntimeState::Serving
+                | control_protocol::node::NodeRuntimeState::Degraded
+        ) {
+            if state == control_protocol::node::NodeRuntimeState::Serving
+                && self.admission_probe_is_due()
+            {
+                let probe_result = self
+                    .admission
+                    .as_ref()
+                    .context("serving runtime lost admission ownership")?
+                    .prove_backend_ready()
+                    .await;
+                if let Err(probe_error) = probe_result {
+                    let cleanup_result = self.stop_runtime().await;
+                    cleanup_result.context("unhealthy admission runtime could not be stopped")?;
+                    return Err(probe_error)
+                        .context("applied admission backend failed its runtime health check");
+                }
+                self.last_admission_probe = Some(Instant::now());
+            }
+            return Ok(());
         }
+        self.ensure_active_running(data_dir).await
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<()> {
-        self.stop_child().await
+        self.stop_runtime().await
     }
 
     pub(crate) fn observe_runtime_state(
         &mut self,
     ) -> Result<control_protocol::node::NodeRuntimeState> {
         let Some(child) = self.child.as_mut() else {
-            self.running_revision = None;
+            self.clear_running_marker();
             return Ok(control_protocol::node::NodeRuntimeState::Idle);
         };
         if child.try_wait()?.is_some() {
             self.child = None;
-            self.running_revision = None;
+            self.clear_running_marker();
             return Ok(control_protocol::node::NodeRuntimeState::Idle);
         }
-        Ok(if self.running_revision.is_some() {
+        if self.running_revision.is_none() {
+            return Ok(control_protocol::node::NodeRuntimeState::Idle);
+        }
+        if self.running_public_port.is_some()
+            && !self
+                .admission
+                .as_ref()
+                .is_some_and(AdmissionGate::is_running)
+        {
+            self.clear_running_marker();
+            return Ok(control_protocol::node::NodeRuntimeState::Idle);
+        }
+        Ok(if self.running_public_port.is_some() {
             control_protocol::node::NodeRuntimeState::Serving
         } else {
-            control_protocol::node::NodeRuntimeState::Idle
+            control_protocol::node::NodeRuntimeState::Degraded
         })
     }
 
@@ -250,7 +327,13 @@ impl XraySupervisor {
                 mark_recovery_required(data_dir, journal.revision, &ErrorCode::RollbackFailed)?;
                 bail!("activation journal predecessor does not match active state");
             }
-            self.ensure_active_running(data_dir).await?;
+            if let Err(recovery_error) = self.ensure_active_running(data_dir).await {
+                let cleanup_result = self.stop_runtime().await;
+                mark_recovery_required(data_dir, journal.revision, &ErrorCode::RollbackFailed)?;
+                cleanup_result.context("failed recovery runtime could not be cleaned up")?;
+                return Err(recovery_error)
+                    .context("activation predecessor could not be restored during recovery");
+            }
             let previous = load_candidate(data_dir, previous_revision)?;
             finalize_rolled_back(data_dir, journal, &previous, &ErrorCode::XrayUnhealthy)?;
             return Ok(());
@@ -274,38 +357,146 @@ impl XraySupervisor {
             load_active_state(&connection)?
         };
         let Some(active) = active else {
-            if self.child.is_some() {
-                self.stop_child().await?;
+            if self.child.is_some() || self.admission.is_some() {
+                self.stop_runtime().await?;
             }
             return Ok(());
         };
         if self.running_revision == Some(active.revision) {
-            if let Some(child) = self.child.as_mut() {
-                if child.try_wait()?.is_none() {
-                    return Ok(());
-                }
+            let state = self.observe_runtime_state()?;
+            if matches!(
+                state,
+                control_protocol::node::NodeRuntimeState::Serving
+                    | control_protocol::node::NodeRuntimeState::Degraded
+            ) {
+                return Ok(());
             }
-            self.child = None;
-            self.running_revision = None;
         }
-        self.stop_child().await?;
+        self.stop_runtime().await?;
         let candidate = load_candidate(data_dir, active.revision)?;
         if candidate.config_digest.as_str() != active.config_digest
             || candidate.binary_digest.to_string() != active.binary_digest
         {
             bail!("active Xray pointer does not match its verified candidate");
         }
-        let child = self
-            .spawn_candidate(&candidate)
-            .await
-            .map_err(|failure| failure.error)?;
-        self.own_child(child);
-        self.prove_owned_child_healthy(candidate.listen_port)
+        self.start_proven_candidate(&candidate)
             .await
             .map_err(|failure| failure.error)?;
         record_active_restart(data_dir, active.revision)?;
-        self.running_revision = Some(active.revision);
         Ok(())
+    }
+
+    async fn start_proven_candidate(
+        &mut self,
+        candidate: &ValidatedXrayCandidate,
+    ) -> std::result::Result<(), ActivationFailure> {
+        let child = self.spawn_candidate(candidate).await?;
+        self.own_child(child);
+        if let Err(failure) = self.prove_owned_child_healthy(candidate.listen_port).await {
+            return Err(self.stop_after_health_failure(failure).await);
+        }
+        if let Err(failure) = self.start_admission(candidate).await {
+            return Err(self.stop_after_health_failure(failure).await);
+        }
+        self.mark_running(candidate);
+        Ok(())
+    }
+
+    async fn restore_after_commit_failure(
+        &mut self,
+        previous: Option<&ValidatedXrayCandidate>,
+    ) -> Result<()> {
+        self.stop_runtime()
+            .await
+            .context("uncommitted candidate runtime could not be stopped")?;
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+        self.start_proven_candidate(previous)
+            .await
+            .map_err(|failure| failure.error)
+            .context("previous runtime could not be restored after commit failure")
+    }
+
+    async fn resolve_commit_failure(
+        &mut self,
+        data_dir: &Path,
+        candidate: &ValidatedXrayCandidate,
+        previous: Option<&ValidatedXrayCandidate>,
+        commit_error: anyhow::Error,
+    ) -> Result<()> {
+        let durable_revision = match (|| -> Result<Option<Revision>> {
+            let connection = open_database(data_dir, false)?;
+            Ok(load_active_state(&connection)?.map(|state| state.revision))
+        })() {
+            Ok(revision) => revision,
+            Err(state_error) => {
+                let cleanup_result = self.stop_runtime().await;
+                cleanup_result
+                    .context("unconfirmed candidate runtime could not be stopped safely")?;
+                return Err(state_error).with_context(|| {
+                    format!(
+                        "candidate commit failed and durable state cannot be confirmed: {commit_error:#}"
+                    )
+                });
+            }
+        };
+        if durable_revision == Some(candidate.revision) {
+            self.mark_running(candidate);
+            return Err(commit_error).context(
+                "candidate commit returned an error but durable state confirms it applied",
+            );
+        }
+        let expected_previous = previous.map(|candidate| candidate.revision);
+        if durable_revision == expected_previous {
+            if let Err(restore_error) = self.restore_after_commit_failure(previous).await {
+                mark_recovery_required(data_dir, candidate.revision, &ErrorCode::RollbackFailed)?;
+                return Err(restore_error).with_context(|| {
+                    format!(
+                        "candidate durable commit also failed before rollback: {commit_error:#}"
+                    )
+                });
+            }
+            return Err(commit_error)
+                .context("candidate durable commit failed; previous runtime restored");
+        }
+
+        let cleanup_result = self.stop_runtime().await;
+        mark_recovery_required(data_dir, candidate.revision, &ErrorCode::StateConflict)?;
+        cleanup_result.context("inconsistent post-commit runtime could not be stopped")?;
+        Err(commit_error).context("candidate commit left an unexpected durable active revision")
+    }
+
+    async fn start_admission(
+        &mut self,
+        candidate: &ValidatedXrayCandidate,
+    ) -> std::result::Result<(), ActivationFailure> {
+        let Some(public_port) = candidate.public_port else {
+            return Ok(());
+        };
+        let gate = AdmissionGate::start(public_port, candidate.listen_port, self.options.admission)
+            .map_err(|error| {
+                ActivationFailure::from_error(ErrorCode::AdmissionBindFailed, error)
+            })?;
+        debug_assert!(self.admission.is_none());
+        self.admission = Some(gate);
+        self.admission
+            .as_ref()
+            .expect("admission gate was just installed")
+            .prove_ready()
+            .await
+            .map_err(|error| ActivationFailure::from_error(ErrorCode::AdmissionUnhealthy, error))?;
+        match self.owned_child_status() {
+            Ok(None) => Ok(()),
+            Ok(Some(_)) => Err(ActivationFailure::new(
+                ErrorCode::XrayUnhealthy,
+                "managed Xray exited while the admission gate was starting",
+            )),
+            Err(error) => Err(ActivationFailure::from_error(
+                ErrorCode::XrayUnhealthy,
+                error,
+            )),
+        }
     }
 
     async fn spawn_candidate(
@@ -413,35 +604,31 @@ impl XraySupervisor {
         &mut self,
         data_dir: &Path,
         candidate: &ValidatedXrayCandidate,
-        previous_revision: Option<Revision>,
+        previous: Option<&ValidatedXrayCandidate>,
         attempt: i64,
         failure: ActivationFailure,
     ) -> Result<()> {
-        if let Err(error) = self.stop_child().await {
+        if let Err(error) = self.stop_runtime().await {
             mark_recovery_required(data_dir, candidate.revision, &ErrorCode::RollbackFailed)?;
-            return Err(error).context("failed Xray child could not be stopped safely");
+            return Err(error).context("failed node runtime could not be stopped safely");
         }
-        if let Some(previous_revision) = previous_revision {
+        if let Some(previous) = previous {
+            if self.start_proven_candidate(previous).await.is_err() {
+                let cleanup_result = self.stop_runtime().await;
+                mark_recovery_required(data_dir, candidate.revision, &ErrorCode::RollbackFailed)?;
+                cleanup_result.context("failed rollback runtime could not be cleaned up")?;
+                bail!("previous runtime failed rollback health checks");
+            }
             update_journal_phase(
                 data_dir,
                 candidate.revision,
                 JournalPhase::RollingBack,
                 Some(&failure.code),
-            )?;
-            let previous = load_candidate(data_dir, previous_revision)?;
-            let Ok(child) = self.spawn_candidate(&previous).await else {
-                mark_recovery_required(data_dir, candidate.revision, &ErrorCode::RollbackFailed)?;
-                bail!("previous Xray revision could not be restarted");
-            };
-            self.own_child(child);
-            let Ok(()) = self.prove_owned_child_healthy(previous.listen_port).await else {
-                mark_recovery_required(data_dir, candidate.revision, &ErrorCode::RollbackFailed)?;
-                bail!("previous Xray revision failed rollback health checks");
-            };
+            )
+            .context("previous runtime restored but rollback journal update failed")?;
             let journal = load_journal(data_dir, candidate.revision)?;
-            finalize_rolled_back(data_dir, &journal, &previous, &failure.code)?;
-            self.running_revision = Some(previous_revision);
-            record_active_restart(data_dir, previous_revision)?;
+            finalize_rolled_back(data_dir, &journal, previous, &failure.code)?;
+            record_active_restart(data_dir, previous.revision)?;
             return Ok(());
         }
 
@@ -459,19 +646,38 @@ impl XraySupervisor {
         }
     }
 
-    async fn stop_child(&mut self) -> Result<()> {
+    async fn stop_runtime(&mut self) -> Result<()> {
+        self.clear_running_marker();
+        let admission_error = if let Some(admission) = self.admission.as_mut() {
+            admission.shutdown().await.err()
+        } else {
+            None
+        };
+        self.admission = None;
         if let Some(child) = self.child.as_mut() {
-            child.kill_and_wait().await?;
+            if let Err(error) = child.kill_and_wait().await {
+                return match admission_error {
+                    Some(admission_error) => Err(error).with_context(|| {
+                        format!(
+                            "admission cleanup also failed before Xray cleanup: {admission_error:#}"
+                        )
+                    }),
+                    None => Err(error.into()),
+                };
+            }
         }
         self.child = None;
-        self.running_revision = None;
-        Ok(())
+        match admission_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn own_child(&mut self, child: ManagedXrayChild) {
         debug_assert!(self.child.is_none());
+        debug_assert!(self.admission.is_none());
         self.child = Some(child);
-        self.running_revision = None;
+        self.clear_running_marker();
     }
 
     fn owned_child_status(&mut self) -> Result<Option<std::process::ExitStatus>> {
@@ -482,13 +688,42 @@ impl XraySupervisor {
             .try_wait()?;
         if status.is_some() {
             self.child = None;
-            self.running_revision = None;
+            self.clear_running_marker();
         }
         Ok(status)
     }
 
+    fn mark_running(&mut self, candidate: &ValidatedXrayCandidate) {
+        debug_assert!(self.child.is_some());
+        debug_assert!(
+            candidate.public_port.is_none()
+                || self
+                    .admission
+                    .as_ref()
+                    .is_some_and(AdmissionGate::is_running)
+        );
+        self.running_revision = Some(candidate.revision);
+        self.running_public_port = candidate.public_port;
+        self.last_admission_probe = candidate.public_port.map(|_| Instant::now());
+    }
+
+    fn clear_running_marker(&mut self) {
+        self.running_revision = None;
+        self.running_public_port = None;
+        self.last_admission_probe = None;
+    }
+
+    fn admission_probe_is_due(&self) -> bool {
+        match self.last_admission_probe {
+            Some(last_probe) => {
+                Instant::now().duration_since(last_probe) >= RUNTIME_ADMISSION_PROBE_INTERVAL
+            }
+            None => true,
+        }
+    }
+
     async fn stop_after_health_failure(&mut self, failure: ActivationFailure) -> ActivationFailure {
-        match self.stop_child().await {
+        match self.stop_runtime().await {
             Ok(()) => failure,
             Err(error) => ActivationFailure::from_error(ErrorCode::RollbackFailed, error),
         }
@@ -967,8 +1202,8 @@ fn timestamp_from_unix(value: i64) -> Result<Timestamp> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        begin_activation, ActivationOptions, JournalPhase, XraySupervisor,
-        MAX_ACTIVATION_ATTEMPTS_WITHOUT_PREDECESSOR,
+        begin_activation, ActivationOptions, AdmissionGate, AdmissionOptions, JournalPhase,
+        XraySupervisor, MAX_ACTIVATION_ATTEMPTS_WITHOUT_PREDECESSOR,
     };
     use crate::xray::validate_desired_state;
     use crate::{configure_xray, initialize, open_database, unix_timestamp};
@@ -992,7 +1227,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use time::OffsetDateTime;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     #[derive(Debug, Clone, Copy)]
     enum FakeMode {
@@ -1046,9 +1281,10 @@ mod tests {
     struct Fixture {
         _directory: tempfile::TempDir,
         _fake: FakeXray,
-        _listener: TcpListener,
+        listener: Option<TcpListener>,
         data_dir: PathBuf,
         listen_port: u16,
+        public_port: u16,
     }
 
     impl Fixture {
@@ -1062,20 +1298,36 @@ mod tests {
                 .unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let listen_port = listener.local_addr().unwrap().port();
+            let public_port = unused_port().await;
+            assert_ne!(listen_port, public_port);
             Self {
                 _directory: directory,
                 _fake: fake,
-                _listener: listener,
+                listener: Some(listener),
                 data_dir,
                 listen_port,
+                public_port,
             }
         }
 
         async fn validate_revision(&self, revision: i64) {
-            let envelope = desired_state(revision, self.listen_port);
-            persist_received(&self.data_dir, &envelope);
+            self.validate_revision_at(revision, self.public_port).await;
+        }
+
+        async fn validate_revision_at(&self, revision: i64, public_port: u16) {
+            let envelope = desired_state(revision, self.listen_port, Some(public_port));
+            self.validate_envelope(revision, &envelope).await;
+        }
+
+        async fn validate_legacy_revision(&self, revision: i64) {
+            let envelope = desired_state(revision, self.listen_port, None);
+            self.validate_envelope(revision, &envelope).await;
+        }
+
+        async fn validate_envelope(&self, revision: i64, envelope: &SignedDesiredState) {
+            persist_received(&self.data_dir, envelope);
             let mut connection = open_database(&self.data_dir, false).unwrap();
-            validate_desired_state(&self.data_dir, &mut connection, &envelope)
+            validate_desired_state(&self.data_dir, &mut connection, envelope)
                 .await
                 .unwrap();
             let now = unix_timestamp().unwrap();
@@ -1087,6 +1339,10 @@ mod tests {
                 )
                 .unwrap();
         }
+
+        fn close_loopback_backend(&mut self) {
+            self.listener.take();
+        }
     }
 
     fn fast_options() -> ActivationOptions {
@@ -1094,12 +1350,28 @@ mod tests {
             startup_timeout: Duration::from_millis(200),
             stabilization_duration: Duration::from_millis(20),
             probe_interval: Duration::from_millis(5),
+            admission: AdmissionOptions {
+                max_connections: 4,
+                connect_timeout: Duration::from_millis(100),
+                canary_timeout: Duration::from_millis(200),
+                probe_interval: Duration::from_millis(5),
+                accept_error_backoff: Duration::from_millis(5),
+            },
         }
     }
 
-    fn desired_state(revision: i64, listen_port: u16) -> SignedDesiredState {
+    async fn unused_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn desired_state(
+        revision: i64,
+        listen_port: u16,
+        public_port: Option<u16>,
+    ) -> SignedDesiredState {
         let document = DesiredStateDocument {
-            schema_version: 1,
+            schema_version: if public_port.is_some() { 2 } else { 1 },
             network_id: "11111111-1111-4111-8111-111111111111"
                 .parse::<NetworkId>()
                 .unwrap(),
@@ -1112,7 +1384,7 @@ mod tests {
             users: Vec::new(),
             xray: DesiredXrayState {
                 listen_port,
-                public_port: None,
+                public_port,
                 server_names: vec!["www.microsoft.com".to_string()],
                 target: "www.microsoft.com:443".to_string(),
             },
@@ -1260,6 +1532,10 @@ mod tests {
         let result = stored_result(&fixture.data_dir, 1, "applied");
         assert_eq!(result.state, RevisionResultState::Applied);
         assert!(result.config_digest.is_some());
+        assert!(supervisor
+            .admission
+            .as_ref()
+            .is_some_and(AdmissionGate::is_running));
         supervisor.shutdown().await.unwrap();
     }
 
@@ -1287,6 +1563,113 @@ mod tests {
             result.error_code,
             Some(ErrorCode::XrayStartFailed | ErrorCode::XrayUnhealthy)
         ));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn occupied_candidate_admission_port_restores_the_previous_gate() {
+        let fixture = Fixture::new(FakeMode::Valid).await;
+        fixture.validate_revision(1).await;
+        let mut supervisor = XraySupervisor::new(fast_options()).unwrap();
+        supervisor.recover(&fixture.data_dir).await.unwrap();
+        supervisor.reconcile(&fixture.data_dir).await.unwrap();
+        let occupied = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        fixture.validate_revision_at(2, occupied_port).await;
+
+        supervisor.reconcile(&fixture.data_dir).await.unwrap();
+
+        assert_eq!(
+            supervisor.observe_runtime_state().unwrap(),
+            NodeRuntimeState::Serving
+        );
+        assert_eq!(stored_active_revision(&fixture.data_dir), Some(1));
+        assert_eq!(stored_journal(&fixture.data_dir, 2).0, "rolledBack");
+        assert_eq!(
+            stored_result(&fixture.data_dir, 2, "rolledBack").error_code,
+            Some(ErrorCode::AdmissionBindFailed)
+        );
+        assert!(TcpStream::connect(("127.0.0.1", fixture.public_port))
+            .await
+            .is_ok());
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_commit_failure_immediately_restores_the_previous_runtime() {
+        let fixture = Fixture::new(FakeMode::Valid).await;
+        fixture.validate_revision(1).await;
+        let mut supervisor = XraySupervisor::new(fast_options()).unwrap();
+        supervisor.recover(&fixture.data_dir).await.unwrap();
+        supervisor.reconcile(&fixture.data_dir).await.unwrap();
+        fixture.validate_revision(2).await;
+        let connection = Connection::open(fixture.data_dir.join("node-host.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER inject_revision_two_commit_failure
+                 BEFORE UPDATE OF applied_revision ON xray_active_state
+                 WHEN NEW.applied_revision = 2
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected active-state failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = supervisor.reconcile(&fixture.data_dir).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("previous runtime restored"));
+        assert_eq!(stored_active_revision(&fixture.data_dir), Some(1));
+        assert_eq!(stored_journal(&fixture.data_dir, 2).0, "stabilizing");
+        assert_eq!(
+            supervisor.observe_runtime_state().unwrap(),
+            NodeRuntimeState::Serving
+        );
+
+        connection
+            .execute_batch("DROP TRIGGER inject_revision_two_commit_failure;")
+            .unwrap();
+        drop(connection);
+        supervisor.reconcile(&fixture.data_dir).await.unwrap();
+        assert_eq!(stored_active_revision(&fixture.data_dir), Some(2));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_backend_failure_stops_the_public_gate_and_reports_idle() {
+        let mut fixture = Fixture::new(FakeMode::Valid).await;
+        fixture.validate_revision(1).await;
+        let mut supervisor = XraySupervisor::new(fast_options()).unwrap();
+        supervisor.recover(&fixture.data_dir).await.unwrap();
+        supervisor.reconcile(&fixture.data_dir).await.unwrap();
+        fixture.close_loopback_backend();
+        supervisor.last_admission_probe = None;
+
+        let error = supervisor.poll(&fixture.data_dir).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("runtime health check"));
+        assert_eq!(
+            supervisor.observe_runtime_state().unwrap(),
+            NodeRuntimeState::Idle
+        );
+        assert!(supervisor.child.is_none());
+        assert!(supervisor.admission.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_revision_runs_loopback_only_and_reports_degraded() {
+        let fixture = Fixture::new(FakeMode::Valid).await;
+        fixture.validate_legacy_revision(1).await;
+        let mut supervisor = XraySupervisor::new(fast_options()).unwrap();
+        supervisor.recover(&fixture.data_dir).await.unwrap();
+        supervisor.reconcile(&fixture.data_dir).await.unwrap();
+
+        assert_eq!(
+            supervisor.observe_runtime_state().unwrap(),
+            NodeRuntimeState::Degraded
+        );
+        assert!(supervisor.admission.is_none());
+        supervisor.poll(&fixture.data_dir).await.unwrap();
+        assert_eq!(supervisor.running_revision.unwrap().get(), 1);
         supervisor.shutdown().await.unwrap();
     }
 
@@ -1362,6 +1745,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_recovery_failure_becomes_recovery_required() {
+        let fixture = Fixture::new(FakeMode::Valid).await;
+        fixture.validate_revision(1).await;
+        let mut first = XraySupervisor::new(fast_options()).unwrap();
+        first.recover(&fixture.data_dir).await.unwrap();
+        first.reconcile(&fixture.data_dir).await.unwrap();
+        fixture.validate_revision(2).await;
+        begin_activation(
+            &fixture.data_dir,
+            Revision::new(2).unwrap(),
+            Some(Revision::new(1).unwrap()),
+        )
+        .unwrap();
+        first.shutdown().await.unwrap();
+        drop(first);
+        let _occupied = TcpListener::bind(("0.0.0.0", fixture.public_port))
+            .await
+            .unwrap();
+
+        let mut recovered = XraySupervisor::new(fast_options()).unwrap();
+        let error = recovered.recover(&fixture.data_dir).await.unwrap_err();
+
+        assert!(format!("{error:#}").contains("could not be restored during recovery"));
+        assert_eq!(stored_journal(&fixture.data_dir, 2).0, "recoveryRequired");
+        assert_eq!(stored_active_revision(&fixture.data_dir), Some(1));
+        assert_eq!(
+            recovered.observe_runtime_state().unwrap(),
+            NodeRuntimeState::Idle
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_activation_keeps_the_child_owned_for_bounded_reaping() {
         let fixture = Fixture::new(FakeMode::Valid).await;
         fixture.validate_revision(1).await;
@@ -1409,6 +1824,7 @@ mod tests {
         );
         assert!(supervisor.child.is_none());
         assert!(supervisor.running_revision.is_none());
+        supervisor.shutdown().await.unwrap();
     }
 
     #[tokio::test]

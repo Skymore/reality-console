@@ -922,6 +922,7 @@ async fn service_loop_repeats_sync_and_releases_the_data_lock_on_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("state");
     install_registration(&data_dir, &controller.origin);
+    let shutdown_requests = Arc::clone(&controller.requests);
 
     let service = async {
         run_until(
@@ -931,8 +932,17 @@ async fn service_loop_repeats_sync_and_releases_the_data_lock_on_shutdown() {
                 initial_backoff: StdDuration::from_millis(5),
                 max_backoff: StdDuration::from_millis(20),
             },
-            async {
-                tokio::time::sleep(StdDuration::from_millis(100)).await;
+            async move {
+                tokio::time::timeout(StdDuration::from_millis(500), async {
+                    loop {
+                        if shutdown_requests.lock().unwrap().len() >= 4 {
+                            break;
+                        }
+                        tokio::time::sleep(StdDuration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("service did not complete two sync cycles");
                 Ok(())
             },
         )
