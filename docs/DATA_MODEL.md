@@ -257,6 +257,10 @@ used; the application requires `parent_revision = revision - 1`. Publication may
 affected nodes, so an unaffected node can legitimately have an applied revision below the network
 high-water mark.
 
+Desired-state schema version 2 separates the unprivileged Xray loopback port from the public
+admission-gate port and signs both. Version-1 rows remain immutable and verifiable for rollback;
+new publications use version 2.
+
 `node_revision_targets`
 
 | Column | Constraint and meaning |
@@ -552,8 +556,8 @@ pass before an atomic directory switch. Recovery behavior after a stale restore 
 
 ## 10. Required Data-Layer Acceptance Tests
 
-1. A fresh database creates exactly schema version 1 with all foreign keys, indexes, triggers, and
-   singleton constraints active.
+1. A fresh database creates exactly the current schema version with all foreign keys, indexes,
+   triggers, and singleton constraints active.
 2. Every supported prior schema fixture upgrades transactionally; injected failure after every
    migration statement leaves the prior schema and rows intact.
 3. A newer or checksum-modified schema is refused without writes.

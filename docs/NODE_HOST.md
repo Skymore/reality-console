@@ -118,8 +118,9 @@ session.
 
 The node may open only these surfaces:
 
-- The admission gate's configured public TCP data port. Xray's corresponding inbound binds to
-  loopback so direct and relayed streams cross the same local enforcement boundary.
+- The admission gate's configured public TCP data port. Xray's corresponding inbound binds to a
+  distinct unprivileged loopback port so direct and relayed streams cross the same local
+  enforcement boundary without competing for one socket.
 - A loopback-only local IPC endpoint for setup and status.
 - Outbound TLS connections to the controller, reachability service, update service, and optional
   relay.

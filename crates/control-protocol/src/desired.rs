@@ -7,7 +7,8 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use thiserror::Error;
 
-const DESIRED_STATE_DOMAIN: &[u8] = b"control/desired-state/v1";
+const DESIRED_STATE_V1_DOMAIN: &[u8] = b"control/desired-state/v1";
+const DESIRED_STATE_V2_DOMAIN: &[u8] = b"control/desired-state/v2";
 
 /// Returns the canonical transcript covered by a desired-state signature.
 ///
@@ -18,11 +19,17 @@ const DESIRED_STATE_DOMAIN: &[u8] = b"control/desired-state/v1";
 /// # Errors
 ///
 /// Returns [`DesiredStateCryptoError::FieldTooLarge`] if a field cannot fit
-/// the version 1 length-prefix encoding.
+/// the length-prefix encoding, or rejects an unsupported/inconsistent schema.
 pub fn desired_state_transcript(
     document: &DesiredStateDocument,
 ) -> Result<Vec<u8>, DesiredStateCryptoError> {
-    let mut transcript = Transcript::new(DESIRED_STATE_DOMAIN)?;
+    let domain = match document.schema_version {
+        1 if document.xray.public_port.is_none() => DESIRED_STATE_V1_DOMAIN,
+        2 if document.xray.public_port.is_some() => DESIRED_STATE_V2_DOMAIN,
+        1 | 2 => return Err(DesiredStateCryptoError::InvalidDocument),
+        _ => return Err(DesiredStateCryptoError::UnsupportedSchema),
+    };
+    let mut transcript = Transcript::new(domain)?;
     transcript.bytes("schema-version", &document.schema_version.to_be_bytes())?;
     transcript.text("network-id", &document.network_id.to_string())?;
     transcript.text("node-id", &document.node_id.to_string())?;
@@ -43,7 +50,16 @@ pub fn desired_state_transcript(
         transcript.bytes("enabled", &[u8::from(user.enabled)])?;
     }
 
-    transcript.bytes("listen-port", &document.xray.listen_port.to_be_bytes())?;
+    if document.schema_version == 1 {
+        transcript.bytes("listen-port", &document.xray.listen_port.to_be_bytes())?;
+    } else {
+        transcript.bytes("loopback-port", &document.xray.listen_port.to_be_bytes())?;
+        let public_port = document
+            .xray
+            .public_port
+            .ok_or(DesiredStateCryptoError::InvalidDocument)?;
+        transcript.bytes("public-port", &public_port.to_be_bytes())?;
+    }
     transcript.count("server-name-count", document.xray.server_names.len())?;
     for server_name in &document.xray.server_names {
         transcript.text("server-name", server_name)?;
@@ -125,6 +141,10 @@ pub enum DesiredStateCryptoError {
     InvalidSignature,
     #[error("a desired-state transcript field is too large")]
     FieldTooLarge,
+    #[error("the desired-state schema is unsupported")]
+    UnsupportedSchema,
+    #[error("the desired-state document is inconsistent with its schema")]
+    InvalidDocument,
 }
 
 #[cfg(test)]
@@ -157,6 +177,7 @@ mod tests {
             }],
             xray: DesiredXrayState {
                 listen_port: 443,
+                public_port: None,
                 server_names: vec!["www.microsoft.com".to_string()],
                 target: "www.microsoft.com:443".to_string(),
             },
@@ -194,5 +215,30 @@ mod tests {
         document.xray.server_names.reverse();
         let second = desired_state_transcript(&document).unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn version_two_binds_distinct_loopback_and_public_ports() {
+        let mut document = document();
+        document.schema_version = 2;
+        document.xray.listen_port = 10_443;
+        document.xray.public_port = Some(443);
+        let first = desired_state_transcript(&document).unwrap();
+
+        document.xray.public_port = Some(8443);
+        let second = desired_state_transcript(&document).unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn schema_one_rejects_an_unsigned_extension_field() {
+        let mut document = document();
+        document.xray.public_port = Some(8443);
+
+        assert_eq!(
+            desired_state_transcript(&document).unwrap_err(),
+            super::DesiredStateCryptoError::InvalidDocument
+        );
     }
 }

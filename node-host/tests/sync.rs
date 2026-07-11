@@ -341,13 +341,32 @@ fn signed_desired(
     registration: Registration,
     revision: i64,
 ) -> SignedDesiredState {
+    signed_desired_for_schema(
+        data_dir,
+        registration,
+        revision,
+        control_protocol::version::DESIRED_STATE_SCHEMA_VERSION,
+    )
+}
+
+fn signed_desired_for_schema(
+    data_dir: &std::path::Path,
+    registration: Registration,
+    revision: i64,
+    schema_version: u16,
+) -> SignedDesiredState {
     let signing_seed: [u8; 32] = fs::read(data_dir.join("identity.ed25519.seed"))
         .unwrap()
         .try_into()
         .unwrap();
     let signing_key = SigningKey::from_bytes(&signing_seed);
+    let (listen_port, public_port) = match schema_version {
+        1 => (443, None),
+        2 => (10_443, Some(443)),
+        _ => panic!("unsupported test desired-state schema"),
+    };
     let document = DesiredStateDocument {
-        schema_version: 1,
+        schema_version,
         network_id: registration.network,
         node_id: registration.node,
         revision: Revision::new(revision).unwrap(),
@@ -360,7 +379,8 @@ fn signed_desired(
             enabled: true,
         }],
         xray: DesiredXrayState {
-            listen_port: 443,
+            listen_port,
+            public_port,
             server_names: vec!["www.microsoft.com".to_string()],
             target: "www.microsoft.com:443".to_string(),
         },
@@ -631,6 +651,30 @@ async fn verified_desired_state_is_persisted_reported_and_not_fetched_twice() {
     assert!(captured[4].path_and_query.ends_with("afterRevision=1"));
 }
 
+#[tokio::test]
+async fn legacy_version_one_desired_state_remains_acceptable() {
+    let controller = MockController::start(ResponseMode::VerifiedDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let registration = install_registration(&data_dir, &controller.origin);
+    controller.set_desired(signed_desired_for_schema(&data_dir, registration, 1, 1));
+
+    let synced = sync_once(&data_dir).await.unwrap();
+
+    assert_eq!(synced.desired_revision_cursor, 1);
+    let stored: String = Connection::open(data_dir.join("node-host.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT envelope_json FROM desired_state_artifacts WHERE revision = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stored: SignedDesiredState = serde_json::from_str(&stored).unwrap();
+    assert_eq!(stored.document.schema_version, 1);
+    assert_eq!(stored.document.xray.public_port, None);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn configured_runtime_validates_and_persists_an_immutable_candidate() {
@@ -692,7 +736,7 @@ async fn configured_runtime_validates_and_persists_an_immutable_candidate() {
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
-    assert_eq!(config["inbounds"][0]["port"], 443);
+    assert_eq!(config["inbounds"][0]["port"], 10_443);
     assert_eq!(
         config["inbounds"][0]["settings"]["users"][0]["id"],
         "2f55c837-7be6-4752-b58a-a7f51401bd89"

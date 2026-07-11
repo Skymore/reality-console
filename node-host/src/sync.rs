@@ -25,7 +25,8 @@ use time::OffsetDateTime;
 use url::Url;
 
 const NONCE_BYTES: usize = 32;
-const SUPPORTED_DESIRED_SCHEMAS: &[u16] = &[1];
+const SUPPORTED_DESIRED_SCHEMAS: &[u16] =
+    control_protocol::version::SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS;
 const MAX_PENDING_REPORTS_PER_SYNC: i64 = 64;
 const NODE_ID_HEADER: &str = "X-Node-Id";
 const NODE_KEY_ID_HEADER: &str = "X-Node-Key-Id";

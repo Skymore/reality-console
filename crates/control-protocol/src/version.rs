@@ -9,7 +9,9 @@ pub const NODE_ENROLLMENT_SCHEMA_VERSION: u16 = 1;
 /// Current heartbeat schema version.
 pub const NODE_HEARTBEAT_SCHEMA_VERSION: u16 = 1;
 /// Current desired-state document schema version.
-pub const DESIRED_STATE_SCHEMA_VERSION: u16 = 1;
+pub const DESIRED_STATE_SCHEMA_VERSION: u16 = 2;
+/// Desired-state schemas retained for verification and rollback compatibility.
+pub const SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS: &[u16] = &[1, 2];
 /// Current member session schema version.
 pub const MEMBER_SESSION_SCHEMA_VERSION: u16 = 1;
 /// Current signed profile-bundle schema version.

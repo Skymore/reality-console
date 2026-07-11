@@ -17,7 +17,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub(crate) const DESIRED_STATE_SCHEMA_VERSION: u16 = 1;
+pub(crate) const DESIRED_STATE_SCHEMA_VERSION: u16 =
+    control_protocol::version::DESIRED_STATE_SCHEMA_VERSION;
+pub(crate) const SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS: &[u16] =
+    control_protocol::version::SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -93,6 +96,7 @@ pub(crate) fn build_signed_desired_state(
 }
 
 pub(crate) struct StoredDesiredState<'a> {
+    pub schema_version: u16,
     pub network_id: NetworkId,
     pub node_id: NodeId,
     pub revision: Revision,
@@ -119,9 +123,10 @@ pub(crate) fn verify_stored_desired_state(
         stored.node_id,
         stored.controller_instance_id,
         None,
-        &[DESIRED_STATE_SCHEMA_VERSION],
+        SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS,
     )?;
     if envelope.document.revision != stored.revision
+        || envelope.document.schema_version != stored.schema_version
         || envelope.document.created_at != stored.created_at
         || envelope.document.signing_key_id != stored.signing_key_id
         || envelope.signature.as_str() != stored.signature
@@ -177,4 +182,81 @@ pub enum DesiredStateError {
     ControllerKey,
     #[error("the stored desired-state artifact failed integrity verification")]
     Integrity,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        controller_signing_key_id, desired_state_transcript, sha256_digest,
+        verify_stored_desired_state, StoredDesiredState,
+    };
+    use crate::identity::ControllerIdentity;
+    use control_protocol::id::{ControllerInstanceId, NetworkId, NodeId, Revision, Timestamp};
+    use control_protocol::node::{DesiredStateDocument, DesiredXrayState, SignedDesiredState};
+
+    #[test]
+    fn stored_version_one_artifact_remains_verifiable_after_version_two_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity =
+            ControllerIdentity::load_or_create(&directory.path().join("control.sqlite3")).unwrap();
+        let network_id = NetworkId::new();
+        let node_id = NodeId::new();
+        let revision = Revision::new(1).unwrap();
+        let created_at = "2026-07-11T20:00:00Z".parse::<Timestamp>().unwrap();
+        let controller_instance_id = ControllerInstanceId::new();
+        let signing_key_id = controller_signing_key_id(&identity).unwrap();
+        let document = DesiredStateDocument {
+            schema_version: 1,
+            network_id,
+            node_id,
+            revision,
+            created_at,
+            min_agent_version: "0.1.0".to_string(),
+            users: Vec::new(),
+            xray: DesiredXrayState {
+                listen_port: 443,
+                public_port: None,
+                server_names: vec!["www.microsoft.com".to_string()],
+                target: "www.microsoft.com:443".to_string(),
+            },
+            signing_key_id,
+            controller_instance_id,
+        };
+        let transcript = desired_state_transcript(&document).unwrap();
+        let signature = identity.sign(&transcript).unwrap();
+        let envelope = SignedDesiredState {
+            document,
+            signature,
+        };
+        let artifact_json = serde_json::to_string(&envelope).unwrap();
+        let artifact_digest = sha256_digest(artifact_json.as_bytes());
+        let transcript_digest = sha256_digest(&transcript);
+        let stored = StoredDesiredState {
+            schema_version: 1,
+            network_id,
+            node_id,
+            revision,
+            created_at,
+            controller_instance_id,
+            signing_key_id,
+            artifact_json: &artifact_json,
+            artifact_digest: artifact_digest.as_str(),
+            transcript_digest: transcript_digest.as_str(),
+            signature: envelope.signature.as_str(),
+        };
+
+        let verified = verify_stored_desired_state(&identity, &stored).unwrap();
+
+        assert_eq!(verified.document.schema_version, 1);
+        assert_eq!(verified.document.xray.public_port, None);
+
+        let mismatched = StoredDesiredState {
+            schema_version: 2,
+            ..stored
+        };
+        assert!(matches!(
+            verify_stored_desired_state(&identity, &mismatched),
+            Err(super::DesiredStateError::Integrity)
+        ));
+    }
 }

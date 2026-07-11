@@ -427,12 +427,26 @@ pub struct DesiredUser {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DesiredXrayState {
-    /// Fixed inbound listen port.
+    /// Node-local loopback port used only by the managed Xray inbound.
     pub listen_port: u16,
+    /// Public admission-gate TCP port. Absent only in legacy schema version 1.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_public_port"
+    )]
+    pub public_port: Option<u16>,
     /// REALITY server names accepted by this node.
     pub server_names: Vec<String>,
     /// REALITY fallback target in `host:port` form.
     pub target: String,
+}
+
+fn deserialize_present_public_port<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    u16::deserialize(deserializer).map(Some)
 }
 
 /// Immutable desired-state document for one node and revision.
@@ -552,7 +566,7 @@ impl DesiredStateDocument {
                 ));
             }
         }
-        self.xray.validate()
+        self.xray.validate(self.schema_version)
     }
 }
 
@@ -581,13 +595,60 @@ impl SignedDesiredState {
 }
 
 impl DesiredXrayState {
-    fn validate(&self) -> Result<(), ProtocolValidationError> {
+    fn validate(&self, schema_version: u16) -> Result<(), ProtocolValidationError> {
         if self.listen_port == 0 {
             return Err(ProtocolValidationError::new(
                 ValidationCode::OutOfRange,
                 "xray.listenPort",
                 "Xray listen port must be non-zero",
             ));
+        }
+        match schema_version {
+            1 if self.public_port.is_some() => {
+                return Err(ProtocolValidationError::new(
+                    ValidationCode::InconsistentState,
+                    "xray.publicPort",
+                    "desired-state schema version 1 cannot carry a public admission port",
+                ));
+            }
+            1 => {}
+            2 => {
+                let public_port = self.public_port.ok_or_else(|| {
+                    ProtocolValidationError::new(
+                        ValidationCode::MissingField,
+                        "xray.publicPort",
+                        "desired-state schema version 2 requires a public admission port",
+                    )
+                })?;
+                if public_port == 0 {
+                    return Err(ProtocolValidationError::new(
+                        ValidationCode::OutOfRange,
+                        "xray.publicPort",
+                        "public admission port must be non-zero",
+                    ));
+                }
+                if self.listen_port < 1_024 {
+                    return Err(ProtocolValidationError::new(
+                        ValidationCode::OutOfRange,
+                        "xray.listenPort",
+                        "schema version 2 loopback port must be unprivileged",
+                    ));
+                }
+                if public_port == self.listen_port {
+                    return Err(ProtocolValidationError::new(
+                        ValidationCode::InconsistentState,
+                        "xray.publicPort",
+                        "public admission and Xray loopback ports must differ",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ProtocolValidationError::new(
+                    ValidationCode::UnsupportedSchema,
+                    "schemaVersion",
+                    "desired-state Xray schema version is not supported",
+                ));
+            }
         }
         if self.server_names.is_empty() || self.server_names.len() > 16 {
             return Err(ProtocolValidationError::new(
@@ -883,6 +944,7 @@ mod tests {
             }],
             xray: DesiredXrayState {
                 listen_port: 443,
+                public_port: None,
                 server_names: vec!["www.microsoft.com".to_string()],
                 target: "www.microsoft.com:443".to_string(),
             },
@@ -1001,5 +1063,66 @@ mod tests {
                 &[1],
             )
             .is_err());
+    }
+
+    #[test]
+    fn desired_state_v2_requires_distinct_unprivileged_loopback_and_public_ports() {
+        let mut document = desired_document();
+        document.schema_version = 2;
+        document.xray.listen_port = 10_443;
+        document.xray.public_port = Some(443);
+        assert!(document
+            .validate_for(
+                document.network_id,
+                document.node_id,
+                document.controller_instance_id,
+                None,
+                &[1, 2],
+            )
+            .is_ok());
+
+        document.xray.public_port = None;
+        assert!(document
+            .validate_for(
+                document.network_id,
+                document.node_id,
+                document.controller_instance_id,
+                None,
+                &[1, 2],
+            )
+            .is_err());
+        document.xray.public_port = Some(10_443);
+        assert!(document
+            .validate_for(
+                document.network_id,
+                document.node_id,
+                document.controller_instance_id,
+                None,
+                &[1, 2],
+            )
+            .is_err());
+        document.xray.public_port = Some(443);
+        document.xray.listen_port = 443;
+        assert!(document
+            .validate_for(
+                document.network_id,
+                document.node_id,
+                document.controller_instance_id,
+                None,
+                &[1, 2],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn legacy_xray_wire_shape_rejects_an_explicit_null_public_port() {
+        let value = serde_json::json!({
+            "listenPort": 443,
+            "publicPort": null,
+            "serverNames": ["www.microsoft.com"],
+            "target": "www.microsoft.com:443"
+        });
+
+        assert!(serde_json::from_value::<DesiredXrayState>(value).is_err());
     }
 }

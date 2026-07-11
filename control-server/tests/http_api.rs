@@ -356,7 +356,8 @@ fn desired_state_body() -> Value {
             }
         ],
         "xray": {
-            "listenPort": 443,
+            "listenPort": 10443,
+            "publicPort": 443,
             "serverNames": ["z.example.test", "a.example.test"],
             "target": "a.example.test:443"
         }
@@ -1541,7 +1542,9 @@ async fn desired_publication_is_signed_canonical_monotonic_and_immutable() {
         &app.controller_public_key,
     )
     .unwrap();
-    assert_eq!(first.document.schema_version, 1);
+    assert_eq!(first.document.schema_version, 2);
+    assert_eq!(first.document.xray.listen_port, 10_443);
+    assert_eq!(first.document.xray.public_port, Some(443));
     assert_eq!(first.document.node_id, node.node_id);
     assert_eq!(first.document.revision.get(), 1);
     assert_eq!(
@@ -2014,5 +2017,5 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (4, 4, 1, 1, 1));
+    assert_eq!(durable, (5, 5, 1, 1, 1));
 }

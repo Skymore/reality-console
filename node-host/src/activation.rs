@@ -1112,6 +1112,7 @@ mod tests {
             users: Vec::new(),
             xray: DesiredXrayState {
                 listen_port,
+                public_port: None,
                 server_names: vec!["www.microsoft.com".to_string()],
                 target: "www.microsoft.com:443".to_string(),
             },

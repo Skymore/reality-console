@@ -1,7 +1,7 @@
 use crate::config::{validate_network_name, ConfigError};
 use crate::desired::{
     build_signed_desired_state, verify_stored_desired_state, DesiredStateDraft, DesiredStateError,
-    StoredDesiredState,
+    StoredDesiredState, SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS,
 };
 use crate::identity::{set_owner_only, ControllerIdentity, IdentityError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -39,7 +39,7 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
@@ -307,6 +307,143 @@ BEGIN
 END;
 ";
 
+const MIGRATION_5_SQL: &str = r"
+PRAGMA defer_foreign_keys = ON;
+
+DROP TRIGGER config_revisions_no_update;
+DROP TRIGGER config_revisions_no_delete;
+DROP TRIGGER node_revision_targets_no_update;
+DROP TRIGGER node_revision_targets_no_delete;
+DROP TRIGGER node_revision_results_no_update;
+DROP TRIGGER node_revision_results_no_delete;
+DROP INDEX node_revision_targets_latest;
+DROP INDEX node_revision_results_latest;
+
+ALTER TABLE node_revision_results RENAME TO node_revision_results_v4;
+ALTER TABLE node_revision_targets RENAME TO node_revision_targets_v4;
+ALTER TABLE config_revisions RENAME TO config_revisions_v4;
+
+CREATE TABLE config_revisions (
+    network_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    parent_revision INTEGER,
+    schema_version INTEGER NOT NULL CHECK(schema_version IN (1, 2)),
+    node_id TEXT NOT NULL,
+    artifact_json TEXT NOT NULL
+        CHECK(json_valid(artifact_json) AND length(artifact_json) BETWEEN 2 AND 1048576),
+    artifact_sha256 TEXT NOT NULL
+        CHECK(length(artifact_sha256) = 71
+            AND substr(artifact_sha256, 1, 7) = 'sha256:'
+            AND substr(artifact_sha256, 8) NOT GLOB '*[^0-9a-f]*'),
+    transcript_sha256 TEXT NOT NULL
+        CHECK(length(transcript_sha256) = 71
+            AND substr(transcript_sha256, 1, 7) = 'sha256:'
+            AND substr(transcript_sha256, 8) NOT GLOB '*[^0-9a-f]*'),
+    signature TEXT NOT NULL CHECK(length(signature) = 86),
+    signing_key_id TEXT NOT NULL CHECK(length(signing_key_id) = 36),
+    controller_instance_id TEXT NOT NULL CHECK(length(controller_instance_id) = 36),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, revision),
+    UNIQUE(network_id, revision, node_id),
+    CHECK((revision = 1 AND parent_revision IS NULL)
+        OR (revision > 1 AND parent_revision = revision - 1)),
+    FOREIGN KEY(network_id) REFERENCES networks(network_id) ON DELETE CASCADE,
+    FOREIGN KEY(network_id, node_id) REFERENCES nodes(network_id, node_id),
+    FOREIGN KEY(network_id, parent_revision)
+        REFERENCES config_revisions(network_id, revision)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE node_revision_targets (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id, revision),
+    UNIQUE(network_id, revision),
+    FOREIGN KEY(network_id, revision, node_id)
+        REFERENCES config_revisions(network_id, revision, node_id),
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE node_revision_results (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    state TEXT NOT NULL
+        CHECK(state IN ('received', 'validated', 'applied', 'rejected', 'rolledBack')),
+    state_rank INTEGER NOT NULL CHECK(
+        (state = 'received' AND state_rank = 10)
+        OR (state = 'validated' AND state_rank = 20)
+        OR (state IN ('applied', 'rejected', 'rolledBack') AND state_rank = 30)
+    ),
+    result_json TEXT NOT NULL
+        CHECK(json_valid(result_json) AND length(result_json) BETWEEN 2 AND 8192),
+    config_digest TEXT CHECK(config_digest IS NULL OR (
+        length(config_digest) = 71
+        AND substr(config_digest, 1, 7) = 'sha256:'
+        AND substr(config_digest, 8) NOT GLOB '*[^0-9a-f]*'
+    )),
+    rollback_revision INTEGER CHECK(
+        rollback_revision IS NULL
+        OR (rollback_revision > 0 AND rollback_revision < revision)
+    ),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id, revision, state),
+    FOREIGN KEY(network_id, node_id, revision)
+        REFERENCES node_revision_targets(network_id, node_id, revision)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO config_revisions SELECT * FROM config_revisions_v4;
+INSERT INTO node_revision_targets SELECT * FROM node_revision_targets_v4;
+INSERT INTO node_revision_results SELECT * FROM node_revision_results_v4;
+
+DROP TABLE node_revision_results_v4;
+DROP TABLE node_revision_targets_v4;
+DROP TABLE config_revisions_v4;
+
+CREATE INDEX node_revision_targets_latest
+    ON node_revision_targets(network_id, node_id, revision DESC);
+CREATE INDEX node_revision_results_latest
+    ON node_revision_results(network_id, node_id, revision, state_rank DESC);
+
+CREATE TRIGGER config_revisions_no_update
+BEFORE UPDATE ON config_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'config revisions are immutable');
+END;
+
+CREATE TRIGGER config_revisions_no_delete
+BEFORE DELETE ON config_revisions
+BEGIN
+    SELECT RAISE(ABORT, 'config revisions are immutable');
+END;
+
+CREATE TRIGGER node_revision_targets_no_update
+BEFORE UPDATE ON node_revision_targets
+BEGIN
+    SELECT RAISE(ABORT, 'node revision targets are immutable');
+END;
+
+CREATE TRIGGER node_revision_targets_no_delete
+BEFORE DELETE ON node_revision_targets
+BEGIN
+    SELECT RAISE(ABORT, 'node revision targets are immutable');
+END;
+
+CREATE TRIGGER node_revision_results_no_update
+BEFORE UPDATE ON node_revision_results
+BEGIN
+    SELECT RAISE(ABORT, 'node revision results are immutable');
+END;
+
+CREATE TRIGGER node_revision_results_no_delete
+BEFORE DELETE ON node_revision_results
+BEGIN
+    SELECT RAISE(ABORT, 'node revision results are immutable');
+END;
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -333,6 +470,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "signed_desired_state_revisions",
         sql: MIGRATION_4_SQL,
+    },
+    Migration {
+        version: 5,
+        name: "desired_state_schema_v2",
+        sql: MIGRATION_5_SQL,
     },
 ];
 
@@ -1147,7 +1289,9 @@ fn verify_desired_revision(
     node_id: NodeId,
     stored: &StoredDesiredRevision,
 ) -> Result<SignedDesiredState, DatabaseError> {
-    if stored.schema_version != 1
+    let stored_schema_version = u16::try_from(stored.schema_version)
+        .map_err(|_| DatabaseError::StoredDesiredStateCorrupt)?;
+    if !SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS.contains(&stored_schema_version)
         || stored.node_id != node_id.to_string()
         || stored.controller_instance_id != network.controller_epoch
     {
@@ -1170,6 +1314,7 @@ fn verify_desired_revision(
     verify_stored_desired_state(
         identity,
         &StoredDesiredState {
+            schema_version: stored_schema_version,
             network_id,
             node_id,
             revision,
@@ -2735,6 +2880,89 @@ mod tests {
         node_id
     }
 
+    fn create_legacy_v4_database(path: &std::path::Path) -> (String, String) {
+        let node_id = create_legacy_v3_database(path);
+        let mut connection = Connection::open(path).unwrap();
+        super::configure_connection(&connection).unwrap();
+        let migration = &MIGRATIONS[3];
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Exclusive)
+            .unwrap();
+        transaction.execute_batch(migration.sql).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at)
+                 VALUES (?1, ?2, ?3, 1)",
+                params![
+                    migration.version,
+                    migration.name,
+                    migration_checksum(migration)
+                ],
+            )
+            .unwrap();
+        transaction
+            .pragma_update(None, "user_version", migration.version)
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let (network_id, controller_instance_id): (String, String) = connection
+            .query_row(
+                "SELECT network_id, controller_epoch FROM networks",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let signature = "A".repeat(86);
+        let signing_key_id = uuid::Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO config_revisions(
+                    network_id, revision, parent_revision, schema_version, node_id,
+                    artifact_json, artifact_sha256, transcript_sha256, signature,
+                    signing_key_id, controller_instance_id, created_at
+                 ) VALUES (?1, 1, NULL, 1, ?2, '{}', ?3, ?3, ?4, ?5, ?6, 1)",
+                params![
+                    network_id,
+                    node_id,
+                    digest,
+                    signature,
+                    signing_key_id,
+                    controller_instance_id
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO node_revision_targets(network_id, node_id, revision, created_at)
+                 VALUES (?1, ?2, 1, 1)",
+                params![network_id, node_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO node_revision_results(
+                    network_id, node_id, revision, state, state_rank, result_json,
+                    config_digest, rollback_revision, created_at
+                 ) VALUES (?1, ?2, 1, 'received', 10, '{}', NULL, NULL, 1)",
+                params![network_id, node_id],
+            )
+            .unwrap();
+        connection
+            .execute("UPDATE networks SET last_revision = 1", [])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE nodes
+                 SET desired_revision = 1, reported_desired_revision = 1,
+                     received_revision = 1
+                 WHERE node_id = ?1",
+                [node_id.as_str()],
+            )
+            .unwrap();
+        (network_id, node_id)
+    }
+
     #[test]
     fn applies_required_pragmas_and_records_authoritative_migration() {
         let temp = TempDir::new().unwrap();
@@ -2840,7 +3068,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(schema, (SCHEMA_VERSION, 4, 3));
+        assert_eq!(schema, (SCHEMA_VERSION, SCHEMA_VERSION, 3));
         let immutable_triggers: i64 = guard
             .connection
             .query_row(
@@ -2855,6 +3083,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(immutable_triggers, 6);
+    }
+
+    #[test]
+    fn v4_upgrade_preserves_revision_graph_and_accepts_schema_two() {
+        let temp = TempDir::new().unwrap();
+        let path = database_path(&temp);
+        let (network_id, node_id) = create_legacy_v4_database(&path);
+
+        let database = Database::open(&path, "Friends").unwrap();
+        let guard = database.inner.lock().unwrap();
+        let connection = &guard.connection;
+        let preserved: (i64, i64, String) = connection
+            .query_row(
+                "SELECT
+                    (SELECT schema_version FROM config_revisions WHERE revision = 1),
+                    (SELECT COUNT(*) FROM node_revision_targets WHERE revision = 1),
+                    (SELECT state FROM node_revision_results WHERE revision = 1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (1, 1, "received".to_string()));
+        let foreign_key_errors: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let signature = "B".repeat(86);
+        let signing_key_id = uuid::Uuid::new_v4().to_string();
+        let controller_instance_id: String = connection
+            .query_row("SELECT controller_epoch FROM networks", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO config_revisions(
+                    network_id, revision, parent_revision, schema_version, node_id,
+                    artifact_json, artifact_sha256, transcript_sha256, signature,
+                    signing_key_id, controller_instance_id, created_at
+                 ) VALUES (?1, 2, 1, 2, ?2, '{}', ?3, ?3, ?4, ?5, ?6, 2)",
+                params![
+                    network_id,
+                    node_id,
+                    digest,
+                    signature,
+                    signing_key_id,
+                    controller_instance_id
+                ],
+            )
+            .unwrap();
+        assert!(connection
+            .execute(
+                "INSERT INTO config_revisions(
+                    network_id, revision, parent_revision, schema_version, node_id,
+                    artifact_json, artifact_sha256, transcript_sha256, signature,
+                    signing_key_id, controller_instance_id, created_at
+                 ) VALUES (?1, 3, 2, 3, ?2, '{}', ?3, ?3, ?4, ?5, ?6, 3)",
+                params![
+                    network_id,
+                    node_id,
+                    digest,
+                    signature,
+                    signing_key_id,
+                    controller_instance_id
+                ],
+            )
+            .is_err());
     }
 
     #[test]

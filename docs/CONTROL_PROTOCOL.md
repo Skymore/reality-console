@@ -193,7 +193,8 @@ does not reactivate a disabled node; that requires a future explicit credential-
     {"userId": "uuid", "credentialId": "uuid", "vlessUuid": "secret", "enabled": true}
   ],
   "xray": {
-    "listenPort": 443,
+    "listenPort": 10443,
+    "publicPort": 443,
     "serverNames": ["www.microsoft.com"],
     "target": "www.microsoft.com:443"
   }
@@ -219,7 +220,7 @@ as the primary operator workflow.
 ```json
 {
   "document": {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "networkId": "uuid",
     "nodeId": "uuid",
     "revision": 12,
@@ -229,7 +230,8 @@ as the primary operator workflow.
       {"userId": "uuid", "credentialId": "uuid", "vlessUuid": "secret", "enabled": true}
     ],
     "xray": {
-      "listenPort": 443,
+      "listenPort": 10443,
+      "publicPort": 443,
       "serverNames": ["www.microsoft.com"],
       "target": "www.microsoft.com:443"
     },
@@ -245,6 +247,11 @@ ordinary desired-state document. The canonical signature transcript binds the ex
 controller epoch, revision, publication time, agent floor, ordered users, ordered server names,
 closed Xray fields, and signing-key ID. Changing or reordering any covered value invalidates the
 signature.
+
+Desired-state schema version 1 remains readable only for rollback compatibility and has no public
+admission port. Version 2 defines `listenPort` as the unprivileged loopback-only Xray port and
+requires a distinct non-zero `publicPort` owned by the admission gate. Controllers publish only
+version 2; Node Host verifies both versions while retained version-1 artifacts exist.
 
 Node Host accepts `200` only as JSON matching the closed schema and only after exact network, node,
 controller epoch, monotonic revision, and controller-signature verification. It atomically stores
