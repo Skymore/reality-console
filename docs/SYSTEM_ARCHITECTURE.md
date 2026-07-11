@@ -166,7 +166,7 @@ Node Host evaluates modes in this order:
 
 1. Existing public endpoint supplied by a VPS/provider.
 2. Existing explicit router mapping.
-3. Consent-gated automatic UPnP IGD, NAT-PMP, or PCP mapping.
+3. Consent-gated automatic PCP, NAT-PMP, or UPnP IGD mapping.
 4. Assigned raw TCP relay.
 
 Only a controller-side probe can mark an endpoint `verified`. Local listening and public-IP

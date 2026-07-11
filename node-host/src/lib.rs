@@ -5,6 +5,7 @@ mod admission;
 mod bootstrap;
 mod enrollment;
 mod mapping;
+mod router_protocol;
 mod service;
 mod sync;
 mod xray;
@@ -38,7 +39,7 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 9;
+const CURRENT_SCHEMA_VERSION: i64 = 10;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
@@ -49,6 +50,7 @@ const MIGRATION_6_NAME: &str = "node_rendered_xray_configs";
 const MIGRATION_7_NAME: &str = "node_xray_activation_state";
 const MIGRATION_8_NAME: &str = "node_heartbeat_generation";
 const MIGRATION_9_NAME: &str = "node_router_mapping_state";
+const MIGRATION_10_NAME: &str = "node_router_mapping_supervision";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -331,6 +333,22 @@ const MIGRATION_9: &str = "
         ON router_mapping_leases(applied_revision, state, lease_expires_at DESC);
 ";
 
+const MIGRATION_10: &str = "
+    ALTER TABLE router_mapping_leases
+    ADD COLUMN topology_fingerprint BLOB
+        CHECK (topology_fingerprint IS NULL OR length(topology_fingerprint) = 32);
+
+    ALTER TABLE provider_network_policy
+    ADD COLUMN last_mapping_error_code TEXT
+        CHECK (
+            last_mapping_error_code IS NULL
+            OR length(last_mapping_error_code) BETWEEN 1 AND 64
+        );
+
+    ALTER TABLE provider_network_policy
+    ADD COLUMN last_mapping_attempt_at INTEGER;
+";
+
 pub use bootstrap::{bootstrap, BootstrapRequest};
 pub use enrollment::join;
 pub use mapping::{RouterMappingState, RouterMappingStatus};
@@ -528,6 +546,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 7, MIGRATION_7_NAME, MIGRATION_7)?;
     apply_migration(&transaction, 8, MIGRATION_8_NAME, MIGRATION_8)?;
     apply_migration(&transaction, 9, MIGRATION_9_NAME, MIGRATION_9)?;
+    apply_migration(&transaction, 10, MIGRATION_10_NAME, MIGRATION_10)?;
     transaction.commit()?;
     Ok(())
 }
@@ -595,6 +614,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (7, MIGRATION_7_NAME, MIGRATION_7),
         (8, MIGRATION_8_NAME, MIGRATION_8),
         (9, MIGRATION_9_NAME, MIGRATION_9),
+        (10, MIGRATION_10_NAME, MIGRATION_10),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");

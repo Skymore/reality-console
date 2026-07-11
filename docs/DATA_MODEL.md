@@ -395,7 +395,7 @@ revocation, purge, migration, backup restore, and recovery-fence actions are man
 
 ## 4. Node Host Local Schema
 
-The implemented Node Host migration version is 9. The database is owner-only and bound to one
+The implemented Node Host migration version is 10. The database is owner-only and bound to one
 enrolled `node_id`; it uses the same SQLite contract and migration table. The list below includes
 implemented tables and later planned policy/telemetry expansions.
 
@@ -403,8 +403,9 @@ implemented tables and later planned policy/telemetry expansions.
   `secret_ref`, installation ID, created time, and revocation state. It is never regenerated because
   metadata is corrupt.
 - `provider_network_policy`: singleton provider-owned automatic-mapping flag, durable consent time,
-  separately gated permanent-UPnP flag, and update time. Local policy always overrides controller
-  desire toward less sharing.
+  reserved permanent-UPnP flag, stable last mapping error and attempt time, and update time. The
+  current agent always leaves the reserved flag disabled and rejects permanent leases. Local policy
+  always overrides controller desire toward less sharing.
 - `controller_registration`: controller URL, network ID, controller epoch, pinned signing public
   keys, node-auth `secret_ref`, credential ID, supported schema versions, last contact, and
   credential-rotation state.
@@ -429,8 +430,9 @@ implemented tables and later planned policy/telemetry expansions.
   candidate can run.
 - `router_mapping_leases`: one retained row per finite owned mapping. It binds mapping and endpoint
   IDs, applied revision, PCP/NAT-PMP/UPnP source, gateway and internal/external addresses and ports,
-  protocol-specific ownership evidence, lease interval, closed lifecycle state, and stable failure
-  code. A partial unique index permits only one active or releasing mapping.
+  protocol-specific ownership evidence, a hashed local topology fingerprint, lease interval,
+  closed lifecycle state, and stable failure code. A partial unique index permits only one active
+  or releasing mapping.
 - `apply_journal`: one row per revision with envelope artifact reference/digest, state
   (`received`, `validated`, `activating`, `applied`, `rejected`, `rolling_back`, `rolled_back`),
   rendered config digest, predecessor revision, timestamps, attempt count, and error code. State

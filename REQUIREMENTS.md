@@ -111,7 +111,7 @@ and join the network with no administrative access.
 
 - `NET-001`: a node is never advertised until a controller-side probe verifies its endpoint.
 - `NET-002`: direct mode supports public endpoints and explicit router forwarding.
-- `NET-003`: Node Host may attempt UPnP IGD, NAT-PMP, or PCP only after provider consent and must
+- `NET-003`: Node Host may attempt PCP, NAT-PMP, or UPnP IGD only after provider consent and must
   remove mappings when sharing is disabled.
 - `NET-004`: relay mode forwards raw TCP without terminating VLESS/REALITY and preserves the node as
   the Internet exit.

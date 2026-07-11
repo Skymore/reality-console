@@ -865,9 +865,11 @@ mod tests {
                     singleton INTEGER PRIMARY KEY,
                     automatic_router_mapping_enabled INTEGER NOT NULL,
                     router_mapping_consented_at INTEGER,
-                    allow_permanent_upnp INTEGER NOT NULL
+                    allow_permanent_upnp INTEGER NOT NULL,
+                    last_mapping_error_code TEXT,
+                    last_mapping_attempt_at INTEGER
                  ) STRICT;
-                 INSERT INTO provider_network_policy VALUES (1, 1, 1, 0);
+                 INSERT INTO provider_network_policy VALUES (1, 1, 1, 0, NULL, NULL);
                  CREATE TABLE router_mapping_leases (
                     endpoint_id TEXT NOT NULL,
                     source TEXT NOT NULL,

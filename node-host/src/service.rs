@@ -1,4 +1,5 @@
 use crate::activation::{ActivationOptions, XraySupervisor};
+use crate::mapping::RouterMappingSupervisor;
 use crate::{
     status_locked, sync::sync_once_locked_with_runtime_probe, DataDirLock, EnrollmentState,
 };
@@ -15,7 +16,10 @@ const MAX_CONFIGURED_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 enum ServiceEvent {
-    Shutdown(Result<()>),
+    Shutdown {
+        signal: Result<()>,
+        cycle: Result<()>,
+    },
     Cycle(Result<()>),
 }
 
@@ -86,10 +90,12 @@ where
         bail!("node host must be enrolled before starting its sync service");
     }
     let mut supervisor = XraySupervisor::new(ActivationOptions::default())?;
+    let mut router_mapping = RouterMappingSupervisor::new();
     if let Err(recovery_error) = supervisor.recover(data_dir).await {
-        if let Err(cleanup_error) = supervisor.shutdown().await {
-            return Err(cleanup_error)
-                .context("managed Xray cleanup failed after service recovery error");
+        if let Err(cleanup_error) =
+            shutdown_services(data_dir, &mut router_mapping, &mut supervisor).await
+        {
+            return Err(cleanup_error).context("service cleanup failed after Xray recovery error");
         }
         return Err(recovery_error);
     }
@@ -98,17 +104,25 @@ where
     let mut backoff = options.initial_backoff;
     loop {
         let event = {
-            let cycle = run_cycle(data_dir, &mut supervisor);
+            let cycle = run_cycle(data_dir, &mut supervisor, &mut router_mapping);
             tokio::pin!(cycle);
             tokio::select! {
-                shutdown_result = &mut shutdown => ServiceEvent::Shutdown(shutdown_result),
+                signal = &mut shutdown => {
+                    // Network mapping side effects are finite but not cancellation-safe.
+                    // Finish the bounded cycle so shutdown can release any committed lease.
+                    let cycle = cycle.await;
+                    ServiceEvent::Shutdown { signal, cycle }
+                }
                 result = &mut cycle => ServiceEvent::Cycle(result),
             }
         };
         let result = match event {
-            ServiceEvent::Shutdown(result) => {
-                supervisor.shutdown().await?;
-                return result;
+            ServiceEvent::Shutdown { signal, cycle } => {
+                if let Err(error) = cycle {
+                    tracing::warn!(error = %error, "node cycle failed while shutdown was pending");
+                }
+                shutdown_services(data_dir, &mut router_mapping, &mut supervisor).await?;
+                return signal;
             }
             ServiceEvent::Cycle(result) => result,
         };
@@ -133,12 +147,15 @@ where
             let wait = (deadline - now).min(RUNTIME_POLL_INTERVAL);
             tokio::select! {
                 shutdown_result = &mut shutdown => {
-                    supervisor.shutdown().await?;
+                    shutdown_services(data_dir, &mut router_mapping, &mut supervisor).await?;
                     return shutdown_result;
                 }
                 () = tokio::time::sleep(wait) => {}
             }
             if let Err(error) = supervisor.poll(data_dir).await {
+                if let Err(mapping_error) = router_mapping.reconcile(data_dir, None).await {
+                    tracing::warn!(error = %mapping_error, "router mapping cleanup failed after runtime health failure");
+                }
                 tracing::warn!(error = %error, "managed Xray health check failed; retrying");
                 break;
             }
@@ -146,13 +163,37 @@ where
     }
 }
 
-async fn run_cycle(data_dir: &Path, supervisor: &mut XraySupervisor) -> Result<()> {
+async fn run_cycle(
+    data_dir: &Path,
+    supervisor: &mut XraySupervisor,
+    router_mapping: &mut RouterMappingSupervisor,
+) -> Result<()> {
     supervisor.poll(data_dir).await?;
     // A previously acknowledged candidate can activate even if the controller
     // is temporarily unavailable after a service restart.
     supervisor.reconcile(data_dir).await?;
+    router_mapping
+        .reconcile(data_dir, supervisor.router_mapping_target()?)
+        .await?;
     sync_once_locked_with_runtime_probe(data_dir, || supervisor.observe_runtime_state()).await?;
-    supervisor.reconcile(data_dir).await
+    supervisor.reconcile(data_dir).await?;
+    router_mapping
+        .reconcile(data_dir, supervisor.router_mapping_target()?)
+        .await
+}
+
+async fn shutdown_services(
+    data_dir: &Path,
+    router_mapping: &mut RouterMappingSupervisor,
+    supervisor: &mut XraySupervisor,
+) -> Result<()> {
+    let mapping_result = router_mapping.shutdown(data_dir).await;
+    let runtime_result = supervisor.shutdown().await;
+    if let Err(mapping_error) = mapping_result {
+        runtime_result.context("managed Xray shutdown also failed")?;
+        return Err(mapping_error).context("router mapping shutdown failed");
+    }
+    runtime_result
 }
 
 fn jitter(base: Duration, random: u64) -> Duration {

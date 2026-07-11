@@ -2,18 +2,22 @@
 name = "node-host"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Minimal Reality Console node host foundation"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 control-protocol = { path = "../crates/control-protocol" }
+crab_nat = "=0.6.0"
 xray-runtime = { path = "../crates/xray-runtime" }
 ed25519-dalek = "2"
 fs2 = "0.4"
+igd-next = { version = "=0.16.0", features = ["aio_tokio"] }
+netdev = "=0.35.3"
 rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

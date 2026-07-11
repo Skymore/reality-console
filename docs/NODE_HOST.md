@@ -248,8 +248,9 @@ Xray.
 
 An automatic mapping is reported in heartbeat only while its local lease is `active`, unexpired,
 and bound to the currently applied revision, and only while the admission gate reports `serving`.
-It remains an unverified candidate at Control. Schema 9 and the safe local status model are now
-implemented; protocol drivers and renewal/release supervision are the next implementation stage.
+It remains an unverified candidate at Control. Schema 10, PCP/NAT-PMP/UPnP drivers, finite renewal
+and release supervision, topology invalidation, bounded retry, and safe local status are now
+implemented.
 
 The current headless `run` command already wraps that cycle in a resilient foreground service. It
 synchronizes immediately, uses a 30-second success interval with bounded jitter, retries failures
@@ -283,11 +284,11 @@ old gate before binding the candidate, so a successful update can include a shor
 Keeping a stable listener and atomically changing backend generations is a later availability
 optimization, not a correctness prerequisite for this best-effort friend network.
 
-The public listener alone does not prove internet reachability. Automatic router mapping,
-controller-originated external TCP and protocol probes, IPv6 admission, relay fallback, bandwidth
-shaping, and durable quota counters are not implemented in this milestone. Until mapping and probe
-convergence lands, a provider still needs a valid manual TCP forwarding rule and there is no
-controller claim that the node is externally reachable.
+The public listener and automatic router mapping alone do not prove internet reachability.
+Controller-originated external TCP and protocol probes, IPv6 admission, relay fallback, bandwidth
+shaping, and durable quota counters are not implemented in this milestone. Until external probe
+convergence lands, Control makes no claim that a mapped node is externally reachable; unsupported
+routers still require a valid manual TCP forwarding rule.
 
 ## 7. Outbound-Only Control Sync
 
@@ -552,9 +553,9 @@ the provider to enable DMZ, expose Xray's API, or disable the firewall.
 
 ### 11.2 Mapping Strategy
 
-The current backend has the explicit consent flag, constrained durable lease schema, safe status,
-and heartbeat publication boundary. It does not report `Mapped` merely because consent is enabled;
-without a driver-created lease the state is `Waiting`.
+The current backend has the explicit consent flag, constrained durable lease schema, protocol
+drivers, safe status, and heartbeat publication boundary. It does not report `Mapped` merely
+because consent is enabled; without a driver-created lease the state is `Waiting`.
 
 For each active default route, the agent attempts standards in this order:
 
@@ -565,8 +566,9 @@ For each active default route, the agent attempts standards in this order:
 Only TCP is requested. The internal client is the node's current LAN address and the internal port
 is the admission gate's applied public listen port. The external port defaults to the same value;
 if unavailable, the agent may accept a router-selected high port only when the controller can
-publish the resulting port. Mappings use a description containing the product name and abbreviated
-node ID.
+publish the resulting port. UPnP is accepted only when the discovered control address is the
+current default gateway. Its mapping description contains the product name, abbreviated node ID,
+revision, and a fresh random ownership token.
 
 Attempts are serialized, bounded to 10 seconds per protocol, and repeated only after topology
 change or backoff. A timeout or malformed router response is failure, not permission to broaden the
@@ -574,14 +576,21 @@ request.
 
 ### 11.3 Lease Lifecycle
 
-- Request a 60-minute lease where supported and renew at 50% of lifetime with jitter.
-- UPnP devices that permit only permanent mappings are used only after a second explicit consent
-  disclosure; otherwise UPnP permanent mapping is skipped.
-- Persist protocol, gateway, internal/external address and port, lease epoch, and mapping ID so a
-  restarted agent can renew or remove its own mapping.
+- Request a 60-minute lease where supported and renew at 50% of its accepted lifetime.
+- Reject UPnP devices that permit only permanent mappings. The current release never accepts or
+  publishes a permanent mapping as usable and attempts immediate cleanup if a router ignores the
+  requested finite lifetime.
+- Persist protocol, gateway, internal/external address and port, ownership material, lease epoch,
+  mapping ID, and a SHA-256 topology fingerprint so a restarted agent can safely renew or remove
+  its own mapping.
 - Delete the mapping on provider pause, unpair, uninstall, port change, or clean shutdown. A crash
   may leave it until lease expiry, which is why finite leases are preferred.
 - Never delete or modify a mapping not proven to have been created by this node.
+- When route identity changes or cannot be proven, withdraw the candidate and abandon the old
+  finite lease without sending a deletion request to the newly observed gateway.
+- If creation may have succeeded but ownership validation or cleanup cannot be proven, expose
+  `mapping_release_failed` and stop automatic retries until setup or recovery resets local mapping
+  consent. This prevents one faulty router from accumulating unknown mappings.
 - Re-run external reachability after every creation or renewal that changes endpoint data.
 
 ### 11.4 Firewall Handling
@@ -1018,9 +1027,17 @@ xray_unhealthy
 admission_bind_failed
 admission_unhealthy
 rollback_failed
-mapping_not_supported
-mapping_conflict
-mapping_lease_lost
+mapping_route_unavailable
+mapping_private_address_unavailable
+mapping_protocol_unavailable
+mapping_unauthorized
+mapping_timeout
+mapping_invalid_response
+mapping_non_public_address
+mapping_permanent_lease_unsupported
+mapping_ownership_lost
+mapping_topology_changed
+mapping_release_failed
 direct_tcp_unreachable
 direct_protocol_probe_failed
 relay_not_consented
@@ -1042,8 +1059,8 @@ Raw Xray/router/TLS errors remain in redacted local diagnostics and are not used
    revision reconciler.
 3. Add direct candidate discovery, external TCP and end-to-end probes, endpoint publication, and
    health history.
-4. Add provider consent/limits, PCP/NAT-PMP/UPnP mapping, firewall integration, and offline quota
-   enforcement.
+4. Finish provider limits, firewall integration, and offline quota enforcement around the
+   implemented consent-gated PCP/NAT-PMP/UPnP mapping lifecycle.
 5. Add bounded telemetry sync and redacted support bundles.
 6. Add the optional opaque TCP relay behind explicit deployment, controller, and provider feature
    flags.

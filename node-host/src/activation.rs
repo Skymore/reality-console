@@ -310,6 +310,24 @@ impl XraySupervisor {
         })
     }
 
+    pub(crate) fn router_mapping_target(
+        &mut self,
+    ) -> Result<Option<crate::mapping::MappingTarget>> {
+        if self.observe_runtime_state()? != control_protocol::node::NodeRuntimeState::Serving {
+            return Ok(None);
+        }
+        let revision = self
+            .running_revision
+            .context("serving Xray runtime has no applied revision")?;
+        let internal_port = self
+            .running_public_port
+            .context("serving Xray runtime has no admission port")?;
+        Ok(Some(crate::mapping::MappingTarget {
+            revision,
+            internal_port,
+        }))
+    }
+
     async fn recover_interrupted(
         &mut self,
         data_dir: &Path,

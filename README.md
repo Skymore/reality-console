@@ -43,9 +43,10 @@ admission gate. It activates only controller-acknowledged candidates, requires t
 port to bind and reach Xray through a local canary before recording `applied`, and restores both
 parts of a proven predecessor after failure. Bootstrap can now bind explicit automatic-mapping
 consent into enrollment, provide a constrained finite-lease store, and publish only a current
-revision-bound lease as an unverified candidate. Native service installers, router protocol
-drivers, controller-side external probes, relay reachability, account synchronization, and the friend-facing
-setup UI/package are still under implementation.
+revision-bound lease as an unverified candidate. The service now drives finite TCP mappings in
+PCP, NAT-PMP, then UPnP order, renews and releases its owned lease, and withdraws it on topology
+change. Native service installers, controller-side external probes, relay reachability, account
+synchronization, and the friend-facing setup UI/package are still under implementation.
 
 ## Authoritative Documentation
 
