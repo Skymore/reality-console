@@ -39,7 +39,10 @@ revocable.
 
 ### Public probe
 
-Endpoint probes use an unguessable bounded challenge and return no control-plane data.
+TCP preflight jobs use an unguessable finite claim token between Control Service and the selected
+runner, send no application bytes to the candidate, and return no control-plane data. A later
+protocol-aware probe additionally uses a bounded canary credential/challenge. Neither credential is
+available from ordinary node or member read APIs.
 
 ## 3. Stable Error Envelope
 

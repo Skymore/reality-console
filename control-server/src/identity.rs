@@ -155,11 +155,14 @@ pub(crate) fn set_owner_only(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_parent(parent: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        fs::File::open(parent)?.sync_all()?;
-    }
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 

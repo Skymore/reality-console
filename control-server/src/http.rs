@@ -312,6 +312,7 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::NodeProgressConflict
         | DatabaseError::NodeHeartbeatConflict
         | DatabaseError::EndpointCandidateConflict
+        | DatabaseError::EndpointCandidateRevisionConflict
         | DatabaseError::DesiredStatePublicationConflict { .. } => {
             ApiError::state_conflict(request_id)
         }

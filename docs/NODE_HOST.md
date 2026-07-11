@@ -284,11 +284,14 @@ old gate before binding the candidate, so a successful update can include a shor
 Keeping a stable listener and atomically changing backend generations is a later availability
 optimization, not a correctness prerequisite for this best-effort friend network.
 
-The public listener and automatic router mapping alone do not prove internet reachability.
-Controller-originated external TCP and protocol probes, IPv6 admission, relay fallback, bandwidth
-shaping, and durable quota counters are not implemented in this milestone. Until external probe
-convergence lands, Control makes no claim that a mapped node is externally reachable; unsupported
-routers still require a valid manual TCP forwarding rule.
+The public listener and automatic router mapping alone do not prove internet reachability. Control
+Service now durably claims and records an external, public-address-only TCP preflight, but the
+in-process runner is valid only when that controller process is outside the node's LAN. A home
+controller probing its own public endpoint measures NAT loopback behavior, not outside
+reachability. Remote probe-worker transport, the protocol-aware VLESS + REALITY canary, IPv6
+admission, relay fallback, bandwidth shaping, and durable quota counters are not implemented in
+this milestone. Until protocol-probe convergence lands, Control makes no claim that a mapped node
+is externally reachable; unsupported routers still require a valid manual TCP forwarding rule.
 
 ## 7. Outbound-Only Control Sync
 
@@ -535,9 +538,19 @@ After two failures it becomes `suspect`; after three consecutive failures or 45 
 successful probe it becomes `unreachable` and is removed from new client bundles. Existing clients
 may retain cached profiles but are warned by normal health selection.
 
-The probe service applies per-node and global rate limits and cannot be used to scan arbitrary
-hosts: it connects only to candidates recently reported by the same authenticated node, only to the
-desired Xray port, and only with a controller-issued nonce.
+The target probe service applies per-node and global rate limits and cannot be used as an arbitrary
+scanner: it connects only to recent candidates from an approved authenticated node, only to the
+public port in that node's signed applied revision, and only with a controller-issued claim or
+canary credential.
+
+The current TCP phase uses a finite database claim and sends no application bytes. It resolves a
+hostname once, rejects the entire answer set if any address is not globally publishable, caps the
+answer count, and connects only to those pinned socket addresses. Claims are bound to the current
+heartbeat generation and applied revision; stale completions are retained as cancelled evidence.
+`CONTROL_PROBE_MODE=local-tcp` is disabled by default and is not valid when Control Service shares
+the node's LAN. The address is still supplied by the enrolled node, so this local runner is not
+exposed as a public probe API; remote-worker release additionally requires an independent
+address-authorization policy. TCP success remains non-publishable until step 4 is implemented.
 
 ## 11. Automatic Router Mapping
 

@@ -213,10 +213,26 @@ legacy `node_reported_endpoints` because those rows allowed a node to assert `ve
 `node_endpoint_verifications` is controller-owned and keyed by the same candidate identity. It
 stores `status` (`pending`, `verified`, `failed`, or `withdrawn`), probe count, last probe/success,
 latency, stable error code, verification expiry, and update time. Candidate insertion creates only
-`pending`; candidate withdrawal forces `withdrawn`. A later `endpoint_probe_attempts` table stores
-append-only `(network_id, probe_id)` evidence with `endpoint_id`, keyed challenge hash,
-started/completed times, result, and stable error code. Challenges expire and are never returned by
-read APIs.
+`pending`; candidate withdrawal forces `withdrawn`.
+
+Schema migration 8 adds `endpoint_probe_attempts` as retained controller evidence. A monotonic
+`attempt_id` orders claims while `(network_id, probe_id)` is unique. Each row binds the node,
+endpoint, phase, runner, candidate heartbeat generation, address, port, applied revision, finite
+claim expiry, and SHA-256 claim-token verifier. Only `claimed` may transition, exactly once, to
+`succeeded`, `failed`, `cancelled`, or `expired`; rows cannot be deleted. The raw 256-bit claim
+token exists only in the claimed job returned to the runner. Network I/O occurs after the claim
+transaction releases the SQLite lock, and completion rechecks the token plus every bound candidate
+field before committing. Direct-candidate ingestion, claim selection, and completion each require
+the candidate port to equal `document.xray.publicPort` in the referenced immutable signed
+revision; a relay endpoint keeps its separately assigned public port.
+
+The implemented TCP phase stores a resolved public address, latency, and stable result code. It
+rejects literal or DNS-resolved private, loopback, link-local, carrier-grade NAT, documentation,
+benchmark, multicast, and reserved targets. A TCP success is preflight evidence only and does not
+increment or mutate `node_endpoint_verifications`; only the later protocol-aware VLESS + REALITY
+canary may make an endpoint `verified`. Candidate withdrawal, generation/revision change, node
+pause, or loss of serving state turns an in-flight result into `cancelled` rather than current
+health evidence.
 
 A node is shareable only when it is approved/active, not revoked, not provider-paused, has a current
 verified endpoint, and has an applied configuration compatible with the profile being generated.

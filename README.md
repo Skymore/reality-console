@@ -45,8 +45,13 @@ parts of a proven predecessor after failure. Bootstrap can now bind explicit aut
 consent into enrollment, provide a constrained finite-lease store, and publish only a current
 revision-bound lease as an unverified candidate. The service now drives finite TCP mappings in
 PCP, NAT-PMP, then UPnP order, renews and releases its owned lease, and withdraws it on topology
-change. Native service installers, controller-side external probes, relay reachability, account
-synchronization, and the friend-facing setup UI/package are still under implementation.
+change. Control Service now has a durable, lease-based external TCP preflight queue and a
+public-address-only executor with DNS pinning, bounded connection time, stale-candidate fencing,
+signed-public-port binding, and append-only results. Bare TCP success deliberately leaves endpoint
+verification `pending`;
+the remote worker transport and VLESS + REALITY canary required for client publication remain
+under implementation, along with native service installers, relay reachability, account
+synchronization, and the friend-facing setup UI/package.
 
 ## Authoritative Documentation
 
@@ -86,6 +91,11 @@ cargo test --manifest-path crates/xray-runtime/Cargo.toml --locked
 cargo test --manifest-path control-server/Cargo.toml
 cargo test --manifest-path node-host/Cargo.toml
 ```
+
+Control Service defaults `CONTROL_PROBE_MODE` to `disabled`. `local-tcp` is a development or
+external-controller mode only: the Control Service process must be outside the candidate node's
+LAN, otherwise the result tests router hairpin behavior rather than Internet reachability. TCP
+preflight records evidence but never marks an endpoint verified.
 
 The installer-oriented Node Host bootstrap accepts the exact JSON returned by
 `POST /v1/admin/node-invitations`. The signed installer supplies the Xray path and hash; these are

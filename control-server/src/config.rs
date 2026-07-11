@@ -1,4 +1,5 @@
 use crate::auth::{BootstrapTokenError, BootstrapTokenVerifier};
+use crate::probe::{ProbeMode, TcpProbeLoopOptions};
 use std::env;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::PathBuf;
@@ -20,6 +21,8 @@ pub struct ServiceConfig {
     pub bootstrap_token: BootstrapTokenVerifier,
     pub controller_origin: String,
     pub request_timeout: Duration,
+    pub probe_mode: ProbeMode,
+    pub probe_options: TcpProbeLoopOptions,
 }
 
 impl ServiceConfig {
@@ -53,6 +56,9 @@ impl ServiceConfig {
         if !(1..=60).contains(&request_timeout_seconds) {
             return Err(ConfigError::InvalidTimeout);
         }
+        let probe_mode = env::var("CONTROL_PROBE_MODE")
+            .map_or(Ok(ProbeMode::Disabled), |value| value.parse())
+            .map_err(|_| ConfigError::InvalidProbeMode)?;
 
         Ok(Self {
             bind_address,
@@ -61,6 +67,8 @@ impl ServiceConfig {
             bootstrap_token,
             controller_origin,
             request_timeout: Duration::from_secs(request_timeout_seconds),
+            probe_mode,
+            probe_options: TcpProbeLoopOptions::default(),
         })
     }
 
@@ -77,6 +85,8 @@ impl ServiceConfig {
             bootstrap_token: BootstrapTokenVerifier::new(bootstrap_token)?,
             controller_origin: DEFAULT_TEST_CONTROLLER_ORIGIN.to_string(),
             request_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
+            probe_mode: ProbeMode::Disabled,
+            probe_options: TcpProbeLoopOptions::default(),
         })
     }
 }
@@ -141,6 +151,8 @@ pub enum ConfigError {
     InvalidNetworkName,
     #[error("CONTROL_PUBLIC_ORIGIN must be an HTTP(S) origin without credentials or a path")]
     InvalidControllerOrigin,
+    #[error("CONTROL_PROBE_MODE must be disabled or local-tcp")]
+    InvalidProbeMode,
 }
 
 #[cfg(test)]

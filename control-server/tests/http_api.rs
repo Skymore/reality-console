@@ -21,6 +21,7 @@ use control_protocol::node::{
     SignedDesiredState,
 };
 use control_protocol::request_auth::NodeRequestSigningInput;
+use control_server::probe::{TcpProbeCompletion, TcpProbeLoopOptions, TcpProbeResult};
 use control_server::{build_router, AppState, Database, ServiceConfig};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use futures_util::stream;
@@ -29,8 +30,10 @@ use rand_core::{OsRng, RngCore as _};
 use serde_json::Value;
 use sha2::Digest as _;
 use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::str::FromStr as _;
+use std::time::Duration;
 use tempfile::TempDir;
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -42,6 +45,7 @@ struct TestApp {
     temp: TempDir,
     router: axum::Router,
     controller_public_key: Ed25519PublicKey,
+    database: Database,
 }
 
 impl TestApp {
@@ -55,7 +59,7 @@ impl TestApp {
         let database = Database::open(&config.database_path, &config.network_display_name).unwrap();
         let controller_public_key = database.controller_identity().public_key();
         let state = AppState::new(
-            database,
+            database.clone(),
             config.bootstrap_token,
             config.controller_origin,
             config.request_timeout,
@@ -64,6 +68,7 @@ impl TestApp {
             temp,
             router: build_router(state),
             controller_public_key,
+            database,
         }
     }
 
@@ -72,8 +77,10 @@ impl TestApp {
             temp,
             router,
             controller_public_key: _,
+            database,
         } = self;
         drop(router);
+        drop(database);
         Self::from_temp(temp)
     }
 
@@ -1283,6 +1290,160 @@ async fn authenticated_heartbeat_persists_only_pending_endpoint_candidates() {
 }
 
 #[tokio::test]
+async fn heartbeat_candidate_port_must_match_the_signed_public_port() {
+    let app = TestApp::new();
+    let (node, mut current) = setup_applied_heartbeat(&app).await;
+    current.endpoints[0].port = 8443;
+
+    let response = post_heartbeat(&app, &node, &current, 24).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json(response).await["error"]["code"], "state_conflict");
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let candidates: i64 = connection
+        .query_row("SELECT COUNT(*) FROM node_endpoint_candidates", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(candidates, 0);
+}
+
+#[tokio::test]
+async fn tcp_preflight_is_durable_and_cannot_mark_an_endpoint_verified() {
+    let app = TestApp::new();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    assert_eq!(
+        post_heartbeat(&app, &node, &current, 25).await.status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let job = app
+        .database
+        .claim_tcp_probe(Uuid::new_v4(), TcpProbeLoopOptions::default())
+        .await
+        .unwrap()
+        .expect("current direct candidate should be due");
+    assert_eq!(job.node_id(), node.node_id);
+    assert_eq!(job.endpoint_id(), current.endpoints[0].endpoint_id);
+    assert_eq!(job.address(), "node.example.test");
+    assert_eq!(job.port(), 443);
+
+    let result = TcpProbeResult::connected(
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        Duration::from_millis(8),
+    );
+    assert_eq!(
+        app.database
+            .complete_tcp_probe(job.clone(), result.clone())
+            .await
+            .unwrap(),
+        TcpProbeCompletion::Recorded
+    );
+    assert_eq!(
+        app.database.complete_tcp_probe(job, result).await.unwrap(),
+        TcpProbeCompletion::AlreadyRecorded
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let attempt: (String, String, String, i64) = connection
+        .query_row(
+            "SELECT status, resolved_address, result_code, latency_ms
+             FROM endpoint_probe_attempts WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        attempt,
+        (
+            "succeeded".into(),
+            "8.8.8.8".into(),
+            "direct_tcp_connected".into(),
+            8,
+        )
+    );
+    let verification: (String, i64, Option<i64>) = connection
+        .query_row(
+            "SELECT status, probe_attempts, last_probe_at
+             FROM node_endpoint_verifications WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(verification, ("pending".into(), 0, None));
+    assert!(connection
+        .execute(
+            "UPDATE endpoint_probe_attempts
+             SET status = 'failed', result_code = 'manual_override',
+                 resolved_address = NULL, latency_ms = NULL
+             WHERE node_id = ?1",
+            [node.node_id.to_string()],
+        )
+        .is_err());
+    assert!(connection
+        .execute(
+            "DELETE FROM endpoint_probe_attempts WHERE node_id = ?1",
+            [node.node_id.to_string()],
+        )
+        .is_err());
+}
+
+#[tokio::test]
+async fn tcp_preflight_discards_success_for_a_withdrawn_candidate() {
+    let app = TestApp::new();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    assert_eq!(
+        post_heartbeat(&app, &node, &current, 26).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    let job = app
+        .database
+        .claim_tcp_probe(Uuid::new_v4(), TcpProbeLoopOptions::default())
+        .await
+        .unwrap()
+        .expect("current direct candidate should be due");
+
+    let mut withdrawn = current;
+    withdrawn.heartbeat_generation = SequenceNumber::new(2).unwrap();
+    withdrawn.endpoints.clear();
+    assert_eq!(
+        post_heartbeat(&app, &node, &withdrawn, 27).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        app.database
+            .complete_tcp_probe(
+                job,
+                TcpProbeResult::connected(
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+                    Duration::from_millis(9),
+                ),
+            )
+            .await
+            .unwrap(),
+        TcpProbeCompletion::CandidateChanged
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let attempt: (String, String) = connection
+        .query_row(
+            "SELECT status, result_code FROM endpoint_probe_attempts WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(attempt, ("cancelled".into(), "candidate_changed".into()));
+    let verification: String = connection
+        .query_row(
+            "SELECT status FROM node_endpoint_verifications WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(verification, "withdrawn");
+}
+
+#[tokio::test]
 async fn heartbeat_withdraws_missing_candidates_and_rejects_identity_reuse() {
     let app = TestApp::new();
     let (node, current) = setup_applied_heartbeat(&app).await;
@@ -2167,5 +2328,5 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (7, 7, 1, 1, 1));
+    assert_eq!(durable, (8, 8, 1, 1, 1));
 }

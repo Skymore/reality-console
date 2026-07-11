@@ -9,7 +9,8 @@ flowchart LR
     Admin["Control admin app"] -->|"HTTPS admin API"| Service["Control Service + SQLite"]
     Host["Node Host agent"] -->|"outbound enroll, poll, report"| Service
     Client["Connect client"] -->|"activate, refresh bundle"| Service
-    Service -->|"external endpoint probe"| Host
+    Probe["Probe worker outside node LAN"] -->|"bounded TCP / protocol probe"| Host
+    Probe <-->|"claim and result"| Service
     Client -->|"VLESS + REALITY"| Host
     Host -->|"optional outbound tunnel"| Relay["Raw TCP relay"]
     Client -->|"VLESS + REALITY"| Relay
@@ -110,6 +111,7 @@ node_invitations
 nodes
 node_endpoint_candidates
 node_endpoint_verifications
+endpoint_probe_attempts
 user_node_assignments
 user_node_credentials
 config_revisions
@@ -169,10 +171,15 @@ Node Host evaluates modes in this order:
 3. Consent-gated automatic PCP, NAT-PMP, or UPnP IGD mapping.
 4. Assigned raw TCP relay.
 
-Only a controller-side probe can mark an endpoint `verified`. Local listening and public-IP
-detection are useful diagnostics but do not prove external reachability. A management overlay such
-as Tailscale may secure operations but does not by itself make the Xray endpoint available to
-ordinary Connect clients.
+Only a controller-owned, protocol-aware external probe can mark an endpoint `verified`. Local
+listening, public-IP detection, router-mapping success, and bare TCP connection are useful staged
+evidence but do not prove the endpoint is the intended VLESS + REALITY node. Control Service owns
+durable claims and results; a replaceable runner performs network I/O outside the SQLite lock. The
+in-process `local-tcp` runner is valid only when Control Service is outside the candidate node's
+LAN. A home controller therefore requires a remote worker for authoritative reachability, because
+probing its own public address would test NAT loopback. A management overlay such as Tailscale may
+secure operations but does not by itself make the Xray endpoint available to ordinary Connect
+clients.
 
 ## 8. Offline And Failure Behavior
 
@@ -192,6 +199,8 @@ ordinary Connect clients.
 - Control Service and local Node Host run as background services on the operator's powered Mac.
 - An HTTP tunnel or reverse proxy exposes only account and synchronization APIs.
 - Router forwarding exposes the local Xray data endpoint.
+- External verification is disabled until a remote probe worker is configured; local TCP probing
+  from the same LAN is not authoritative.
 - Daily SQLite backup and config backup are copied outside the application data directory.
 
 ### Optional public deployment

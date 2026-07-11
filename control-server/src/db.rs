@@ -4,6 +4,9 @@ use crate::desired::{
     StoredDesiredState, SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS,
 };
 use crate::identity::{set_owner_only, ControllerIdentity, IdentityError};
+use crate::probe::{
+    ProbeSchedule, TcpProbeCompletion, TcpProbeJob, TcpProbeLoopOptions, TcpProbeResult,
+};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use control_protocol::crypto::{Ed25519PublicKey, Sha256Digest};
@@ -12,11 +15,11 @@ use control_protocol::enrollment::{
     EnrollmentCryptoError, EnrollmentInvitation,
 };
 use control_protocol::id::{
-    ControllerInstanceId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision, SigningKeyId,
-    Timestamp,
+    ControllerInstanceId, EndpointId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision,
+    SigningKeyId, Timestamp,
 };
 use control_protocol::node::{
-    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate,
+    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate, EndpointMode,
     EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode, NodeCapability, NodeCredential,
     NodeHeartbeat, PairingPurpose, RevisionResult, RevisionResultState, SignedDesiredState,
 };
@@ -35,11 +38,12 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
@@ -537,6 +541,93 @@ ALTER TABLE nodes ADD COLUMN consent_router_mapping INTEGER NOT NULL DEFAULT 0
     CHECK(consent_router_mapping IN (0, 1));
 ";
 
+const MIGRATION_8_SQL: &str = r"
+CREATE TABLE endpoint_probe_attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    network_id TEXT NOT NULL,
+    probe_id TEXT NOT NULL CHECK(length(probe_id) = 36),
+    node_id TEXT NOT NULL,
+    endpoint_id TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('tcp', 'protocol')),
+    status TEXT NOT NULL
+        CHECK(status IN ('claimed', 'succeeded', 'failed', 'cancelled', 'expired')),
+    runner_id TEXT NOT NULL CHECK(length(runner_id) = 36),
+    claim_token_sha256 BLOB NOT NULL CHECK(length(claim_token_sha256) = 32),
+    candidate_generation INTEGER NOT NULL CHECK(candidate_generation > 0),
+    address TEXT NOT NULL CHECK(length(address) BETWEEN 1 AND 253),
+    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+    applied_revision INTEGER NOT NULL CHECK(applied_revision > 0),
+    started_at INTEGER NOT NULL,
+    claim_expires_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    resolved_address TEXT CHECK(
+        resolved_address IS NULL OR length(resolved_address) BETWEEN 2 AND 45
+    ),
+    latency_ms INTEGER CHECK(latency_ms IS NULL OR latency_ms >= 0),
+    result_code TEXT CHECK(result_code IS NULL OR length(result_code) BETWEEN 1 AND 64),
+    UNIQUE(network_id, probe_id),
+    CHECK(claim_expires_at > started_at),
+    CHECK(completed_at IS NULL OR completed_at >= started_at),
+    CHECK(
+        (status = 'claimed' AND completed_at IS NULL
+            AND resolved_address IS NULL AND latency_ms IS NULL AND result_code IS NULL)
+        OR (status = 'succeeded' AND completed_at IS NOT NULL
+            AND resolved_address IS NOT NULL AND latency_ms IS NOT NULL
+            AND (
+                (phase = 'tcp' AND result_code = 'direct_tcp_connected')
+                OR (phase = 'protocol' AND result_code = 'direct_protocol_connected')
+            ))
+        OR (status = 'failed' AND completed_at IS NOT NULL AND result_code IS NOT NULL)
+        OR (status = 'cancelled' AND completed_at IS NOT NULL
+            AND resolved_address IS NULL AND latency_ms IS NULL
+            AND result_code = 'candidate_changed')
+        OR (status = 'expired' AND completed_at IS NOT NULL
+            AND resolved_address IS NULL AND latency_ms IS NULL
+            AND result_code = 'claim_expired')
+    ),
+    FOREIGN KEY(network_id, node_id, endpoint_id)
+        REFERENCES node_endpoint_candidates(network_id, node_id, endpoint_id)
+        ON DELETE RESTRICT
+) STRICT;
+
+CREATE UNIQUE INDEX endpoint_probe_attempts_active_node
+    ON endpoint_probe_attempts(network_id, node_id)
+    WHERE status = 'claimed';
+
+CREATE INDEX endpoint_probe_attempts_latest_endpoint
+    ON endpoint_probe_attempts(
+        network_id, node_id, endpoint_id, phase, attempt_id DESC
+    );
+
+CREATE TRIGGER endpoint_probe_attempts_terminal_transition
+BEFORE UPDATE ON endpoint_probe_attempts
+WHEN OLD.status != 'claimed'
+    OR NEW.status NOT IN ('succeeded', 'failed', 'cancelled', 'expired')
+    OR NEW.attempt_id != OLD.attempt_id
+    OR NEW.network_id != OLD.network_id
+    OR NEW.probe_id != OLD.probe_id
+    OR NEW.node_id != OLD.node_id
+    OR NEW.endpoint_id != OLD.endpoint_id
+    OR NEW.phase != OLD.phase
+    OR NEW.runner_id != OLD.runner_id
+    OR NEW.claim_token_sha256 != OLD.claim_token_sha256
+    OR NEW.candidate_generation != OLD.candidate_generation
+    OR NEW.address != OLD.address
+    OR NEW.port != OLD.port
+    OR NEW.applied_revision != OLD.applied_revision
+    OR NEW.started_at != OLD.started_at
+    OR NEW.claim_expires_at != OLD.claim_expires_at
+BEGIN
+    SELECT RAISE(ABORT, 'endpoint probe attempts allow only one terminal transition');
+END;
+
+CREATE TRIGGER endpoint_probe_attempts_no_delete
+BEFORE DELETE ON endpoint_probe_attempts
+BEGIN
+    SELECT RAISE(ABORT, 'endpoint probe attempts are retained');
+END;
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -578,6 +669,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "router_mapping_consent",
         sql: MIGRATION_7_SQL,
+    },
+    Migration {
+        version: 8,
+        name: "endpoint_tcp_probe_attempts",
+        sql: MIGRATION_8_SQL,
     },
 ];
 
@@ -846,6 +942,57 @@ impl Database {
         .map_err(DatabaseError::Worker)?
     }
 
+    /// Claims one due direct-endpoint TCP preflight with a finite lease.
+    ///
+    /// The returned token is not stored in plaintext. Callers must release the
+    /// database lock before doing network work and then submit the whole job to
+    /// [`Self::complete_tcp_probe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] for invalid scheduling, clock, worker, or
+    /// durable storage failures.
+    pub async fn claim_tcp_probe(
+        &self,
+        runner_id: Uuid,
+        options: TcpProbeLoopOptions,
+    ) -> Result<Option<TcpProbeJob>, DatabaseError> {
+        let schedule = options
+            .validated_schedule()
+            .map_err(|_| DatabaseError::InvalidProbeSchedule)?;
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            claim_tcp_probe(&mut guard.connection, runner_id, schedule)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Completes one claimed TCP preflight without trusting stale candidate state.
+    ///
+    /// A successful TCP connection is retained as preflight evidence only. It
+    /// never changes `node_endpoint_verifications` to `verified`; that requires
+    /// a later protocol-aware VLESS+REALITY canary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when the claim is unknown, forged, corrupt, or
+    /// cannot be committed atomically.
+    pub async fn complete_tcp_probe(
+        &self,
+        job: TcpProbeJob,
+        result: TcpProbeResult,
+    ) -> Result<TcpProbeCompletion, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            complete_tcp_probe(&mut guard.connection, &job, &result)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
     /// Publishes one immutable signed desired-state revision for an active node.
     pub(crate) async fn publish_desired_state(
         &self,
@@ -1080,6 +1227,540 @@ fn record_heartbeat(
     Ok(())
 }
 
+const SELECT_DUE_TCP_PROBE_SQL: &str = r"
+SELECT c.network_id, c.node_id, c.endpoint_id, c.address, c.port,
+       c.applied_revision, c.last_report_generation
+FROM node_endpoint_candidates AS c
+JOIN nodes AS n ON n.network_id = c.network_id AND n.node_id = c.node_id
+JOIN networks AS network ON network.network_id = c.network_id
+JOIN config_revisions AS revision
+  ON revision.network_id = c.network_id
+ AND revision.node_id = c.node_id
+ AND revision.revision = c.applied_revision
+JOIN node_endpoint_verifications AS verification
+  ON verification.network_id = c.network_id
+ AND verification.node_id = c.node_id
+ AND verification.endpoint_id = c.endpoint_id
+WHERE network.status = 'active'
+  AND n.status = 'active'
+  AND n.runtime_state = 'serving'
+  AND n.provider_paused = 0
+  AND n.last_seen_at IS NOT NULL AND n.last_seen_at >= ?1
+  AND n.applied_revision = c.applied_revision
+  AND n.last_heartbeat_generation = c.last_report_generation
+  AND revision.schema_version = 2
+  AND json_type(revision.artifact_json, '$.document.xray.publicPort') = 'integer'
+  AND json_extract(revision.artifact_json, '$.document.xray.publicPort') = c.port
+  AND c.mode = 'direct'
+  AND c.withdrawn_at IS NULL
+  AND (c.expires_at IS NULL OR c.expires_at > ?2)
+  AND verification.status != 'withdrawn'
+  AND NOT EXISTS (
+      SELECT 1 FROM endpoint_probe_attempts AS active
+      WHERE active.network_id = c.network_id
+        AND active.node_id = c.node_id
+        AND active.status = 'claimed'
+  )
+  AND COALESCE((
+      SELECT previous.started_at + CASE
+          WHEN previous.status = 'succeeded' THEN ?3 ELSE ?4 END
+      FROM endpoint_probe_attempts AS previous
+      WHERE previous.network_id = c.network_id
+        AND previous.node_id = c.node_id
+        AND previous.endpoint_id = c.endpoint_id
+        AND previous.phase = 'tcp'
+      ORDER BY previous.attempt_id DESC
+      LIMIT 1
+  ), 0) <= ?5
+ORDER BY COALESCE((
+            SELECT MAX(previous.attempt_id)
+            FROM endpoint_probe_attempts AS previous
+            WHERE previous.network_id = c.network_id
+              AND previous.node_id = c.node_id
+              AND previous.endpoint_id = c.endpoint_id
+              AND previous.phase = 'tcp'
+         ), 0),
+         c.first_reported_at,
+         c.endpoint_id
+LIMIT 1
+";
+
+struct StoredProbeCandidate {
+    network_id: String,
+    node_id: String,
+    endpoint_id: String,
+    address: String,
+    port: i64,
+    applied_revision: i64,
+    candidate_generation: i64,
+}
+
+struct ProbeCandidate {
+    network_id: NetworkId,
+    node_id: NodeId,
+    endpoint_id: EndpointId,
+    address: String,
+    port: u16,
+    applied_revision: Revision,
+    candidate_generation: i64,
+}
+
+fn claim_tcp_probe(
+    connection: &mut Connection,
+    runner_id: Uuid,
+    schedule: ProbeSchedule,
+) -> Result<Option<TcpProbeJob>, DatabaseError> {
+    let now = unix_timestamp()?;
+    let claim_expires_at = now
+        .checked_add(probe_duration_seconds(schedule.claim_lease)?)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let online_cutoff = now
+        .checked_sub(probe_duration_seconds(schedule.node_online_window)?)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    expire_stale_probe_claims(&transaction, now)?;
+    let candidate = select_due_tcp_probe(
+        &transaction,
+        online_cutoff,
+        claim_expires_at,
+        probe_duration_seconds(schedule.success_interval)?,
+        probe_duration_seconds(schedule.failure_interval)?,
+        now,
+    )?;
+    let Some(candidate) = candidate else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+
+    let probe_id = Uuid::new_v4();
+    let mut claim_token = [0_u8; 32];
+    OsRng.fill_bytes(&mut claim_token);
+    let claim_token_digest: [u8; 32] = Sha256::digest(claim_token).into();
+    insert_tcp_probe_claim(
+        &transaction,
+        &candidate,
+        probe_id,
+        runner_id,
+        &claim_token_digest,
+        now,
+        claim_expires_at,
+    )?;
+    transaction.commit()?;
+
+    Ok(Some(TcpProbeJob {
+        probe_id,
+        runner_id,
+        network_id: candidate.network_id,
+        node_id: candidate.node_id,
+        endpoint_id: candidate.endpoint_id,
+        address: candidate.address,
+        port: candidate.port,
+        applied_revision: candidate.applied_revision,
+        candidate_generation: candidate.candidate_generation,
+        claim_expires_at,
+        claim_token: Secret::new(claim_token),
+    }))
+}
+
+fn expire_stale_probe_claims(
+    transaction: &rusqlite::Transaction<'_>,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "UPDATE endpoint_probe_attempts
+         SET status = 'expired', completed_at = ?1, result_code = 'claim_expired'
+         WHERE status = 'claimed' AND claim_expires_at <= ?1",
+        [now],
+    )?;
+    Ok(())
+}
+
+fn select_due_tcp_probe(
+    transaction: &rusqlite::Transaction<'_>,
+    online_cutoff: i64,
+    claim_expires_at: i64,
+    success_interval: i64,
+    failure_interval: i64,
+    now: i64,
+) -> Result<Option<ProbeCandidate>, DatabaseError> {
+    let stored = transaction
+        .query_row(
+            SELECT_DUE_TCP_PROBE_SQL,
+            params![
+                online_cutoff,
+                claim_expires_at,
+                success_interval,
+                failure_interval,
+                now,
+            ],
+            |row| {
+                Ok(StoredProbeCandidate {
+                    network_id: row.get(0)?,
+                    node_id: row.get(1)?,
+                    endpoint_id: row.get(2)?,
+                    address: row.get(3)?,
+                    port: row.get(4)?,
+                    applied_revision: row.get(5)?,
+                    candidate_generation: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    stored.map(decode_probe_candidate).transpose()
+}
+
+fn decode_probe_candidate(stored: StoredProbeCandidate) -> Result<ProbeCandidate, DatabaseError> {
+    if stored.candidate_generation <= 0 {
+        return Err(DatabaseError::StoredProtocolValue);
+    }
+    Ok(ProbeCandidate {
+        network_id: stored
+            .network_id
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        node_id: stored
+            .node_id
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        endpoint_id: stored
+            .endpoint_id
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        address: stored.address,
+        port: u16::try_from(stored.port).map_err(|_| DatabaseError::StoredProtocolValue)?,
+        applied_revision: Revision::new(stored.applied_revision)
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        candidate_generation: stored.candidate_generation,
+    })
+}
+
+fn insert_tcp_probe_claim(
+    transaction: &rusqlite::Transaction<'_>,
+    candidate: &ProbeCandidate,
+    probe_id: Uuid,
+    runner_id: Uuid,
+    claim_token_digest: &[u8; 32],
+    now: i64,
+    claim_expires_at: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "INSERT INTO endpoint_probe_attempts(
+            network_id, probe_id, node_id, endpoint_id, phase, status, runner_id,
+            claim_token_sha256, candidate_generation, address, port,
+            applied_revision, started_at, claim_expires_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, 'tcp', 'claimed', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+         )",
+        params![
+            candidate.network_id.to_string(),
+            probe_id.to_string(),
+            candidate.node_id.to_string(),
+            candidate.endpoint_id.to_string(),
+            runner_id.to_string(),
+            claim_token_digest.as_slice(),
+            candidate.candidate_generation,
+            candidate.address,
+            i64::from(candidate.port),
+            candidate.applied_revision.get(),
+            now,
+            claim_expires_at,
+        ],
+    )?;
+    Ok(())
+}
+
+struct StoredProbeClaim {
+    status: String,
+    node_id: String,
+    endpoint_id: String,
+    phase: String,
+    runner_id: String,
+    claim_digest: [u8; 32],
+    candidate_generation: i64,
+    address: String,
+    port: i64,
+    applied_revision: i64,
+    claim_expires_at: i64,
+}
+
+impl StoredProbeClaim {
+    fn authenticates(&self, job: &TcpProbeJob) -> bool {
+        let submitted_digest: [u8; 32] = Sha256::digest(job.claim_token.expose_secret()).into();
+        bool::from(
+            self.claim_digest
+                .as_slice()
+                .ct_eq(submitted_digest.as_slice()),
+        ) && self.node_id == job.node_id.to_string()
+            && self.endpoint_id == job.endpoint_id.to_string()
+            && self.phase == "tcp"
+            && self.runner_id == job.runner_id.to_string()
+            && self.candidate_generation == job.candidate_generation
+            && self.address == job.address
+            && self.port == i64::from(job.port)
+            && self.applied_revision == job.applied_revision.get()
+            && self.claim_expires_at == job.claim_expires_at
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "succeeded" | "failed" | "cancelled" | "expired"
+        )
+    }
+}
+
+struct ProbeTerminalResult {
+    status: &'static str,
+    resolved_address: Option<String>,
+    latency_ms: Option<i64>,
+    result_code: &'static str,
+}
+
+impl ProbeTerminalResult {
+    const fn expired() -> Self {
+        Self {
+            status: "expired",
+            resolved_address: None,
+            latency_ms: None,
+            result_code: "claim_expired",
+        }
+    }
+
+    const fn candidate_changed() -> Self {
+        Self {
+            status: "cancelled",
+            resolved_address: None,
+            latency_ms: None,
+            result_code: "candidate_changed",
+        }
+    }
+}
+
+fn complete_tcp_probe(
+    connection: &mut Connection,
+    job: &TcpProbeJob,
+    result: &TcpProbeResult,
+) -> Result<TcpProbeCompletion, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stored = load_probe_claim(&transaction, job)?;
+    if !stored.authenticates(job) {
+        return Err(DatabaseError::ProbeClaimConflict);
+    }
+    if stored.status != "claimed" {
+        if stored.is_terminal() {
+            transaction.commit()?;
+            return Ok(TcpProbeCompletion::AlreadyRecorded);
+        }
+        return Err(DatabaseError::StoredProtocolValue);
+    }
+    if now >= stored.claim_expires_at {
+        finish_probe_attempt(&transaction, job, &ProbeTerminalResult::expired(), now)?;
+        transaction.commit()?;
+        return Ok(TcpProbeCompletion::ClaimExpired);
+    }
+    if !probe_candidate_is_current(&transaction, job, now)? {
+        finish_probe_attempt(
+            &transaction,
+            job,
+            &ProbeTerminalResult::candidate_changed(),
+            now,
+        )?;
+        transaction.commit()?;
+        return Ok(TcpProbeCompletion::CandidateChanged);
+    }
+
+    let prepared = prepare_probe_result(result)?;
+    finish_probe_attempt(&transaction, job, &prepared, now)?;
+    transaction.commit()?;
+    Ok(TcpProbeCompletion::Recorded)
+}
+
+fn load_probe_claim(
+    transaction: &rusqlite::Transaction<'_>,
+    job: &TcpProbeJob,
+) -> Result<StoredProbeClaim, DatabaseError> {
+    transaction
+        .query_row(
+            "SELECT status, node_id, endpoint_id, phase, runner_id,
+                    claim_token_sha256, candidate_generation, address, port,
+                    applied_revision, claim_expires_at
+             FROM endpoint_probe_attempts
+             WHERE network_id = ?1 AND probe_id = ?2",
+            params![job.network_id.to_string(), job.probe_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ProbeClaimNotFound)
+        .and_then(decode_probe_claim)
+}
+
+type StoredProbeClaimTuple = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<u8>,
+    i64,
+    String,
+    i64,
+    i64,
+    i64,
+);
+
+fn decode_probe_claim(stored: StoredProbeClaimTuple) -> Result<StoredProbeClaim, DatabaseError> {
+    Ok(StoredProbeClaim {
+        status: stored.0,
+        node_id: stored.1,
+        endpoint_id: stored.2,
+        phase: stored.3,
+        runner_id: stored.4,
+        claim_digest: stored
+            .5
+            .try_into()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        candidate_generation: stored.6,
+        address: stored.7,
+        port: stored.8,
+        applied_revision: stored.9,
+        claim_expires_at: stored.10,
+    })
+}
+
+fn probe_candidate_is_current(
+    transaction: &rusqlite::Transaction<'_>,
+    job: &TcpProbeJob,
+    now: i64,
+) -> Result<bool, DatabaseError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM node_endpoint_candidates AS c
+                 JOIN nodes AS n
+                   ON n.network_id = c.network_id AND n.node_id = c.node_id
+                 JOIN config_revisions AS revision
+                   ON revision.network_id = c.network_id
+                  AND revision.node_id = c.node_id
+                  AND revision.revision = c.applied_revision
+                 JOIN node_endpoint_verifications AS verification
+                   ON verification.network_id = c.network_id
+                  AND verification.node_id = c.node_id
+                  AND verification.endpoint_id = c.endpoint_id
+                 WHERE c.network_id = ?1 AND c.node_id = ?2 AND c.endpoint_id = ?3
+                   AND c.mode = 'direct'
+                   AND c.address = ?4 AND c.port = ?5 AND c.applied_revision = ?6
+                   AND c.last_report_generation = ?7
+                   AND revision.schema_version = 2
+                   AND json_type(
+                       revision.artifact_json, '$.document.xray.publicPort'
+                   ) = 'integer'
+                   AND json_extract(
+                       revision.artifact_json, '$.document.xray.publicPort'
+                   ) = c.port
+                   AND c.withdrawn_at IS NULL
+                   AND (c.expires_at IS NULL OR c.expires_at > ?8)
+                   AND verification.status != 'withdrawn'
+                   AND n.status = 'active' AND n.runtime_state = 'serving'
+                   AND n.provider_paused = 0
+                   AND n.applied_revision = ?6
+                   AND n.last_heartbeat_generation = ?7
+             )",
+            params![
+                job.network_id.to_string(),
+                job.node_id.to_string(),
+                job.endpoint_id.to_string(),
+                job.address,
+                i64::from(job.port),
+                job.applied_revision.get(),
+                job.candidate_generation,
+                now,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(DatabaseError::from)
+}
+
+fn prepare_probe_result(result: &TcpProbeResult) -> Result<ProbeTerminalResult, DatabaseError> {
+    match result {
+        TcpProbeResult::Connected {
+            resolved_address,
+            latency,
+        } => Ok(ProbeTerminalResult {
+            status: "succeeded",
+            resolved_address: Some(resolved_address.to_string()),
+            latency_ms: Some(probe_duration_millis(*latency)?),
+            result_code: "direct_tcp_connected",
+        }),
+        TcpProbeResult::Failed {
+            code,
+            resolved_address,
+            latency,
+        } => Ok(ProbeTerminalResult {
+            status: "failed",
+            resolved_address: resolved_address.map(|address| address.to_string()),
+            latency_ms: latency.map(probe_duration_millis).transpose()?,
+            result_code: code.as_str(),
+        }),
+    }
+}
+
+fn finish_probe_attempt(
+    transaction: &rusqlite::Transaction<'_>,
+    job: &TcpProbeJob,
+    result: &ProbeTerminalResult,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let updated = transaction.execute(
+        "UPDATE endpoint_probe_attempts
+         SET status = ?1, completed_at = ?2, resolved_address = ?3,
+             latency_ms = ?4, result_code = ?5
+         WHERE network_id = ?6 AND probe_id = ?7 AND status = 'claimed'",
+        params![
+            result.status,
+            now,
+            result.resolved_address.as_deref(),
+            result.latency_ms,
+            result.result_code,
+            job.network_id.to_string(),
+            job.probe_id.to_string(),
+        ],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(DatabaseError::ProbeClaimConflict)
+    }
+}
+
+fn probe_duration_seconds(duration: std::time::Duration) -> Result<i64, DatabaseError> {
+    let seconds =
+        i64::try_from(duration.as_secs()).map_err(|_| DatabaseError::InvalidProbeSchedule)?;
+    if seconds == 0 {
+        return Err(DatabaseError::InvalidProbeSchedule);
+    }
+    Ok(seconds)
+}
+
+fn probe_duration_millis(duration: std::time::Duration) -> Result<i64, DatabaseError> {
+    i64::try_from(duration.as_millis()).map_err(|_| DatabaseError::ProbeResultOverflow)
+}
+
 fn record_endpoint_candidates(
     transaction: &rusqlite::Transaction<'_>,
     network_id: &str,
@@ -1091,6 +1772,7 @@ fn record_endpoint_candidates(
     let node_id = node_id.to_string();
     let mut new_candidates = Vec::new();
     for candidate in &heartbeat.endpoints {
+        validate_endpoint_candidate_revision(transaction, network_id, &node_id, candidate)?;
         let prepared = PreparedEndpointCandidate::new(candidate)?;
         if !refresh_endpoint_candidate(
             transaction,
@@ -1117,6 +1799,36 @@ fn record_endpoint_candidates(
         )?;
     }
     Ok(())
+}
+
+fn validate_endpoint_candidate_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: &str,
+    candidate: &EndpointCandidate,
+) -> Result<(), DatabaseError> {
+    if candidate.mode != EndpointMode::Direct {
+        return Ok(());
+    }
+    let public_port = transaction
+        .query_row(
+            "SELECT CASE
+                 WHEN schema_version = 2
+                  AND json_type(artifact_json, '$.document.xray.publicPort') = 'integer'
+                 THEN json_extract(artifact_json, '$.document.xray.publicPort')
+             END
+             FROM config_revisions
+             WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3",
+            params![network_id, node_id, candidate.applied_revision.get()],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten();
+    if public_port == Some(i64::from(candidate.port)) {
+        Ok(())
+    } else {
+        Err(DatabaseError::EndpointCandidateRevisionConflict)
+    }
 }
 
 struct PreparedEndpointCandidate<'a> {
@@ -2005,14 +2717,18 @@ fn prepare_owner_only_file(path: &Path) -> Result<(), DatabaseError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn owner_only_open_options() -> OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let mut options = OpenOptions::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
+    options.mode(0o600);
     options
+}
+
+#[cfg(not(unix))]
+fn owner_only_open_options() -> OpenOptions {
+    OpenOptions::new()
 }
 
 fn lock_path(path: &Path) -> PathBuf {
@@ -3096,6 +3812,16 @@ pub enum DatabaseError {
     NodeProgressConflict,
     #[error("the node reused an endpoint candidate identity with different or withdrawn state")]
     EndpointCandidateConflict,
+    #[error("the endpoint candidate does not match its applied signed revision")]
+    EndpointCandidateRevisionConflict,
+    #[error("the TCP probe schedule is invalid")]
+    InvalidProbeSchedule,
+    #[error("the endpoint probe claim was not found")]
+    ProbeClaimNotFound,
+    #[error("the endpoint probe claim does not match its durable identity or token")]
+    ProbeClaimConflict,
+    #[error("the endpoint probe result exceeds durable storage limits")]
+    ProbeResultOverflow,
     #[error("the node request signature is invalid")]
     InvalidNodeRequestSignature,
     #[error("the node was not found")]
