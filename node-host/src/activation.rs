@@ -1223,6 +1223,9 @@ mod tests {
         begin_activation, ActivationOptions, AdmissionGate, AdmissionOptions, JournalPhase,
         XraySupervisor, MAX_ACTIVATION_ATTEMPTS_WITHOUT_PREDECESSOR,
     };
+    use crate::test_support::{
+        bind_unique_loopback, bind_unique_wildcard, lock_network_tests, unique_unused_port,
+    };
     use crate::xray::validate_desired_state;
     use crate::{configure_xray, initialize, open_database, unix_timestamp};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1297,6 +1300,7 @@ mod tests {
     }
 
     struct Fixture {
+        _network_test_lock: tokio::sync::MutexGuard<'static, ()>,
         _directory: tempfile::TempDir,
         _fake: FakeXray,
         listener: Option<TcpListener>,
@@ -1307,6 +1311,7 @@ mod tests {
 
     impl Fixture {
         async fn new(mode: FakeMode) -> Self {
+            let network_test_lock = lock_network_tests().await;
             let directory = tempfile::tempdir().unwrap();
             let data_dir = directory.path().join("state");
             initialize(&data_dir, "https://controller.example").unwrap();
@@ -1314,11 +1319,12 @@ mod tests {
             configure_xray(&data_dir, &fake.path, &fake.digest, false)
                 .await
                 .unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = bind_unique_loopback().await;
             let listen_port = listener.local_addr().unwrap().port();
-            let public_port = unused_port().await;
+            let public_port = unique_unused_port().await;
             assert_ne!(listen_port, public_port);
             Self {
+                _network_test_lock: network_test_lock,
                 _directory: directory,
                 _fake: fake,
                 listener: Some(listener),
@@ -1364,23 +1370,20 @@ mod tests {
     }
 
     fn fast_options() -> ActivationOptions {
+        // Keep process/socket checks above scheduler jitter when the full test
+        // binary runs many child-process fixtures in parallel on macOS CI.
         ActivationOptions {
-            startup_timeout: Duration::from_millis(200),
-            stabilization_duration: Duration::from_millis(20),
-            probe_interval: Duration::from_millis(5),
+            startup_timeout: Duration::from_secs(1),
+            stabilization_duration: Duration::from_millis(100),
+            probe_interval: Duration::from_millis(25),
             admission: AdmissionOptions {
                 max_connections: 4,
-                connect_timeout: Duration::from_millis(100),
-                canary_timeout: Duration::from_millis(200),
-                probe_interval: Duration::from_millis(5),
-                accept_error_backoff: Duration::from_millis(5),
+                connect_timeout: Duration::from_millis(250),
+                canary_timeout: Duration::from_secs(1),
+                probe_interval: Duration::from_millis(25),
+                accept_error_backoff: Duration::from_millis(10),
             },
         }
-    }
-
-    async fn unused_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
     }
 
     fn desired_state(
@@ -1591,7 +1594,7 @@ mod tests {
         let mut supervisor = XraySupervisor::new(fast_options()).unwrap();
         supervisor.recover(&fixture.data_dir).await.unwrap();
         supervisor.reconcile(&fixture.data_dir).await.unwrap();
-        let occupied = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let occupied = bind_unique_wildcard().await;
         let occupied_port = occupied.local_addr().unwrap().port();
         fixture.validate_revision_at(2, occupied_port).await;
 

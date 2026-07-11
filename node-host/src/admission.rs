@@ -275,6 +275,9 @@ fn log_connection_result(result: std::result::Result<Result<()>, tokio::task::Jo
 #[cfg(test)]
 mod tests {
     use super::{AdmissionGate, AdmissionOptions};
+    use crate::test_support::{
+        bind_unique_loopback, bind_unique_wildcard, lock_network_tests, unique_unused_port,
+    };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream};
@@ -289,14 +292,10 @@ mod tests {
         }
     }
 
-    async fn unused_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
-    }
-
     #[tokio::test]
     async fn gate_proves_and_forwards_the_byte_stream() {
-        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _network_test_lock = lock_network_tests().await;
+        let backend = bind_unique_loopback().await;
         let backend_port = backend.local_addr().unwrap().port();
         let backend_task = tokio::spawn(async move {
             loop {
@@ -309,7 +308,7 @@ mod tests {
                 });
             }
         });
-        let public_port = unused_port().await;
+        let public_port = unique_unused_port().await;
         let mut gate = AdmissionGate::start(public_port, backend_port, fast_options()).unwrap();
 
         gate.prove_ready().await.unwrap();
@@ -331,8 +330,9 @@ mod tests {
 
     #[tokio::test]
     async fn gate_canary_fails_when_the_backend_is_unavailable() {
-        let backend_port = unused_port().await;
-        let public_port = unused_port().await;
+        let _network_test_lock = lock_network_tests().await;
+        let backend_port = unique_unused_port().await;
+        let public_port = unique_unused_port().await;
         assert_ne!(backend_port, public_port);
         let mut gate = AdmissionGate::start(public_port, backend_port, fast_options()).unwrap();
 
@@ -344,9 +344,10 @@ mod tests {
 
     #[tokio::test]
     async fn occupied_public_port_fails_before_spawning_an_owner_task() {
-        let occupied = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let _network_test_lock = lock_network_tests().await;
+        let occupied = bind_unique_wildcard().await;
         let public_port = occupied.local_addr().unwrap().port();
-        let backend_port = unused_port().await;
+        let backend_port = unique_unused_port().await;
 
         let error = AdmissionGate::start(public_port, backend_port, fast_options()).unwrap_err();
 
@@ -355,9 +356,10 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_gate_releases_its_listener_and_connection_tasks() {
-        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _network_test_lock = lock_network_tests().await;
+        let backend = bind_unique_loopback().await;
         let backend_port = backend.local_addr().unwrap().port();
-        let public_port = unused_port().await;
+        let public_port = unique_unused_port().await;
         let gate = AdmissionGate::start(public_port, backend_port, fast_options()).unwrap();
         let client = TcpStream::connect(("127.0.0.1", public_port))
             .await
@@ -382,9 +384,10 @@ mod tests {
 
     #[tokio::test]
     async fn connection_limit_refuses_excess_streams_and_releases_permits() {
-        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _network_test_lock = lock_network_tests().await;
+        let backend = bind_unique_loopback().await;
         let backend_port = backend.local_addr().unwrap().port();
-        let public_port = unused_port().await;
+        let public_port = unique_unused_port().await;
         let mut options = fast_options();
         options.max_connections = 1;
         let mut gate = AdmissionGate::start(public_port, backend_port, options).unwrap();

@@ -959,7 +959,7 @@ mod tests {
                 "UPDATE router_mapping_leases
                  SET lease_started_at = ?1, lease_expires_at = ?2
                  WHERE state = 'active'",
-                params![now - 100, now + 1],
+                params![now - 100, now + 60],
             )
             .unwrap();
         drop(connection);

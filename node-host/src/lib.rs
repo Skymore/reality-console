@@ -14,6 +14,8 @@ mod mapping;
 mod router_protocol;
 mod service;
 mod sync;
+#[cfg(test)]
+mod test_support;
 mod xray;
 
 use anyhow::{bail, Context, Result};
