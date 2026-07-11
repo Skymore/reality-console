@@ -19,9 +19,10 @@ The local Control application manages a native Xray installation, users, configu
 backups, diagnostics, quotas, and local telemetry. Connect can securely import a compatibility
 profile and supervise a pinned Xray sidecar. Control Service now supports secure one-time node
 invitations and proof-of-possession enrollment. Node Host has durable owner-only identities and a
-headless `init`/`join`/`status` flow that verifies the controller response before persisting its
-registration. Heartbeat, multi-node desired state, account synchronization, and relay fallback
-remain under active implementation.
+headless `init`/`join`/`sync-once`/`status` flow that verifies the controller response before
+persisting its registration. Authenticated heartbeat and empty desired-state polling are
+implemented. Automatic polling, signed desired-state apply, account synchronization, and relay
+fallback remain under active implementation.
 
 ## Authoritative Documentation
 

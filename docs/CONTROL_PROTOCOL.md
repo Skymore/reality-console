@@ -127,6 +127,13 @@ controller instance ID. The service rejects revoked keys, clock skew outside the
 window, repeated nonces, path/body substitution, and a node ID that does not own the key. Nonces
 are retained for at least the accepted clock-skew window.
 
+Version 1 uses the same labeled length-prefix encoding as enrollment, with domain
+`control/node-request/v1`. Fields are uppercase method, canonical origin-form path and raw query,
+canonical RFC 3339 UTC timestamp, unpadded base64url nonce, raw 32-byte body SHA-256 digest, and
+controller instance ID. The shared protocol rejects absolute URLs, fragments, dot or repeated path
+segments, ambiguous percent encoding, oversized request targets, unsupported methods, and
+non-canonical header values before signature verification.
+
 ### Heartbeat
 
 `POST /v1/nodes/{nodeId}/heartbeat`
@@ -150,6 +157,9 @@ are retained for at least the accepted clock-skew window.
 
 Heartbeat is a current-state report, not a command channel. The response may include polling and
 minimum-version hints but not arbitrary executable instructions.
+
+The initial implementation returns `204 No Content` after durably accepting the heartbeat. A
+heartbeat never approves a pending node, and revision plus telemetry cursors cannot move backward.
 
 ## 5. Desired State API
 
@@ -183,6 +193,10 @@ minimum-version hints but not arbitrary executable instructions.
 
 Node-local REALITY private keys are referenced or generated locally and are not transported in the
 ordinary desired-state document.
+
+The initial sync slice implements the authenticated `204` path. Node Host rejects a `200` desired
+state until signature verification and atomic apply are implemented; it never treats an unsigned
+document as configuration.
 
 ### Report result
 

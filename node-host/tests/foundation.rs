@@ -68,12 +68,22 @@ fn migrations_are_recorded_once_and_pragmas_are_enabled() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("migration metadata");
-    assert_eq!(count, 2);
+    assert_eq!(count, 3);
     assert_eq!(journal_mode, "wal");
-    assert_eq!(user_version, 2);
+    assert_eq!(user_version, 3);
     assert_eq!(migration.0, "node_host_foundation");
     assert_eq!(migration.1.len(), 64);
     assert!(migration.2 > 0);
+}
+
+#[test]
+fn cli_exposes_single_cycle_sync_command() {
+    Command::cargo_bin("node-host")
+        .expect("binary")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sync-once"));
 }
 
 #[test]

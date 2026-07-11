@@ -192,7 +192,8 @@ deleted and the invitation remains consumed. Re-pairing requires a new invitatio
 
 ### 6.4 Headless Development Flow
 
-The current headless implementation exposes `init`, `join`, and `status`. `join` consumes the exact
+The current headless implementation exposes `init`, `join`, `sync-once`, and `status`. `join`
+consumes the exact
 JSON invitation returned by Control Service, requires both provider-consent flags, reuses the
 installation's owner-only Ed25519/X25519 identities, and persists registration only after verifying
 the controller fingerprint and signed response. On Unix, the invitation file must be a regular
@@ -203,6 +204,11 @@ This CLI is a development and service integration surface, not the intended frie
 desktop wrapper will receive the invitation in memory through a QR code or deep link and present
 the provider disclosures as explicit checkboxes. Registration creates a pending node; operator
 approval and activation remain separate control-plane steps.
+
+`sync-once` performs one outbound signed heartbeat and one signed desired-state fetch. It records
+heartbeat and complete-cycle timestamps locally, uses a fresh nonce for every request, and accepts
+only the empty `204` desired-state response in the current slice. A later service loop will run the
+same operation with jitter and backoff after signed desired-state apply is complete.
 
 ## 7. Outbound-Only Control Sync
 

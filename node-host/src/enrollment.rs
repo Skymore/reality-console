@@ -193,13 +193,7 @@ async fn post_enrollment(
     let endpoint = controller
         .join("/v1/nodes/enroll")
         .context("failed to construct enrollment endpoint")?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .redirect(Policy::none())
-        .user_agent(concat!("node-host/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("failed to initialize enrollment HTTP client")?;
+    let client = control_http_client().context("failed to initialize enrollment HTTP client")?;
     let response = client
         .post(endpoint)
         .json(request)
@@ -217,7 +211,17 @@ async fn post_enrollment(
     serde_json::from_slice(&bytes).context("controller returned an invalid enrollment response")
 }
 
-async fn read_bounded_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
+pub(crate) fn control_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(Policy::none())
+        .user_agent(concat!("node-host/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("failed to initialize controller HTTP client")
+}
+
+pub(crate) async fn read_bounded_response(mut response: reqwest::Response) -> Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)

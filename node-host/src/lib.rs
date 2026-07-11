@@ -1,12 +1,13 @@
 //! Persistent local foundation for the Reality Console node host.
 
 mod enrollment;
+mod sync;
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use control_protocol::crypto::{Ed25519PublicKey, Ed25519Signature, X25519PublicKey};
-use control_protocol::id::{NodeId, NodeInvitationId, Timestamp};
+use control_protocol::id::{ControllerInstanceId, NodeId, NodeInvitationId, NodeKeyId, Timestamp};
 use control_protocol::node::{EnrollNodeResponse, NodeAuthenticationMode};
 use ed25519_dalek::{Signer as _, SigningKey};
 use fs2::FileExt;
@@ -30,10 +31,11 @@ const LOCK_FILE: &str = "node-host.lock";
 const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
+const MIGRATION_3_NAME: &str = "node_control_sync_state";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -58,7 +60,21 @@ const MIGRATION_2: &str = "
     ) STRICT;
 ";
 
+const MIGRATION_3: &str = "
+    CREATE TABLE control_sync_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        last_heartbeat_at INTEGER,
+        last_sync_at INTEGER,
+        desired_revision_cursor INTEGER NOT NULL DEFAULT 0
+            CHECK (desired_revision_cursor >= 0)
+    ) STRICT;
+
+    INSERT INTO control_sync_state(singleton, desired_revision_cursor)
+    VALUES (1, 0);
+";
+
 pub use enrollment::join;
+pub use sync::sync_once;
 
 /// Safe enrollment state rendered by the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -96,6 +112,12 @@ pub struct HostStatus {
     pub node_id: Option<NodeId>,
     /// Expiry of the active node authentication credential, when enrolled.
     pub credential_expires_at: Option<Timestamp>,
+    /// Last heartbeat durably acknowledged by the controller.
+    pub last_heartbeat_at: Option<Timestamp>,
+    /// Last complete heartbeat and desired-state synchronization cycle.
+    pub last_sync_at: Option<Timestamp>,
+    /// Highest desired-state revision durably accepted by this host.
+    pub desired_revision_cursor: i64,
 }
 
 /// A seed whose formatting can never reveal its bytes.
@@ -215,6 +237,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     validate_migration_state(&transaction)?;
     apply_migration(&transaction, 1, MIGRATION_1_NAME, MIGRATION_1)?;
     apply_migration(&transaction, 2, MIGRATION_2_NAME, MIGRATION_2)?;
+    apply_migration(&transaction, 3, MIGRATION_3_NAME, MIGRATION_3)?;
     transaction.commit()?;
     Ok(())
 }
@@ -275,6 +298,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
     let known = [
         (1, MIGRATION_1_NAME, MIGRATION_1),
         (2, MIGRATION_2_NAME, MIGRATION_2),
+        (3, MIGRATION_3_NAME, MIGRATION_3),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");
@@ -349,6 +373,7 @@ fn build_status(
         |row| row.get(0),
     )?;
     let registration = load_registration_status(connection)?;
+    let sync_status = load_sync_status(connection)?;
     Ok(HostStatus {
         controller,
         identity_public_key: identity.ed25519_public()?,
@@ -361,7 +386,62 @@ fn build_status(
         },
         node_id: registration.as_ref().map(|value| value.0),
         credential_expires_at: registration.map(|value| value.1),
+        last_heartbeat_at: sync_status.last_heartbeat_at,
+        last_sync_at: sync_status.last_sync_at,
+        desired_revision_cursor: sync_status.desired_revision_cursor,
     })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SyncStatus {
+    last_heartbeat_at: Option<Timestamp>,
+    last_sync_at: Option<Timestamp>,
+    desired_revision_cursor: i64,
+}
+
+fn load_sync_status(connection: &Connection) -> Result<SyncStatus> {
+    let has_table: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'control_sync_state'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_table == 0 {
+        return Ok(SyncStatus::default());
+    }
+
+    let stored = connection
+        .query_row(
+            "SELECT last_heartbeat_at, last_sync_at, desired_revision_cursor
+             FROM control_sync_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .context("control sync state is missing")?;
+    Ok(SyncStatus {
+        last_heartbeat_at: stored
+            .0
+            .map(timestamp_from_unix)
+            .transpose()
+            .context("stored heartbeat timestamp is invalid")?,
+        last_sync_at: stored
+            .1
+            .map(timestamp_from_unix)
+            .transpose()
+            .context("stored sync timestamp is invalid")?,
+        desired_revision_cursor: stored.2,
+    })
+}
+
+fn timestamp_from_unix(value: i64) -> Result<Timestamp> {
+    Ok(Timestamp::from_datetime(
+        time::OffsetDateTime::from_unix_timestamp(value)?,
+    ))
 }
 
 fn load_registration_status(connection: &Connection) -> Result<Option<(NodeId, Timestamp)>> {
@@ -434,6 +514,41 @@ struct RegistrationRecord {
     credential_key_id: String,
     credential_mode: String,
     credential_expires_at: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyncRegistration {
+    node: NodeId,
+    controller_instance: ControllerInstanceId,
+    key: NodeKeyId,
+}
+
+fn load_sync_registration(connection: &Connection) -> Result<SyncRegistration> {
+    let registration = load_registration(connection)?.context("node host is not enrolled")?;
+    if registration.credential_mode != "signedRequest" {
+        bail!("node host credential mode is not supported for outbound sync");
+    }
+    let credential_expires_at: Timestamp = registration
+        .credential_expires_at
+        .parse()
+        .context("stored credential expiry is invalid")?;
+    if credential_expires_at.as_datetime() <= time::OffsetDateTime::now_utc() {
+        bail!("node host credential has expired");
+    }
+    Ok(SyncRegistration {
+        node: registration
+            .node_id
+            .parse()
+            .context("stored node ID is invalid")?,
+        controller_instance: registration
+            .controller_instance_id
+            .parse()
+            .context("stored controller instance ID is invalid")?,
+        key: registration
+            .credential_key_id
+            .parse()
+            .context("stored credential key ID is invalid")?,
+    })
 }
 
 impl RegistrationRecord {

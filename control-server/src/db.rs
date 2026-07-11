@@ -2,16 +2,20 @@ use crate::config::{validate_network_name, ConfigError};
 use crate::identity::{set_owner_only, ControllerIdentity, IdentityError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use control_protocol::crypto::Ed25519PublicKey;
 use control_protocol::enrollment::{
     enrollment_request_transcript, enrollment_response_transcript, verify_enrollment_proof,
     EnrollmentCryptoError, EnrollmentInvitation,
 };
 use control_protocol::id::{
-    ControllerInstanceId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Timestamp,
+    ControllerInstanceId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision, Timestamp,
 };
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
-    EnrollNodeResponse, NodeAuthenticationMode, NodeCredential, PairingPurpose,
+    EnrollNodeResponse, NodeAuthenticationMode, NodeCredential, NodeHeartbeat, PairingPurpose,
+};
+use control_protocol::request_auth::{
+    verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
 };
 use control_protocol::secret::Secret;
 use control_protocol::validation::ProtocolValidationError;
@@ -29,10 +33,11 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
+const NODE_REQUEST_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 
 const MIGRATION_1_SQL: &str = r"
 CREATE TABLE networks (
@@ -122,6 +127,54 @@ CREATE TABLE audit_events (
 CREATE INDEX audit_events_created_at ON audit_events(created_at);
 ";
 
+const MIGRATION_3_SQL: &str = r"
+ALTER TABLE nodes ADD COLUMN xray_version TEXT;
+ALTER TABLE nodes ADD COLUMN runtime_state TEXT;
+ALTER TABLE nodes ADD COLUMN provider_paused INTEGER NOT NULL DEFAULT 0
+    CHECK(provider_paused IN (0, 1));
+ALTER TABLE nodes ADD COLUMN last_seen_at INTEGER;
+ALTER TABLE nodes ADD COLUMN desired_revision INTEGER CHECK(desired_revision > 0);
+ALTER TABLE nodes ADD COLUMN received_revision INTEGER CHECK(received_revision > 0);
+ALTER TABLE nodes ADD COLUMN validated_revision INTEGER CHECK(validated_revision > 0);
+ALTER TABLE nodes ADD COLUMN applied_revision INTEGER CHECK(applied_revision > 0);
+ALTER TABLE nodes ADD COLUMN telemetry_cursor INTEGER NOT NULL DEFAULT 0
+    CHECK(telemetry_cursor >= 0);
+
+CREATE INDEX nodes_last_seen_at ON nodes(last_seen_at);
+CREATE INDEX nodes_status_last_seen ON nodes(status, last_seen_at);
+
+CREATE TABLE node_request_nonces (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    node_credential_id TEXT NOT NULL,
+    nonce_hash BLOB NOT NULL CHECK(length(nonce_hash) = 32),
+    request_timestamp INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id, node_credential_id, nonce_hash),
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE CASCADE,
+    FOREIGN KEY(network_id, node_credential_id)
+        REFERENCES node_auth_credentials(network_id, node_credential_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX node_request_nonces_expiry ON node_request_nonces(expires_at);
+
+CREATE TABLE node_reported_endpoints (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK(mode IN ('direct', 'relay')),
+    address TEXT NOT NULL CHECK(length(address) BETWEEN 1 AND 253),
+    port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'verified', 'failed', 'withdrawn')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id, mode, address, port),
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -138,6 +191,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "node_enrollment",
         sql: MIGRATION_2_SQL,
+    },
+    Migration {
+        version: 3,
+        name: "node_request_auth_and_heartbeat",
+        sql: MIGRATION_3_SQL,
     },
 ];
 
@@ -167,6 +225,12 @@ pub struct NetworkRecord {
 pub struct NodeEnrollmentResult {
     pub response: EnrollNodeResponse,
     pub created: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedNode {
+    pub node_id: NodeId,
+    pub key_id: NodeKeyId,
 }
 
 impl Database {
@@ -267,10 +331,293 @@ impl Database {
         .map_err(DatabaseError::Worker)?
     }
 
+    /// Verifies a signed node request and atomically reserves its nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when identity, credential lifetime, clock,
+    /// signature, replay policy, or durable nonce storage validation fails.
+    pub async fn authenticate_node_request(
+        &self,
+        headers: NodeRequestAuthHeaders,
+        input: NodeRequestSigningInput,
+    ) -> Result<AuthenticatedNode, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            authenticate_node_request(&mut guard.connection, &headers, &input)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Persists the latest validated heartbeat and replaces its reported endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when the heartbeat is invalid, the node is no
+    /// longer active, or the transactional update cannot be committed.
+    pub async fn record_heartbeat(
+        &self,
+        node_id: NodeId,
+        heartbeat: NodeHeartbeat,
+    ) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            record_heartbeat(&mut guard.connection, node_id, &heartbeat)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
     #[must_use]
     pub fn controller_identity(&self) -> ControllerIdentity {
         self.controller_identity.clone()
     }
+}
+
+fn authenticate_node_request(
+    connection: &mut Connection,
+    headers: &NodeRequestAuthHeaders,
+    input: &NodeRequestSigningInput,
+) -> Result<AuthenticatedNode, DatabaseError> {
+    let now = unix_timestamp()?;
+    let request_timestamp = headers.timestamp().as_datetime().unix_timestamp();
+    if now.abs_diff(request_timestamp) > NODE_REQUEST_CLOCK_SKEW_SECONDS.unsigned_abs() {
+        return Err(DatabaseError::NodeRequestClockSkew);
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "DELETE FROM node_request_nonces WHERE expires_at < ?1",
+        [now],
+    )?;
+    let network = load_network(&transaction)?;
+    let credential = transaction
+        .query_row(
+            "SELECT n.status, c.identity_public_key, c.not_before, c.expires_at, c.revoked_at
+             FROM nodes AS n
+             JOIN node_auth_credentials AS c
+               ON c.network_id = n.network_id AND c.node_id = n.node_id
+             WHERE n.network_id = ?1 AND n.node_id = ?2 AND c.node_credential_id = ?3",
+            params![
+                network.network_id,
+                headers.node_id().to_string(),
+                headers.key_id().to_string(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((node_status, public_key, not_before, expires_at, revoked_at)) = credential else {
+        return Err(DatabaseError::NodeAuthenticationFailed);
+    };
+    if matches!(node_status.as_str(), "disabled" | "revoked") || revoked_at.is_some() {
+        return Err(DatabaseError::NodeRevoked);
+    }
+    if not_before > now || expires_at <= now {
+        return Err(DatabaseError::NodeAuthenticationFailed);
+    }
+
+    let controller_instance_id = network
+        .controller_epoch
+        .parse::<ControllerInstanceId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let public_key = public_key
+        .parse::<Ed25519PublicKey>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    verify_node_request_signature(&public_key, headers, input, controller_instance_id)
+        .map_err(|_| DatabaseError::InvalidNodeRequestSignature)?;
+
+    let expires_at = request_timestamp
+        .checked_add(NODE_REQUEST_CLOCK_SKEW_SECONDS)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let nonce_hash = Sha256::digest(headers.nonce().as_str().as_bytes());
+    let inserted = transaction.execute(
+        "INSERT OR IGNORE INTO node_request_nonces(
+            network_id, node_id, node_credential_id, nonce_hash,
+            request_timestamp, expires_at, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            network.network_id,
+            headers.node_id().to_string(),
+            headers.key_id().to_string(),
+            nonce_hash.as_slice(),
+            request_timestamp,
+            expires_at,
+            now,
+        ],
+    )?;
+    if inserted == 0 {
+        return Err(DatabaseError::NodeRequestNonceReplayed);
+    }
+    transaction.commit()?;
+
+    Ok(AuthenticatedNode {
+        node_id: headers.node_id(),
+        key_id: headers.key_id(),
+    })
+}
+
+fn record_heartbeat(
+    connection: &mut Connection,
+    node_id: NodeId,
+    heartbeat: &NodeHeartbeat,
+) -> Result<(), DatabaseError> {
+    heartbeat.validate()?;
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    validate_reported_progress(&transaction, &network.network_id, node_id, heartbeat)?;
+    let updated = transaction.execute(
+        "UPDATE nodes
+         SET agent_version = ?1, xray_version = ?2, runtime_state = ?3,
+             provider_paused = ?4, last_seen_at = ?5,
+             desired_revision = ?6, received_revision = ?7,
+             validated_revision = ?8, applied_revision = ?9,
+             telemetry_cursor = ?10, updated_at = ?5
+         WHERE network_id = ?11 AND node_id = ?12 AND status IN ('pending', 'active')",
+        params![
+            heartbeat.agent_version,
+            heartbeat.xray_version,
+            enum_wire(&heartbeat.state)?,
+            i64::from(heartbeat.provider_paused),
+            now,
+            heartbeat
+                .revisions
+                .desired_revision
+                .map(control_protocol::id::Revision::get),
+            heartbeat
+                .revisions
+                .received_revision
+                .map(control_protocol::id::Revision::get),
+            heartbeat
+                .revisions
+                .validated_revision
+                .map(control_protocol::id::Revision::get),
+            heartbeat
+                .revisions
+                .applied_revision
+                .map(control_protocol::id::Revision::get),
+            heartbeat.telemetry_cursor.get(),
+            network.network_id,
+            node_id.to_string(),
+        ],
+    )?;
+    if updated != 1 {
+        return Err(DatabaseError::NodeRevoked);
+    }
+
+    transaction.execute(
+        "DELETE FROM node_reported_endpoints WHERE network_id = ?1 AND node_id = ?2",
+        params![network.network_id, node_id.to_string()],
+    )?;
+    for endpoint in &heartbeat.endpoints {
+        transaction.execute(
+            "INSERT INTO node_reported_endpoints(
+                network_id, node_id, mode, address, port, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                network.network_id,
+                node_id.to_string(),
+                enum_wire(&endpoint.mode)?,
+                endpoint.address,
+                i64::from(endpoint.port),
+                enum_wire(&endpoint.status)?,
+                now,
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_reported_progress(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: NodeId,
+    heartbeat: &NodeHeartbeat,
+) -> Result<(), DatabaseError> {
+    let previous: (
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        i64,
+    ) = transaction
+        .query_row(
+            "SELECT status, desired_revision, received_revision, validated_revision,
+                    applied_revision, telemetry_cursor
+             FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+            params![network_id, node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeRevoked)?;
+    if !matches!(previous.0.as_str(), "pending" | "active") {
+        return Err(DatabaseError::NodeRevoked);
+    }
+    for (stored, reported) in [
+        (
+            previous.1,
+            heartbeat.revisions.desired_revision.map(Revision::get),
+        ),
+        (
+            previous.2,
+            heartbeat.revisions.received_revision.map(Revision::get),
+        ),
+        (
+            previous.3,
+            heartbeat.revisions.validated_revision.map(Revision::get),
+        ),
+        (
+            previous.4,
+            heartbeat.revisions.applied_revision.map(Revision::get),
+        ),
+    ] {
+        ensure_monotonic_cursor(stored, reported)?;
+    }
+    if heartbeat.telemetry_cursor.get() < previous.5 {
+        return Err(DatabaseError::NodeProgressRegressed);
+    }
+    Ok(())
+}
+
+fn ensure_monotonic_cursor(
+    previous: Option<i64>,
+    reported: Option<i64>,
+) -> Result<(), DatabaseError> {
+    if matches!((previous, reported), (Some(_), None))
+        || matches!((previous, reported), (Some(previous), Some(reported)) if reported < previous)
+    {
+        return Err(DatabaseError::NodeProgressRegressed);
+    }
+    Ok(())
+}
+
+fn enum_wire<T: serde::Serialize>(value: &T) -> Result<String, DatabaseError> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or(DatabaseError::StoredProtocolValue)
 }
 
 fn prepare_parent(path: &Path) -> Result<(), DatabaseError> {
@@ -1113,6 +1460,18 @@ pub enum DatabaseError {
     InvitationCancelled,
     #[error("the node enrollment proof is invalid")]
     InvalidEnrollmentProof,
+    #[error("node authentication failed")]
+    NodeAuthenticationFailed,
+    #[error("the node or node credential is revoked")]
+    NodeRevoked,
+    #[error("the node request timestamp is outside the accepted clock window")]
+    NodeRequestClockSkew,
+    #[error("the node request nonce was already used")]
+    NodeRequestNonceReplayed,
+    #[error("the node reported progress older than its durable progress")]
+    NodeProgressRegressed,
+    #[error("the node request signature is invalid")]
+    InvalidNodeRequestSignature,
     #[error("the controller identity no longer matches the invitation")]
     ControllerIdentityMismatch,
     #[error("a stored protocol value is invalid")]

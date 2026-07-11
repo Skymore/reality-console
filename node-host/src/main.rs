@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use node_host::{initialize, join, status, HostStatus};
+use node_host::{initialize, join, status, sync_once, HostStatus};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -45,6 +45,12 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Perform one outbound heartbeat and desired-state synchronization cycle.
+    SyncOnce {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -71,6 +77,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Status { data_dir } => status(&data_dir)?,
+        Command::SyncOnce { data_dir } => sync_once(&data_dir).await?,
     };
     print_status(&status);
     Ok(())
@@ -97,4 +104,16 @@ fn print_status(status: &HostStatus) {
         Some(expires_at) => println!("credential_expires_at: {expires_at}"),
         None => println!("credential_expires_at: none"),
     }
+    match status.last_heartbeat_at {
+        Some(timestamp) => println!("last_heartbeat_at: {timestamp}"),
+        None => println!("last_heartbeat_at: none"),
+    }
+    match status.last_sync_at {
+        Some(timestamp) => println!("last_sync_at: {timestamp}"),
+        None => println!("last_sync_at: none"),
+    }
+    println!(
+        "desired_revision_cursor: {}",
+        status.desired_revision_cursor
+    );
 }

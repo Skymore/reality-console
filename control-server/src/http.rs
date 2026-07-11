@@ -1,18 +1,19 @@
 use crate::auth::BootstrapTokenVerifier;
-use crate::db::{Database, DatabaseError, NetworkRecord, SCHEMA_VERSION};
+use crate::db::{AuthenticatedNode, Database, DatabaseError, NetworkRecord, SCHEMA_VERSION};
 use crate::error::{ApiError, REQUEST_ID_HEADER};
 use crate::protocol::RequestId;
 use axum::body::Body;
-use axum::extract::{Extension, Request, State};
-use axum::http::{header, HeaderValue};
+use axum::extract::{Extension, Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
-    EnrollNodeResponse,
+    EnrollNodeResponse, NodeHeartbeat,
 };
+use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
 use http_body_util::BodyExt as _;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -54,16 +55,126 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/admin/network", get(get_network))
         .route("/v1/admin/node-invitations", post(create_node_invitation))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+    let authenticated_node_routes = Router::new()
+        .route("/v1/nodes/{node_id}/heartbeat", post(node_heartbeat))
+        .route("/v1/nodes/{node_id}/desired", get(fetch_desired_state))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_node,
+        ));
 
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/nodes/enroll", post(enroll_node))
+        .merge(authenticated_node_routes)
         .merge(admin_routes)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, enforce_limits))
         .layer(middleware::from_fn(request_context))
+}
+
+#[derive(Clone)]
+struct SignedBody(Vec<u8>);
+
+async fn authenticate_node(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request_id(&request);
+    let Ok(headers) = node_auth_headers(request.headers()) else {
+        return ApiError::authentication_failed(request_id).into_response();
+    };
+    let method = request.method().as_str().to_owned();
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
+    let (mut parts, body) = request.into_parts();
+    let body = match read_bounded_body(body, request_id).await {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    let Ok(input) = NodeRequestSigningInput::from_body(&method, &path_and_query, &body) else {
+        return ApiError::authentication_failed(request_id).into_response();
+    };
+    let authenticated = match state
+        .database
+        .authenticate_node_request(headers, input)
+        .await
+    {
+        Ok(authenticated) => authenticated,
+        Err(error) => return database_api_error(error, request_id).into_response(),
+    };
+
+    parts.extensions.insert(authenticated);
+    parts.extensions.insert(SignedBody(body));
+    next.run(Request::from_parts(parts, Body::empty())).await
+}
+
+fn node_auth_headers(headers: &HeaderMap) -> Result<NodeRequestAuthHeaders, ()> {
+    let node_id = single_header(headers, "x-node-id")?;
+    let key_id = single_header(headers, "x-node-key-id")?;
+    let timestamp = single_header(headers, "x-node-timestamp")?;
+    let nonce = single_header(headers, "x-node-nonce")?;
+    let signature = single_header(headers, "x-node-signature")?;
+    NodeRequestAuthHeaders::parse(node_id, key_id, timestamp, nonce, signature).map_err(|_| ())
+}
+
+fn single_header<'a>(headers: &'a HeaderMap, name: &'static str) -> Result<&'a str, ()> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next().ok_or(())?;
+    if values.next().is_some() {
+        return Err(());
+    }
+    value.to_str().map_err(|_| ())
+}
+
+async fn node_heartbeat(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(authenticated): Extension<AuthenticatedNode>,
+    Extension(body): Extension<SignedBody>,
+) -> Result<StatusCode, ApiError> {
+    if path_node_id != authenticated.node_id.to_string() {
+        return Err(ApiError::authentication_failed(request_id));
+    }
+    let heartbeat: NodeHeartbeat =
+        serde_json::from_slice(&body.0).map_err(|_| ApiError::validation_failed(request_id))?;
+    heartbeat
+        .validate()
+        .map_err(|_| ApiError::validation_failed(request_id))?;
+    state
+        .database
+        .record_heartbeat(authenticated.node_id, heartbeat)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn fetch_desired_state(
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(authenticated): Extension<AuthenticatedNode>,
+    uri: Uri,
+) -> Result<StatusCode, ApiError> {
+    if path_node_id != authenticated.node_id.to_string() {
+        return Err(ApiError::authentication_failed(request_id));
+    }
+    parse_after_revision(uri.query()).ok_or_else(|| ApiError::validation_failed(request_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn parse_after_revision(query: Option<&str>) -> Option<i64> {
+    let value = query?.strip_prefix("afterRevision=")?;
+    if value.is_empty() || value.contains('&') {
+        return None;
+    }
+    let revision = value.parse::<i64>().ok()?;
+    (revision >= 0 && revision.to_string() == value).then_some(revision)
 }
 
 async fn create_node_invitation(
@@ -107,7 +218,11 @@ async fn parse_bounded_json<T>(request: Request, request_id: RequestId) -> Resul
 where
     T: DeserializeOwned,
 {
-    let mut body = request.into_body();
+    let bytes = read_bounded_body(request.into_body(), request_id).await?;
+    serde_json::from_slice(&bytes).map_err(|_| ApiError::validation_failed(request_id))
+}
+
+async fn read_bounded_body(mut body: Body, request_id: RequestId) -> Result<Vec<u8>, ApiError> {
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| ApiError::validation_failed(request_id))?;
@@ -122,7 +237,7 @@ where
             bytes.extend_from_slice(&data);
         }
     }
-    serde_json::from_slice(&bytes).map_err(|_| ApiError::validation_failed(request_id))
+    Ok(bytes)
 }
 
 fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
@@ -132,7 +247,14 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::InvitationExpired => ApiError::invitation_expired(request_id),
         DatabaseError::InvitationConsumed => ApiError::invitation_consumed(request_id),
         DatabaseError::InvitationCancelled => ApiError::invitation_cancelled(request_id),
-        DatabaseError::InvalidEnrollmentProof => ApiError::signature_invalid(request_id),
+        DatabaseError::InvalidEnrollmentProof | DatabaseError::InvalidNodeRequestSignature => {
+            ApiError::signature_invalid(request_id)
+        }
+        DatabaseError::NodeAuthenticationFailed => ApiError::authentication_failed(request_id),
+        DatabaseError::NodeRevoked => ApiError::node_revoked(request_id),
+        DatabaseError::NodeRequestClockSkew => ApiError::clock_skew(request_id),
+        DatabaseError::NodeRequestNonceReplayed => ApiError::nonce_replayed(request_id),
+        DatabaseError::NodeProgressRegressed => ApiError::state_stale(request_id),
         other => {
             tracing::error!(request_id = %request_id, error = %other, "database request failed");
             ApiError::internal(request_id)

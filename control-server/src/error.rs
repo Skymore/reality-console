@@ -118,7 +118,51 @@ impl ApiError {
         Self::new(
             StatusCode::UNAUTHORIZED,
             ErrorCode::SignatureInvalid,
-            "The enrollment proof is invalid.",
+            "The request signature or proof is invalid.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn node_revoked(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::NodeRevoked,
+            "The node or node credential is revoked.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn nonce_replayed(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::NonceReplayed,
+            "The request nonce was already used.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn clock_skew(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::ClockSkew,
+            "The request timestamp is outside the accepted clock window.",
+            request_id,
+            true,
+        )
+    }
+
+    #[must_use]
+    pub fn state_stale(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::StateStale,
+            "The node reported progress older than its durable state.",
             request_id,
             false,
         )
