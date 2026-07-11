@@ -1,6 +1,7 @@
 //! Persistent local foundation for the Reality Console node host.
 
 mod enrollment;
+mod service;
 mod sync;
 
 use anyhow::{bail, Context, Result};
@@ -129,6 +130,7 @@ const MIGRATION_4: &str = "
 ";
 
 pub use enrollment::join;
+pub use service::{run, run_until, SyncLoopOptions};
 pub use sync::sync_once;
 
 /// Safe enrollment state rendered by the CLI.

@@ -24,8 +24,9 @@ persisting its registration. Authenticated heartbeat and empty desired-state pol
 implemented. Node Host can also verify, durably retain, and acknowledge signed desired-state
 envelopes without applying them to Xray yet. Control Service exposes redacted node summaries plus
 explicit approve, disable, and revoke operations; enrollment and heartbeat never activate a node
-implicitly. Automatic polling, validated Xray activation, account synchronization, and relay
-fallback remain under active implementation.
+implicitly. Node Host also has a resilient outbound sync loop with jitter, bounded retry backoff,
+and graceful process shutdown. Native service installers, validated Xray activation, account
+synchronization, and relay fallback remain under active implementation.
 
 ## Authoritative Documentation
 
@@ -77,6 +78,9 @@ node-host join \
   --display-name "Friend Mac" \
   --accept-host-owner \
   --accept-exit-ip
+
+# Development foreground service; the installer will register this automatically.
+node-host run --data-dir ./node-state
 ```
 
 The future desktop wrapper will pass the same invitation in memory from a QR code or deep link, so

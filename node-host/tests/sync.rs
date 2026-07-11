@@ -21,12 +21,13 @@ use control_protocol::request_auth::{
 };
 use control_protocol::secret::Secret;
 use ed25519_dalek::{Signer as _, SigningKey};
-use node_host::{initialize, status, sync_once, EnrollmentState};
+use node_host::{initialize, run_until, status, sync_once, EnrollmentState, SyncLoopOptions};
 use rusqlite::{params, Connection};
 use serde_json::json;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 use time::{Duration, OffsetDateTime};
 
 const SECRET_RESPONSE_TEXT: &str = "controller-private-debug-secret";
@@ -601,6 +602,32 @@ async fn failed_result_report_is_retried_before_the_next_heartbeat() {
         )
         .unwrap();
     assert!(reported_at.is_some());
+}
+
+#[tokio::test]
+async fn service_loop_repeats_sync_and_releases_the_data_lock_on_shutdown() {
+    let controller = MockController::start(ResponseMode::NoDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    install_registration(&data_dir, &controller.origin);
+
+    run_until(
+        &data_dir,
+        SyncLoopOptions {
+            success_interval: StdDuration::from_millis(10),
+            initial_backoff: StdDuration::from_millis(5),
+            max_backoff: StdDuration::from_millis(20),
+        },
+        async {
+            tokio::time::sleep(StdDuration::from_millis(100)).await;
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(controller.captured().len() >= 4);
+    status(&data_dir).expect("shutdown must release the exclusive data-directory lock");
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

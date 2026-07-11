@@ -214,19 +214,25 @@ nonce for every request. A `200` response is accepted only after closed-schema i
 monotonicity, and pinned controller-signature verification. The immutable envelope and its digests
 are committed before a signed `received` result is sent; an interrupted result remains queued and
 is retried before the next heartbeat. This stage does not yet render, validate, or activate Xray.
-A later service loop will run the same operation with jitter and backoff after signed desired-state
-apply is complete.
+
+The current headless `run` command already wraps that cycle in a resilient foreground service. It
+synchronizes immediately, uses a 30-second success interval with bounded jitter, retries failures
+with exponential backoff capped at five minutes, and exits cleanly on Ctrl-C or `SIGTERM`. Timing
+bounds are configurable for service integration. It does not create a macOS power assertion or
+prevent lock/sleep; sleeping pauses networking and the next wake resumes convergence. Native
+`launchd` and `systemd` installation remains a packaging step rather than protocol behavior.
 
 ## 7. Outbound-Only Control Sync
 
 ### 7.1 Transport
 
-The agent maintains one outbound WebSocket over HTTPS where possible. If WebSocket upgrade fails,
-it uses bounded HTTPS long polling. No behavior depends on unsolicited controller-to-node traffic.
+The current agent uses bounded outbound HTTPS polling. A later transport optimization may maintain
+an outbound WebSocket and fall back to the same polling contract. No behavior depends on
+unsolicited controller-to-node traffic.
 
 - Heartbeat interval: 30 seconds while connected, with server-provided jitter.
-- Reconnect: exponential backoff from 1 second to 5 minutes, full jitter, reset after 10 stable
-  minutes.
+- Reconnect: exponential backoff from 5 seconds to 5 minutes, bounded jitter, reset after one
+  successful cycle.
 - Every request carries `node_id`, node session ID, monotonically increasing request sequence,
   agent capabilities, current state summary, and an idempotency key.
 - Every response is signed, bounded in size, has an expiry, and is tied to the requesting node and

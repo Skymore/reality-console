@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use node_host::{initialize, join, status, sync_once, HostStatus};
+use node_host::{initialize, join, run, status, sync_once, HostStatus, SyncLoopOptions};
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(name = "node-host", about = "Reality Console node host")]
@@ -51,6 +52,21 @@ enum Command {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Run resilient outbound synchronization until the process is stopped.
+    Run {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Base interval after successful synchronization.
+        #[arg(long, default_value_t = 30)]
+        sync_interval_seconds: u64,
+        /// First retry delay after a failed synchronization.
+        #[arg(long, default_value_t = 5)]
+        initial_backoff_seconds: u64,
+        /// Maximum retry delay after consecutive failures.
+        #[arg(long, default_value_t = 300)]
+        max_backoff_seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -78,9 +94,37 @@ async fn main() -> Result<()> {
         }
         Command::Status { data_dir } => status(&data_dir)?,
         Command::SyncOnce { data_dir } => sync_once(&data_dir).await?,
+        Command::Run {
+            data_dir,
+            sync_interval_seconds,
+            initial_backoff_seconds,
+            max_backoff_seconds,
+        } => {
+            init_logging();
+            run(
+                &data_dir,
+                SyncLoopOptions {
+                    success_interval: Duration::from_secs(sync_interval_seconds),
+                    initial_backoff: Duration::from_secs(initial_backoff_seconds),
+                    max_backoff: Duration::from_secs(max_backoff_seconds),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
     };
     print_status(&status);
     Ok(())
+}
+
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("node_host=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_target(false)
+        .try_init();
 }
 
 fn print_status(status: &HostStatus) {

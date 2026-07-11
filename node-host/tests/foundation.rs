@@ -83,7 +83,8 @@ fn cli_exposes_single_cycle_sync_command() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("sync-once"));
+        .stdout(predicate::str::contains("sync-once"))
+        .stdout(predicate::str::contains("run"));
 }
 
 #[test]
