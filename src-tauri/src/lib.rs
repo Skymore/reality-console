@@ -1,17 +1,17 @@
 mod db;
 
-use std::env;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use db::Db;
-use dirs;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,6 +95,13 @@ struct TrafficResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrafficRefreshResponse {
+    traffic: TrafficResponse,
+    quotas: Vec<db::UserQuota>,
+}
+
 #[derive(Default)]
 struct ConfigInspection {
     listen_port: Option<u16>,
@@ -120,8 +127,26 @@ struct LoadedConfig {
     link_context: RealityLinkContext,
 }
 
+static PUBLIC_IPV4_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
+static PUBLIC_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+const PUBLIC_IPV4_TTL: Duration = Duration::from_secs(5 * 60);
+
+async fn run_blocking<T, F>(task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| format!("Background task failed: {error}"))?
+}
+
 #[tauri::command]
-fn get_xray_snapshot() -> XraySnapshot {
+async fn get_xray_snapshot() -> Result<XraySnapshot, String> {
+    run_blocking(|| Ok(get_xray_snapshot_sync())).await
+}
+
+fn get_xray_snapshot_sync() -> XraySnapshot {
     let mut notes = Vec::new();
 
     let xray_binary = resolve_command_path("xray");
@@ -138,12 +163,7 @@ fn get_xray_snapshot() -> XraySnapshot {
         None
     };
 
-    let (running, pid) = brew_service_status("xray")
-        .or_else(|| pgrep_status("xray"))
-        .unwrap_or_else(|| {
-            notes.push("Could not determine process state from brew services or pgrep.".to_string());
-            (false, None)
-        });
+    let (running, pid) = pgrep_status("xray").unwrap_or((false, None));
 
     let config_path = detect_config_path();
     let public_ipv4: Option<String> = resolve_public_ipv4().or_else(|| {
@@ -192,7 +212,11 @@ fn get_xray_snapshot() -> XraySnapshot {
 }
 
 #[tauri::command]
-fn get_vless_users() -> Result<UserListResponse, String> {
+async fn get_vless_users() -> Result<UserListResponse, String> {
+    run_blocking(get_vless_users_sync).await
+}
+
+fn get_vless_users_sync() -> Result<UserListResponse, String> {
     let loaded = load_config_with_ip(resolve_public_ipv4())?;
 
     Ok(UserListResponse {
@@ -203,7 +227,11 @@ fn get_vless_users() -> Result<UserListResponse, String> {
 }
 
 #[tauri::command]
-fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, String> {
+async fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, String> {
+    run_blocking(move || create_vless_user_sync(input)).await
+}
+
+fn create_vless_user_sync(input: CreateUserInput) -> Result<UserMutationResult, String> {
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
     let timestamp = unix_timestamp();
@@ -216,8 +244,7 @@ fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, Strin
         "email": label
     });
 
-    clients_mut(&mut loaded.root)?
-        .push(client);
+    clients_mut(&mut loaded.root)?.push(client);
 
     loaded.metadata.version = 1;
     loaded.metadata.users.insert(
@@ -238,14 +265,24 @@ fn create_vless_user(input: CreateUserInput) -> Result<UserMutationResult, Strin
 }
 
 #[tauri::command]
-fn update_user_label(user_id: String, new_label: String) -> Result<UserMutationResult, String> {
+async fn update_user_label(
+    user_id: String,
+    new_label: String,
+) -> Result<UserMutationResult, String> {
+    run_blocking(move || update_user_label_sync(user_id, new_label)).await
+}
+
+fn update_user_label_sync(
+    user_id: String,
+    new_label: String,
+) -> Result<UserMutationResult, String> {
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
     let clients = clients_mut(&mut loaded.root)?;
 
-    let found = clients.iter_mut().find(|client| {
-        client.get("id").and_then(Value::as_str) == Some(user_id.as_str())
-    });
+    let found = clients
+        .iter_mut()
+        .find(|client| client.get("id").and_then(Value::as_str) == Some(user_id.as_str()));
 
     match found {
         Some(client) => {
@@ -264,21 +301,29 @@ fn update_user_label(user_id: String, new_label: String) -> Result<UserMutationR
 }
 
 #[tauri::command]
-fn update_user_note(user_id: String, new_note: String) -> Result<UserMutationResult, String> {
+async fn update_user_note(user_id: String, new_note: String) -> Result<UserMutationResult, String> {
+    run_blocking(move || update_user_note_sync(user_id, new_note)).await
+}
+
+fn update_user_note_sync(user_id: String, new_note: String) -> Result<UserMutationResult, String> {
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
 
     // Verify user exists in config
-    let exists = clients(&loaded.root)?.iter().any(|c| {
-        c.get("id").and_then(Value::as_str) == Some(user_id.as_str())
-    });
+    let exists = clients(&loaded.root)?
+        .iter()
+        .any(|c| c.get("id").and_then(Value::as_str) == Some(user_id.as_str()));
     if !exists {
         return Err("User was not found in the current config.".to_string());
     }
 
     let trimmed = new_note.trim();
     let entry = loaded.metadata.users.entry(user_id).or_default();
-    entry.note = if trimmed.is_empty() { None } else { Some(trimmed.to_string()) };
+    entry.note = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
 
     write_metadata(&loaded.metadata_path, &loaded.metadata)?;
 
@@ -297,14 +342,23 @@ struct ConfigUpdate {
 }
 
 #[tauri::command]
-fn update_config(input: ConfigUpdate) -> Result<String, String> {
+async fn update_config(input: ConfigUpdate) -> Result<String, String> {
+    run_blocking(move || update_config_sync(input)).await
+}
+
+fn update_config_sync(input: ConfigUpdate) -> Result<String, String> {
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip)?;
 
-    let inbound = loaded.root
+    let inbound = loaded
+        .root
         .get_mut("inbounds")
         .and_then(Value::as_array_mut)
-        .and_then(|inbounds| inbounds.iter_mut().find(|e| e.get("protocol").and_then(Value::as_str) == Some("vless")))
+        .and_then(|inbounds| {
+            inbounds
+                .iter_mut()
+                .find(|e| e.get("protocol").and_then(Value::as_str) == Some("vless"))
+        })
         .ok_or_else(|| "Could not find VLESS inbound in config.".to_string())?;
 
     if let Some(port) = input.listen_port {
@@ -312,13 +366,19 @@ fn update_config(input: ConfigUpdate) -> Result<String, String> {
     }
 
     if let Some(ref target) = input.reality_target {
-        if let Some(reality) = inbound.get_mut("streamSettings").and_then(|s| s.get_mut("realitySettings")) {
+        if let Some(reality) = inbound
+            .get_mut("streamSettings")
+            .and_then(|s| s.get_mut("realitySettings"))
+        {
             reality["target"] = json!(target);
         }
     }
 
     if let Some(ref sni) = input.server_name {
-        if let Some(reality) = inbound.get_mut("streamSettings").and_then(|s| s.get_mut("realitySettings")) {
+        if let Some(reality) = inbound
+            .get_mut("streamSettings")
+            .and_then(|s| s.get_mut("realitySettings"))
+        {
             reality["serverNames"] = json!([sni]);
         }
     }
@@ -328,7 +388,11 @@ fn update_config(input: ConfigUpdate) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn service_action(action: String) -> Result<String, String> {
+async fn service_action(action: String) -> Result<String, String> {
+    run_blocking(move || service_action_sync(action)).await
+}
+
+fn service_action_sync(action: String) -> Result<String, String> {
     let valid = ["start", "stop", "restart"];
     if !valid.contains(&action.as_str()) {
         return Err(format!("Invalid action: {action}"));
@@ -349,7 +413,11 @@ fn service_action(action: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn get_user_traffic() -> TrafficResponse {
+async fn get_user_traffic() -> Result<TrafficResponse, String> {
+    run_blocking(|| Ok(get_user_traffic_sync())).await
+}
+
+fn get_user_traffic_sync() -> TrafficResponse {
     let config_path = match detect_config_path() {
         Some(path) => path,
         None => {
@@ -414,7 +482,14 @@ fn get_user_traffic() -> TrafficResponse {
     };
 
     match Command::new(&xray_binary)
-        .args(["api", "statsquery", "--server", &server, "-pattern", "user>>>"])
+        .args([
+            "api",
+            "statsquery",
+            "--server",
+            &server,
+            "-pattern",
+            "user>>>",
+        ])
         .output()
     {
         Ok(output) if output.status.success() => {
@@ -446,51 +521,48 @@ fn get_user_traffic() -> TrafficResponse {
 }
 
 #[tauri::command]
-fn sync_traffic(db: tauri::State<'_, Db>) -> Result<Vec<db::UserQuota>, String> {
-    // Get live stats from xray
-    let config_path = detect_config_path().ok_or("No Xray config found.")?;
-    let contents = fs::read_to_string(&config_path).map_err(|e| format!("Cannot read config: {e}"))?;
-    let root: Value = serde_json::from_str(&contents).map_err(|e| format!("Cannot parse config: {e}"))?;
+async fn refresh_traffic(db: tauri::State<'_, Db>) -> Result<TrafficRefreshResponse, String> {
+    let db = db.inner().clone();
+    run_blocking(move || refresh_traffic_sync(&db)).await
+}
 
-    let has_stats = root.get("stats").is_some();
-    let api_port = find_api_port(&root);
-
-    if !has_stats || api_port.is_none() {
-        return db.get_quotas();
-    }
-
-    let port = api_port.unwrap();
-    let server = format!("127.0.0.1:{port}");
-    let xray_binary = resolve_required_command_path("xray")?;
-
-    let live_stats = match Command::new(&xray_binary)
-        .args(["api", "statsquery", "--server", &server, "-pattern", "user>>>"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            parse_traffic_stats(&stdout)
-        }
-        _ => vec![],
+fn refresh_traffic_sync(db: &Db) -> Result<TrafficRefreshResponse, String> {
+    let traffic = get_user_traffic_sync();
+    let quotas = if traffic.available && traffic.error.is_none() {
+        let stats: Vec<(String, u64, u64)> = traffic
+            .users
+            .iter()
+            .map(|entry| (entry.email.clone(), entry.uplink, entry.downlink))
+            .collect();
+        let now = time_now();
+        let current_month = format!("{}-{:02}", now.0, now.1);
+        db.sync_traffic(&stats, &current_month)?
+    } else {
+        db.get_quotas()?
     };
 
-    let stats_tuples: Vec<(String, u64, u64)> = live_stats
-        .into_iter()
-        .map(|t| (t.email, t.uplink, t.downlink))
-        .collect();
-
-    let now = time_now();
-    let current_month = format!("{}-{:02}", now.0, now.1);
-
-    db.sync_traffic(&stats_tuples, &current_month)
+    Ok(TrafficRefreshResponse { traffic, quotas })
 }
 
 #[tauri::command]
-fn pull_access_logs(db: tauri::State<'_, Db>) -> Result<usize, String> {
+async fn sync_traffic(db: tauri::State<'_, Db>) -> Result<Vec<db::UserQuota>, String> {
+    let db = db.inner().clone();
+    run_blocking(move || refresh_traffic_sync(&db).map(|response| response.quotas)).await
+}
+
+#[tauri::command]
+async fn pull_access_logs(db: tauri::State<'_, Db>) -> Result<usize, String> {
+    let db = db.inner().clone();
+    run_blocking(move || pull_access_logs_sync(&db)).await
+}
+
+fn pull_access_logs_sync(db: &Db) -> Result<usize, String> {
     // Find access log path from xray config
     let config_path = detect_config_path().ok_or("No Xray config found.")?;
-    let contents = fs::read_to_string(&config_path).map_err(|e| format!("Cannot read config: {e}"))?;
-    let root: Value = serde_json::from_str(&contents).map_err(|e| format!("Cannot parse config: {e}"))?;
+    let contents =
+        fs::read_to_string(&config_path).map_err(|e| format!("Cannot read config: {e}"))?;
+    let root: Value =
+        serde_json::from_str(&contents).map_err(|e| format!("Cannot parse config: {e}"))?;
 
     let log_path = root
         .get("log")
@@ -502,14 +574,27 @@ fn pull_access_logs(db: tauri::State<'_, Db>) -> Result<usize, String> {
 }
 
 #[tauri::command]
-fn get_connection_logs(db: tauri::State<'_, Db>, user_email: Option<String>, limit: Option<i64>) -> Result<Vec<db::ConnectionLog>, String> {
-    db.get_connections(user_email.as_deref(), limit.unwrap_or(50))
+async fn get_connection_logs(
+    db: tauri::State<'_, Db>,
+    user_email: Option<String>,
+    limit: Option<i64>,
+) -> Result<Vec<db::ConnectionLog>, String> {
+    let db = db.inner().clone();
+    run_blocking(move || db.get_connections(user_email.as_deref(), limit.unwrap_or(50))).await
 }
 
 #[tauri::command]
-fn set_user_quota(db: tauri::State<'_, Db>, user_id: String, quota_gb: f64) -> Result<(), String> {
-    let quota_bytes = (quota_gb * 1_073_741_824.0) as i64;
-    db.set_quota(&user_id, quota_bytes)
+async fn set_user_quota(
+    db: tauri::State<'_, Db>,
+    user_id: String,
+    quota_gb: f64,
+) -> Result<(), String> {
+    let db = db.inner().clone();
+    run_blocking(move || {
+        let quota_bytes = (quota_gb * 1_073_741_824.0) as i64;
+        db.set_quota(&user_id, quota_bytes)
+    })
+    .await
 }
 
 fn time_now() -> (i32, u32) {
@@ -531,7 +616,11 @@ fn time_now() -> (i32, u32) {
 }
 
 #[tauri::command]
-fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String> {
+async fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String> {
+    run_blocking(move || delete_vless_user_sync(user_id)).await
+}
+
+fn delete_vless_user_sync(user_id: String) -> Result<UserMutationResult, String> {
     let ip = resolve_public_ipv4();
     let mut loaded = load_config_with_ip(ip.clone())?;
     let clients = clients_mut(&mut loaded.root)?;
@@ -561,7 +650,32 @@ fn delete_vless_user(user_id: String) -> Result<UserMutationResult, String> {
 }
 
 fn resolve_public_ipv4() -> Option<String> {
-    command_output("curl", &["-4", "-fsS", "--connect-timeout", "3", "https://api.ipify.org"])
+    let cache = PUBLIC_IPV4_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().ok()?;
+
+    if let Some((fetched_at, value)) = cached.as_ref() {
+        if fetched_at.elapsed() < PUBLIC_IPV4_TTL {
+            return Some(value.clone());
+        }
+    }
+
+    let stale = cached.as_ref().map(|(_, value)| value.clone());
+    let fetched = command_output(
+        "curl",
+        &[
+            "-4",
+            "-fsS",
+            "--connect-timeout",
+            "3",
+            "https://api.ipify.org",
+        ],
+    );
+
+    if let Some(value) = fetched.as_ref() {
+        *cached = Some((Instant::now(), value.clone()));
+    }
+
+    fetched.or(stale)
 }
 
 fn load_config_with_ip(public_ipv4: Option<String>) -> Result<LoadedConfig, String> {
@@ -571,8 +685,8 @@ fn load_config_with_ip(public_ipv4: Option<String>) -> Result<LoadedConfig, Stri
 
     let contents = fs::read_to_string(&path)
         .map_err(|error| format!("Failed to read config file: {error}"))?;
-    let root: Value =
-        serde_json::from_str(&contents).map_err(|error| format!("Failed to parse config JSON: {error}"))?;
+    let root: Value = serde_json::from_str(&contents)
+        .map_err(|error| format!("Failed to parse config JSON: {error}"))?;
 
     let metadata_path = metadata_path_for(&path)?;
     let metadata = read_metadata(&metadata_path)?;
@@ -592,7 +706,8 @@ fn persist_config_and_metadata(loaded: &LoadedConfig) -> Result<String, String> 
         .map_err(|error| format!("Failed to serialize updated config: {error}"))?;
 
     let temp_path = temporary_path_for(&loaded.path);
-    fs::write(&temp_path, candidate).map_err(|error| format!("Failed to write temp config: {error}"))?;
+    fs::write(&temp_path, candidate)
+        .map_err(|error| format!("Failed to write temp config: {error}"))?;
 
     if let Err(error) = validate_xray_config(&temp_path) {
         let _ = fs::remove_file(&temp_path);
@@ -659,9 +774,7 @@ fn build_link_context(root: &Value, public_ipv4: Option<String>) -> RealityLinkC
         .and_then(Value::as_str)
         .map(ToString::to_string);
 
-    let public_key = private_key
-        .as_deref()
-        .and_then(derive_public_key);
+    let public_key = private_key.as_deref().and_then(derive_public_key);
 
     let short_id = inbound
         .and_then(|entry| entry.get("streamSettings"))
@@ -769,11 +882,17 @@ fn clients(root: &Value) -> Result<&Vec<Value>, String> {
 fn clients_mut(root: &mut Value) -> Result<&mut Vec<Value>, String> {
     root.get_mut("inbounds")
         .and_then(Value::as_array_mut)
-        .and_then(|inbounds| inbounds.iter_mut().find(|entry| entry.get("protocol").and_then(Value::as_str) == Some("vless")))
+        .and_then(|inbounds| {
+            inbounds
+                .iter_mut()
+                .find(|entry| entry.get("protocol").and_then(Value::as_str) == Some("vless"))
+        })
         .and_then(|entry| entry.get_mut("settings"))
         .and_then(|settings| settings.get_mut("clients"))
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| "Could not find mutable `inbounds[0].settings.clients` in config.".to_string())
+        .ok_or_else(|| {
+            "Could not find mutable `inbounds[0].settings.clients` in config.".to_string()
+        })
 }
 
 fn metadata_path_for(config_path: &Path) -> Result<PathBuf, String> {
@@ -791,8 +910,8 @@ fn read_metadata(path: &Path) -> Result<UserMetadataStore, String> {
         });
     }
 
-    let contents =
-        fs::read_to_string(path).map_err(|error| format!("Failed to read metadata file: {error}"))?;
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read metadata file: {error}"))?;
     let metadata: UserMetadataStore = serde_json::from_str(&contents)
         .map_err(|error| format!("Failed to parse metadata JSON: {error}"))?;
 
@@ -811,7 +930,10 @@ fn create_backup(path: &Path) -> Result<String, String> {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("config");
-    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("json");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("json");
     let backup_name = format!("{file_stem}.backup-{timestamp}.{extension}");
     let backup_path = path
         .parent()
@@ -825,7 +947,10 @@ fn create_backup(path: &Path) -> Result<String, String> {
 
 fn temporary_path_for(path: &Path) -> PathBuf {
     let timestamp = unix_timestamp();
-    let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("config");
+    let stem = path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("config");
     let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("json");
     path.with_file_name(format!("{stem}.tmp-{timestamp}.{ext}"))
 }
@@ -852,17 +977,30 @@ fn validate_xray_config(path: &Path) -> Result<(), String> {
         "Unknown xray validation failure.".to_string()
     };
 
-    Err(format!("Updated config did not pass `xray -test`: {detail}"))
+    Err(format!(
+        "Updated config did not pass `xray -test`: {detail}"
+    ))
 }
 
 fn derive_public_key(private_key: &str) -> Option<String> {
+    let cache = PUBLIC_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(value) = cache.lock().ok()?.get(private_key).cloned() {
+        return Some(value);
+    }
+
     let xray_binary = resolve_command_path("xray")?;
     let output = command_output_at(&xray_binary, &["x25519", "-i", private_key])?;
-    output.lines().find_map(|line| {
+    let public_key = output.lines().find_map(|line| {
         line.trim()
             .strip_prefix("Password (PublicKey): ")
             .map(ToString::to_string)
-    })
+    })?;
+
+    cache
+        .lock()
+        .ok()?
+        .insert(private_key.to_string(), public_key.clone());
+    Some(public_key)
 }
 
 fn next_user_label(root: &Value, preferred: Option<&str>) -> String {
@@ -941,22 +1079,6 @@ fn detect_lan_ip() -> Option<String> {
     command_output("ipconfig", &["getifaddr", interface.as_str()])
 }
 
-fn brew_service_status(service: &str) -> Option<(bool, Option<u32>)> {
-    let output = command_output("brew", &["services", "info", service])?;
-    let running = output
-        .lines()
-        .find(|line| line.trim_start().starts_with("Running:"))
-        .map(|line| line.contains("true"))?;
-
-    let pid = output
-        .lines()
-        .find(|line| line.trim_start().starts_with("PID:"))
-        .and_then(|line| line.split(':').nth(1))
-        .and_then(|value| value.trim().parse::<u32>().ok());
-
-    Some((running, pid))
-}
-
 fn pgrep_status(process: &str) -> Option<(bool, Option<u32>)> {
     let output = command_output("pgrep", &["-x", process])?;
     let pid = output.lines().next()?.trim().parse::<u32>().ok()?;
@@ -964,9 +1086,8 @@ fn pgrep_status(process: &str) -> Option<(bool, Option<u32>)> {
 }
 
 fn resolve_required_command_path(program: &str) -> Result<PathBuf, String> {
-    resolve_command_path(program).ok_or_else(|| {
-        format!("`{program}` was not found in PATH or known install locations.")
-    })
+    resolve_command_path(program)
+        .ok_or_else(|| format!("`{program}` was not found in PATH or known install locations."))
 }
 
 fn resolve_command_path(program: &str) -> Option<PathBuf> {
@@ -1107,6 +1228,7 @@ pub fn run() {
             update_user_note,
             update_config,
             get_user_traffic,
+            refresh_traffic,
             sync_traffic,
             set_user_quota,
             pull_access_logs,

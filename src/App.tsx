@@ -28,7 +28,15 @@ import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
-import type { ConnectionLog, CreateUserInput, TrafficResponse, UserListResponse, UserMutationResult, UserQuota } from "@/lib/users"
+import type {
+  ConnectionLog,
+  CreateUserInput,
+  TrafficRefreshResponse,
+  TrafficResponse,
+  UserListResponse,
+  UserMutationResult,
+  UserQuota,
+} from "@/lib/users"
 import type { XraySnapshot } from "@/lib/xray"
 import { cn } from "@/lib/utils"
 
@@ -88,6 +96,7 @@ function App() {
   const [toast, setToast] = useState<string | null>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout>>(null)
   const titleBarDoubleClickOrigin = useRef<{ x: number; y: number } | null>(null)
+  const refreshPromise = useRef<Promise<void> | null>(null)
 
   const currentSnapshot = snapshot ?? fallbackSnapshot
   const currentNav = navItems.find((item) => item.id === activePage) ?? navItems[0]
@@ -183,7 +192,7 @@ function App() {
       if (action === "restart") setNeedsRestart(false)
       const msgKey = action === "restart" ? "action.restarted" : action === "start" ? "action.started" : "action.stopped"
       showToast(t(msgKey))
-      await refreshAll()
+      await refreshAll(false)
     } catch (error) {
       showToast(toErrorMessage(error, t("action.serviceFailed")))
     } finally {
@@ -200,16 +209,26 @@ function App() {
   }
 
   async function loadTraffic() {
-    return invoke<TrafficResponse>("get_user_traffic")
+    return invoke<TrafficRefreshResponse>("refresh_traffic")
   }
 
-  async function refreshAll() {
-    try {
+  async function loadConnectionLogs() {
+    await invoke<number>("pull_access_logs")
+    return invoke<ConnectionLog[]>("get_connection_logs", { limit: 200 })
+  }
+
+  function refreshAll(notify = true): Promise<void> {
+    if (refreshPromise.current) {
+      return refreshPromise.current
+    }
+
+    const request = (async () => {
       setIsRefreshing(true)
-      const [nextSnapshot, nextUsers, nextTraffic] = await Promise.allSettled([
+      const [nextSnapshot, nextUsers, nextTraffic, nextLogs] = await Promise.allSettled([
         loadSnapshot(),
         loadUsers(),
         loadTraffic(),
+        loadConnectionLogs(),
       ])
 
       startTransition(() => {
@@ -228,21 +247,50 @@ function App() {
         }
 
         if (nextTraffic.status === "fulfilled") {
-          setTrafficResponse(nextTraffic.value)
+          setTrafficResponse(nextTraffic.value.traffic)
+          setQuotas(nextTraffic.value.quotas)
         }
 
-        // Sync cumulative traffic + connection logs
-        invoke<UserQuota[]>("sync_traffic").then((q) => setQuotas(q)).catch(() => {})
-        invoke("pull_access_logs")
-          .then(() => invoke<ConnectionLog[]>("get_connection_logs", { limit: 200 }))
-          .then((logs) => setConnLogs(logs))
-          .catch(() => {})
-
+        if (nextLogs.status === "fulfilled") {
+          setConnLogs(nextLogs.value)
+        }
       })
-      showToast(t("action.refreshed"))
-    } finally {
-      setIsRefreshing(false)
+
+      if (notify) {
+        showToast(t("action.refreshed"))
+      }
+    })()
+
+    refreshPromise.current = request
+    void request.finally(() => {
+      if (refreshPromise.current === request) {
+        refreshPromise.current = null
+        setIsRefreshing(false)
+      }
+    })
+
+    return request
+  }
+
+  async function refreshBackgroundData() {
+    if (refreshPromise.current) {
+      return
     }
+
+    const [nextTraffic, nextLogs] = await Promise.allSettled([
+      loadTraffic(),
+      loadConnectionLogs(),
+    ])
+
+    startTransition(() => {
+      if (nextTraffic.status === "fulfilled") {
+        setTrafficResponse(nextTraffic.value.traffic)
+        setQuotas(nextTraffic.value.quotas)
+      }
+      if (nextLogs.status === "fulfilled") {
+        setConnLogs(nextLogs.value)
+      }
+    })
   }
 
   async function refreshSnapshotOnly() {
@@ -341,20 +389,15 @@ function App() {
   }
 
   useEffect(() => {
-    void refreshAll()
+    void refreshAll(false)
 
     // Auto sync traffic every 30 minutes + refresh at midnight
     const timer = setInterval(() => {
       const now = new Date()
       if (now.getHours() === 0 && now.getMinutes() === 0) {
-        void refreshAll()
+        void refreshAll(false)
       } else {
-        // Silent traffic sync (no full refresh, just accumulate stats)
-        invoke<UserQuota[]>("sync_traffic").then((q) => setQuotas(q)).catch(() => {})
-        invoke("pull_access_logs")
-          .then(() => invoke<ConnectionLog[]>("get_connection_logs", { limit: 200 }))
-          .then((logs) => setConnLogs(logs))
-          .catch(() => {})
+        void refreshBackgroundData()
       }
     }, 30 * 60_000)
     return () => clearInterval(timer)

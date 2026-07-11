@@ -1,14 +1,16 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::path::Path;
-use std::sync::Mutex;
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 const DEFAULT_MONTHLY_QUOTA: i64 = 53_687_091_200; // 50 GB
 
+#[derive(Clone)]
 pub struct Db {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
+    log_sync: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,8 +35,8 @@ pub struct UserQuota {
 impl Db {
     pub fn open(dir: &Path) -> Result<Self, String> {
         let db_path = dir.join("xray-plane.db");
-        let conn = Connection::open(&db_path)
-            .map_err(|e| format!("Failed to open database: {e}"))?;
+        let conn =
+            Connection::open(&db_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS user_traffic (
@@ -62,7 +64,8 @@ impl Db {
         .map_err(|e| format!("Failed to create tables: {e}"))?;
 
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
+            log_sync: Arc::new(Mutex::new(())),
         })
     }
 
@@ -80,7 +83,8 @@ impl Db {
             conn.execute(
                 "INSERT OR IGNORE INTO user_traffic (user_id, last_reset_month) VALUES (?1, ?2)",
                 params![email, current_month],
-            ).map_err(|e| format!("DB insert: {e}"))?;
+            )
+            .map_err(|e| format!("DB insert: {e}"))?;
 
             let (last_up, last_down, stored_month): (i64, i64, String) = conn
                 .query_row(
@@ -100,7 +104,11 @@ impl Db {
             } else {
                 // Delta calculation (handle xray restart)
                 let delta_up = if up >= last_up { up - last_up } else { up };
-                let delta_down = if down >= last_down { down - last_down } else { down };
+                let delta_down = if down >= last_down {
+                    down - last_down
+                } else {
+                    down
+                };
                 let delta = delta_up + delta_down;
 
                 conn.execute(
@@ -130,58 +138,92 @@ impl Db {
 
     /// Read new lines from xray access log and store parsed connections.
     pub fn sync_access_log(&self, log_path: &str) -> Result<usize, String> {
-        let conn = self.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
+        let _sync_guard = self
+            .log_sync
+            .lock()
+            .map_err(|e| format!("Log sync lock: {e}"))?;
 
-        // Get last read offset
-        let last_offset: i64 = conn
-            .query_row(
-                "SELECT value FROM kv WHERE key = 'log_offset'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        let last_offset: i64 = {
+            let conn = self.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
+            conn.query_row("SELECT value FROM kv WHERE key = 'log_offset'", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0)
+        };
 
         let file = fs::File::open(log_path).map_err(|e| format!("Cannot open access log: {e}"))?;
         let file_len = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
 
         // If file is smaller than last offset, it was rotated/truncated
-        let start = if file_len < last_offset { 0 } else { last_offset };
+        let start = if file_len < last_offset {
+            0
+        } else {
+            last_offset
+        };
 
         let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(start as u64)).map_err(|e| format!("Seek failed: {e}"))?;
+        reader
+            .seek(SeekFrom::Start(start as u64))
+            .map_err(|e| format!("Seek failed: {e}"))?;
 
-        let mut count = 0;
+        let mut entries = Vec::new();
         let mut line = String::new();
 
-        while reader.read_line(&mut line).map_err(|e| format!("Read failed: {e}"))? > 0 {
+        while reader
+            .read_line(&mut line)
+            .map_err(|e| format!("Read failed: {e}"))?
+            > 0
+        {
             if let Some(entry) = parse_access_line(&line) {
-                conn.execute(
-                    "INSERT INTO connection_logs (user_email, timestamp, client_ip, destination) VALUES (?1, ?2, ?3, ?4)",
-                    params![entry.0, entry.1, entry.2, entry.3],
-                ).map_err(|e| format!("DB insert log: {e}"))?;
-                count += 1;
+                entries.push(entry);
             }
             line.clear();
         }
 
-        // Save new offset
         let new_offset = reader.stream_position().unwrap_or(file_len as u64) as i64;
-        conn.execute(
+        let count = entries.len();
+        let mut conn = self.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("DB transaction: {e}"))?;
+
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO connection_logs (user_email, timestamp, client_ip, destination) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| format!("DB prepare log insert: {e}"))?;
+
+            for entry in entries {
+                insert
+                    .execute(params![entry.0, entry.1, entry.2, entry.3])
+                    .map_err(|e| format!("DB insert log: {e}"))?;
+            }
+        }
+
+        tx.execute(
             "INSERT INTO kv (key, value) VALUES ('log_offset', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
             params![new_offset],
-        ).map_err(|e| format!("DB save offset: {e}"))?;
+        )
+        .map_err(|e| format!("DB save offset: {e}"))?;
 
-        // Keep only last 1000 entries per user to avoid unbounded growth
-        conn.execute(
+        tx.execute(
             "DELETE FROM connection_logs WHERE id NOT IN (SELECT id FROM connection_logs ORDER BY id DESC LIMIT 5000)",
             [],
-        ).map_err(|_| "".to_string()).ok();
+        )
+        .ok();
+
+        tx.commit().map_err(|e| format!("DB commit: {e}"))?;
 
         Ok(count)
     }
 
     /// Get recent connection logs for a specific user, or all users.
-    pub fn get_connections(&self, user_email: Option<&str>, limit: i64) -> Result<Vec<ConnectionLog>, String> {
+    pub fn get_connections(
+        &self,
+        user_email: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ConnectionLog>, String> {
         let conn = self.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
 
         let mut logs = Vec::new();
@@ -190,15 +232,17 @@ impl Db {
             let mut stmt = conn
                 .prepare("SELECT id, user_email, timestamp, client_ip, destination FROM connection_logs WHERE user_email = ?1 ORDER BY id DESC LIMIT ?2")
                 .map_err(|e| format!("DB prepare: {e}"))?;
-            let rows = stmt.query_map(params![email, limit], |row| {
-                Ok(ConnectionLog {
-                    id: row.get(0)?,
-                    user_email: row.get(1)?,
-                    timestamp: row.get(2)?,
-                    client_ip: row.get(3)?,
-                    destination: row.get(4)?,
+            let rows = stmt
+                .query_map(params![email, limit], |row| {
+                    Ok(ConnectionLog {
+                        id: row.get(0)?,
+                        user_email: row.get(1)?,
+                        timestamp: row.get(2)?,
+                        client_ip: row.get(3)?,
+                        destination: row.get(4)?,
+                    })
                 })
-            }).map_err(|e| format!("DB query: {e}"))?;
+                .map_err(|e| format!("DB query: {e}"))?;
             for row in rows {
                 logs.push(row.map_err(|e| format!("DB row: {e}"))?);
             }
@@ -206,30 +250,23 @@ impl Db {
             let mut stmt = conn
                 .prepare("SELECT id, user_email, timestamp, client_ip, destination FROM connection_logs ORDER BY id DESC LIMIT ?1")
                 .map_err(|e| format!("DB prepare: {e}"))?;
-            let rows = stmt.query_map(params![limit], |row| {
-                Ok(ConnectionLog {
-                    id: row.get(0)?,
-                    user_email: row.get(1)?,
-                    timestamp: row.get(2)?,
-                    client_ip: row.get(3)?,
-                    destination: row.get(4)?,
+            let rows = stmt
+                .query_map(params![limit], |row| {
+                    Ok(ConnectionLog {
+                        id: row.get(0)?,
+                        user_email: row.get(1)?,
+                        timestamp: row.get(2)?,
+                        client_ip: row.get(3)?,
+                        destination: row.get(4)?,
+                    })
                 })
-            }).map_err(|e| format!("DB query: {e}"))?;
+                .map_err(|e| format!("DB query: {e}"))?;
             for row in rows {
                 logs.push(row.map_err(|e| format!("DB row: {e}"))?);
             }
         }
 
         Ok(logs)
-    }
-
-    pub fn delete_user(&self, user_id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
-        conn.execute("DELETE FROM user_traffic WHERE user_id = ?1", params![user_id])
-            .map_err(|e| format!("DB delete: {e}"))?;
-        conn.execute("DELETE FROM connection_logs WHERE user_email = ?1", params![user_id])
-            .map_err(|e| format!("DB delete logs: {e}"))?;
-        Ok(())
     }
 
     fn get_quotas_inner(&self, conn: &Connection) -> Result<Vec<UserQuota>, String> {

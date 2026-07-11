@@ -50,3 +50,8 @@ export type UserQuota = {
   usedThisMonth: number
   lastResetMonth: string
 }
+
+export type TrafficRefreshResponse = {
+  traffic: TrafficResponse
+  quotas: UserQuota[]
+}
