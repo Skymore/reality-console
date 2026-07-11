@@ -80,6 +80,29 @@ describe("handleRequest", () => {
     expect(connector).not.toHaveBeenCalled();
   });
 
+  it("returns at the deadline without waiting for socket cleanup", async () => {
+    const close = vi.fn(() => new Promise<void>(() => undefined));
+    const connector = vi.fn<TcpConnector>(() => ({
+      opened: new Promise(() => undefined),
+      close,
+    }));
+    const timeoutRequest = request(
+      JSON.stringify({
+        ...JSON.parse(body()),
+        targets: ["8.8.8.8"],
+        timeoutMillis: 100,
+      }),
+    );
+
+    const started = performance.now();
+    const result = await handleRequest(timeoutRequest, ENV, connector);
+    const elapsed = performance.now() - started;
+    expect(result.status).toBe(200);
+    expect(await result.json()).toMatchObject({ result: { status: "timedOut" } });
+    expect(close).toHaveBeenCalledOnce();
+    expect(elapsed).toBeLessThan(1_000);
+  });
+
   it("does not accept alternate paths or query strings", async () => {
     const connector = vi.fn<TcpConnector>();
     const alternate = request();

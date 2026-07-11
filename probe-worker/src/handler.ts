@@ -106,7 +106,9 @@ async function executeProbe(
   if (timeoutHandle !== undefined) {
     clearTimeout(timeoutHandle);
   }
-  await Promise.allSettled(attempts.map(({ socket }) => socket.close()));
+  for (const { socket } of attempts) {
+    void socket.close().catch(() => undefined);
+  }
   return result;
 }
 
