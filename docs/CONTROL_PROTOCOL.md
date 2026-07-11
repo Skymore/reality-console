@@ -44,6 +44,14 @@ runner, send no application bytes to the candidate, and return no control-plane 
 protocol-aware probe additionally uses a bounded canary credential/challenge. Neither credential is
 available from ordinary node or member read APIs.
 
+The optional external TCP executor uses schema 1 with an unrelated request UUID, one to six unique
+controller-resolved public IPv4 literals, the public port from the node's signed applied revision,
+and a timeout from 100 to 10,000 milliseconds. It receives no node/member identity, hostname,
+REALITY material, VLESS credential, or durable database claim token. Its response echoes the
+request UUID and returns only `connected`, `unreachable`, `timedOut`, or `executorFailed`; a
+connected address must be one of the exact requested literals. Unknown fields and non-public,
+duplicate, non-canonical, port-25, oversized, or unsupported-schema requests fail closed.
+
 ## 3. Stable Error Envelope
 
 ```json

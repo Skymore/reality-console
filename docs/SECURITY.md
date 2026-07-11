@@ -493,6 +493,23 @@ The product has no vendor telemetry by default. Any future crash or product anal
 separate opt-in with a published schema, endpoint, retention period, and local preview. It must
 never reuse network-operation telemetry silently.
 
+## External TCP Executor Trust Boundary
+
+The optional external TCP executor is outside the controller trust boundary. It receives only an
+unrelated request ID, at most six controller-resolved public IPv4 literals, one signed-revision
+port, and a short timeout. It never receives node/member identity, hostname, database claim token,
+REALITY keys, VLESS credentials, configuration artifacts, or administrator credentials. Requests
+use a dedicated high-entropy deployment token over HTTPS; that token authorizes only this
+non-publishable TCP preflight surface and is not reused for control APIs.
+
+The executor or its provider can observe target IP/port, request timing, and connection outcome; it
+can refuse work or lie about a TCP result. Control validates the closed response against its
+request and current durable candidate, but cannot make a bare TCP claim trustworthy. Therefore TCP
+evidence never marks an endpoint `verified` or enters a client bundle. A later VLESS + REALITY
+canary uses a stronger separately scoped identity and is the first phase allowed to affect
+publication. Executor logs and platform observability stay disabled, request bodies and
+authorization headers are never logged, and the token is stored as a platform secret.
+
 ## Relay Trust Boundary
 
 If a management relay is deployed, it forwards opaque, end-to-end authenticated and encrypted

@@ -9,8 +9,9 @@ flowchart LR
     Admin["Control admin app"] -->|"HTTPS admin API"| Service["Control Service + SQLite"]
     Host["Node Host agent"] -->|"outbound enroll, poll, report"| Service
     Client["Connect client"] -->|"activate, refresh bundle"| Service
-    Probe["Probe worker outside node LAN"] -->|"bounded TCP / protocol probe"| Host
-    Probe <-->|"claim and result"| Service
+    Probe["External probe executor"] -->|"bounded TCP / protocol probe"| Host
+    Service -->|"privacy-minimized request"| Probe
+    Probe -->|"secret-free evidence"| Service
     Client -->|"VLESS + REALITY"| Host
     Host -->|"optional outbound tunnel"| Relay["Raw TCP relay"]
     Client -->|"VLESS + REALITY"| Relay
@@ -180,6 +181,12 @@ LAN. A home controller therefore requires a remote worker for authoritative reac
 probing its own public address would test NAT loopback. A management overlay such as Tailscale may
 secure operations but does not by itself make the Xray endpoint available to ordinary Connect
 clients.
+
+For a home controller, the initial external TCP executor is an optional Cloudflare Worker invoked
+outbound by Control Service. Control resolves and filters DNS locally, sends at most six pinned
+public IPv4 literals plus the signed public port, and retains all node identity plus durable claim
+state locally. The Worker sends no bytes after TCP connect and cannot change verification state.
+It is replaceable by a small VPS executor using the same closed request/response contract.
 
 ## 8. Offline And Failure Behavior
 

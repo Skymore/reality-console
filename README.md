@@ -10,6 +10,7 @@ Connect. The final public brand is intentionally not encoded into the protocol o
 - `client/`: independent macOS/Windows Connect application with a bundled Xray supervisor.
 - `control-server/`: standalone lightweight Control Service with authoritative SQLite storage.
 - `node-host/`: headless Node Host core with local identity, state, and CLI foundations.
+- `probe-worker/`: optional privacy-minimized Cloudflare Worker for external TCP preflight.
 - `crates/`: shared versioned protocol/domain types plus the verified Xray runtime boundary.
 - `docs/`: authoritative architecture, protocol, security, and component designs.
 
@@ -52,6 +53,8 @@ verification `pending`;
 the remote worker transport and VLESS + REALITY canary required for client publication remain
 under implementation, along with native service installers, relay reachability, account
 synchronization, and the friend-facing setup UI/package.
+The optional probe-worker contract is now implemented and dry-run deployable; Control Service
+integration and live deployment are the next step.
 
 ## Authoritative Documentation
 
@@ -90,6 +93,10 @@ cargo test --manifest-path crates/control-protocol/Cargo.toml
 cargo test --manifest-path crates/xray-runtime/Cargo.toml --locked
 cargo test --manifest-path control-server/Cargo.toml
 cargo test --manifest-path node-host/Cargo.toml
+
+npm --prefix probe-worker run check
+npm --prefix probe-worker test
+npm --prefix probe-worker run deploy -- --dry-run
 ```
 
 Control Service defaults `CONTROL_PROBE_MODE` to `disabled`. `local-tcp` is a development or
