@@ -18,6 +18,27 @@ export type ClientState = {
   errorMessage?: string | null
 }
 
+export type ClientError = {
+  code: string
+  message: string
+  field?: string | null
+}
+
+export type InvitationPreview = {
+  name: string
+  serverAddress: string
+  serverPort: number
+  transport: "raw"
+  security: "reality"
+  flow: string
+  serverName: string
+  fingerprint: string
+}
+
 export function getClientState() {
   return invoke<ClientState>("client_get_state")
+}
+
+export function previewInvitation(invitation: string) {
+  return invoke<InvitationPreview>("client_preview_invitation", { invitation })
 }
