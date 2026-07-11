@@ -1,5 +1,8 @@
-use crate::{status_locked, sync::sync_once_locked, DataDirLock, EnrollmentState};
-use anyhow::{bail, Result};
+use crate::activation::{ActivationOptions, XraySupervisor};
+use crate::{
+    status_locked, sync::sync_once_locked_with_runtime_probe, DataDirLock, EnrollmentState,
+};
+use anyhow::{bail, Context as _, Result};
 use rand_core::{OsRng, RngCore as _};
 use std::future::Future;
 use std::path::Path;
@@ -9,6 +12,12 @@ const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(5 * 60);
 const MAX_CONFIGURED_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+const RUNTIME_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+enum ServiceEvent {
+    Shutdown(Result<()>),
+    Cycle(Result<()>),
+}
 
 /// Timing policy for the resilient outbound synchronization loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,16 +85,35 @@ where
     if status_locked(data_dir)?.enrollment_state != EnrollmentState::Enrolled {
         bail!("node host must be enrolled before starting its sync service");
     }
+    let mut supervisor = XraySupervisor::new(ActivationOptions::default())?;
+    if let Err(recovery_error) = supervisor.recover(data_dir).await {
+        if let Err(cleanup_error) = supervisor.shutdown().await {
+            return Err(cleanup_error)
+                .context("managed Xray cleanup failed after service recovery error");
+        }
+        return Err(recovery_error);
+    }
 
     tokio::pin!(shutdown);
     let mut backoff = options.initial_backoff;
     loop {
-        let result = tokio::select! {
-            shutdown_result = &mut shutdown => return shutdown_result,
-            result = sync_once_locked(data_dir) => result,
+        let event = {
+            let cycle = run_cycle(data_dir, &mut supervisor);
+            tokio::pin!(cycle);
+            tokio::select! {
+                shutdown_result = &mut shutdown => ServiceEvent::Shutdown(shutdown_result),
+                result = &mut cycle => ServiceEvent::Cycle(result),
+            }
+        };
+        let result = match event {
+            ServiceEvent::Shutdown(result) => {
+                supervisor.shutdown().await?;
+                return result;
+            }
+            ServiceEvent::Cycle(result) => result,
         };
         let base_delay = match result {
-            Ok(_) => {
+            Ok(()) => {
                 backoff = options.initial_backoff;
                 options.success_interval
             }
@@ -96,12 +124,35 @@ where
                 current
             }
         };
-        let delay = jitter(base_delay, OsRng.next_u64());
-        tokio::select! {
-            shutdown_result = &mut shutdown => return shutdown_result,
-            () = tokio::time::sleep(delay) => {}
+        let deadline = tokio::time::Instant::now() + jitter(base_delay, OsRng.next_u64());
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = (deadline - now).min(RUNTIME_POLL_INTERVAL);
+            tokio::select! {
+                shutdown_result = &mut shutdown => {
+                    supervisor.shutdown().await?;
+                    return shutdown_result;
+                }
+                () = tokio::time::sleep(wait) => {}
+            }
+            if let Err(error) = supervisor.poll(data_dir).await {
+                tracing::warn!(error = %error, "managed Xray health check failed; retrying");
+                break;
+            }
         }
     }
+}
+
+async fn run_cycle(data_dir: &Path, supervisor: &mut XraySupervisor) -> Result<()> {
+    supervisor.poll(data_dir).await?;
+    // A previously acknowledged candidate can activate even if the controller
+    // is temporarily unavailable after a service restart.
+    supervisor.reconcile(data_dir).await?;
+    sync_once_locked_with_runtime_probe(data_dir, || supervisor.observe_runtime_state()).await?;
+    supervisor.reconcile(data_dir).await
 }
 
 fn jitter(base: Duration, random: u64) -> Duration {

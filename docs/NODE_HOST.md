@@ -239,6 +239,19 @@ cycles. Timing bounds are configurable for service integration. It does not crea
 assertion or prevent lock/sleep; sleeping pauses networking and the next wake resumes convergence.
 Native `launchd` and `systemd` installation remains a packaging step rather than protocol behavior.
 
+Unlike `sync-once`, `run` also owns the managed Xray child. It revalidates both the explicit binary
+and 0600 candidate immediately before each no-shell spawn, waits up to 10 seconds for the expected
+loopback listener, then requires five seconds of process stability before atomically committing the
+active pointer and `applied` result. A replacement candidate failure restarts and health-checks the
+durable predecessor before reporting `rolledBack`. With no predecessor, startup is retried at most
+three times before a stable `rejected`. An interrupted switch keeps the predecessor pointer and is
+conservatively completed as rollback on restart. Current shutdown uses bounded forceful kill/reap;
+graceful termination remains a later process-boundary enhancement.
+
+This lifecycle does not yet make the node externally usable. Xray binds only to loopback and the
+planned admission gate, router mapping, external probe, and relay adapter are not implemented in
+this milestone. It therefore cannot bypass provider policy by exposing Xray directly.
+
 ## 7. Outbound-Only Control Sync
 
 ### 7.1 Transport

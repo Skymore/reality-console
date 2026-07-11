@@ -183,6 +183,14 @@ fn print_status(status: &HostStatus) {
         "desired_revision_cursor: {}",
         status.desired_revision_cursor
     );
+    match status.applied_revision {
+        Some(revision) => println!("applied_revision: {}", revision.get()),
+        None => println!("applied_revision: none"),
+    }
+    match &status.xray_activation_phase {
+        Some(phase) => println!("xray_activation_phase: {phase}"),
+        None => println!("xray_activation_phase: none"),
+    }
     println!("xray_configured: {}", status.xray_configured);
     match &status.xray_binary_path {
         Some(path) => println!("xray_binary_path: {}", path.display()),

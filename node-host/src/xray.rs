@@ -41,6 +41,16 @@ pub(crate) struct XrayRuntimeStatus {
     pub reality_short_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedXrayCandidate {
+    pub revision: Revision,
+    pub config_path: PathBuf,
+    pub config_digest: ProtocolSha256Digest,
+    pub binary_path: PathBuf,
+    pub binary_digest: RuntimeSha256Digest,
+    pub listen_port: u16,
+}
+
 /// Verifies and records an installer-provided Xray runtime without starting it.
 ///
 /// The explicit binary is checked for safe file metadata and the caller's
@@ -80,10 +90,20 @@ pub async fn configure_xray(
         .to_owned();
     let expected_sha256 = digest.to_string();
     let existing = load_runtime_row(&connection)?;
-    if existing.as_ref().is_some_and(|stored| {
-        (stored.binary_path != binary_path || stored.expected_sha256 != expected_sha256) && !replace
-    }) {
+    let pin_changed = existing.as_ref().is_some_and(|stored| {
+        stored.binary_path != binary_path || stored.expected_sha256 != expected_sha256
+    });
+    if pin_changed && !replace {
         bail!("Xray runtime is already configured; use --replace to change the pinned binary");
+    }
+    if pin_changed {
+        let validated_configs: i64 =
+            connection.query_row("SELECT COUNT(*) FROM rendered_xray_configs", [], |row| {
+                row.get(0)
+            })?;
+        if validated_configs != 0 {
+            bail!("Xray runtime cannot be replaced while validated revisions are retained");
+        }
     }
 
     let spec = XrayBinarySpec::new(binary_path.clone(), digest)
@@ -207,6 +227,63 @@ pub(crate) async fn validate_desired_state(
 
 pub(crate) fn configured_xray_version(connection: &Connection) -> Result<Option<String>> {
     Ok(load_runtime_row(connection)?.map(|runtime| runtime.version))
+}
+
+pub(crate) fn load_validated_candidate(
+    connection: &Connection,
+    data_dir: &Path,
+    revision: Revision,
+) -> Result<ValidatedXrayCandidate> {
+    let reports = load_revision_results(connection, revision)?;
+    let latest = reports
+        .last()
+        .map(|(_, report)| report)
+        .context("validated Xray candidate has no revision result")?;
+    if !matches!(
+        latest.state,
+        RevisionResultState::Validated | RevisionResultState::Applied
+    ) {
+        bail!("revision is not eligible to run as an Xray candidate");
+    }
+    verify_rendered_config(connection, data_dir, revision, latest)?;
+    let rendered = load_rendered_config_row(connection, revision)?;
+    let runtime =
+        load_runtime_row(connection)?.context("validated candidate has no Xray runtime")?;
+    if runtime.expected_sha256 != rendered.binary_digest {
+        bail!("validated candidate was tested with a different pinned Xray binary");
+    }
+    let config_digest: ProtocolSha256Digest = rendered
+        .config_digest
+        .parse()
+        .context("validated candidate config digest is invalid")?;
+    let binary_digest = RuntimeSha256Digest::from_hex(&rendered.binary_digest)
+        .context("validated candidate binary digest is invalid")?;
+    let expected_relative = config_relative_path(revision);
+    if Path::new(&rendered.relative_path) != expected_relative {
+        bail!("validated candidate config path is invalid");
+    }
+    let config_path = fs::canonicalize(data_dir.join(expected_relative))
+        .context("validated candidate config path is unavailable")?;
+    let envelope_json: String = connection
+        .query_row(
+            "SELECT envelope_json FROM desired_state_artifacts WHERE revision = ?1",
+            [revision.get()],
+            |row| row.get(0),
+        )
+        .context("validated candidate desired-state artifact is missing")?;
+    let envelope: SignedDesiredState = serde_json::from_str(&envelope_json)
+        .context("validated candidate desired-state artifact is invalid")?;
+    if envelope.document.revision != revision {
+        bail!("validated candidate desired-state revision is inconsistent");
+    }
+    Ok(ValidatedXrayCandidate {
+        revision,
+        config_path,
+        config_digest,
+        binary_path: PathBuf::from(runtime.binary_path),
+        binary_digest,
+        listen_port: envelope.document.xray.listen_port,
+    })
 }
 
 pub(crate) fn load_xray_runtime_status(
@@ -387,36 +464,50 @@ fn verify_rendered_config(
     revision: Revision,
     report: &RevisionResult,
 ) -> Result<()> {
-    let stored = connection
-        .query_row(
-            "SELECT relative_path, config_digest, binary_digest
-             FROM rendered_xray_configs WHERE revision = ?1",
-            [revision.get()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()?
-        .context("validated revision is missing its rendered Xray config metadata")?;
+    let stored = load_rendered_config_row(connection, revision)?;
     let expected_relative = config_relative_path(revision);
-    if Path::new(&stored.0) != expected_relative {
+    if Path::new(&stored.relative_path) != expected_relative {
         bail!("stored rendered Xray config path is invalid");
     }
     if report
         .config_digest
         .as_ref()
         .map(ProtocolSha256Digest::as_str)
-        != Some(stored.1.as_str())
+        != Some(stored.config_digest.as_str())
     {
         bail!("validated revision config digest is inconsistent");
     }
-    RuntimeSha256Digest::from_hex(&stored.2)
+    RuntimeSha256Digest::from_hex(&stored.binary_digest)
         .context("validated revision has an invalid historical Xray binary digest")?;
-    verify_config_file(&data_dir.join(expected_relative), &stored.1)
+    verify_config_file(&data_dir.join(expected_relative), &stored.config_digest)
+}
+
+#[derive(Debug)]
+struct RenderedConfigRow {
+    relative_path: String,
+    config_digest: String,
+    binary_digest: String,
+}
+
+fn load_rendered_config_row(
+    connection: &Connection,
+    revision: Revision,
+) -> Result<RenderedConfigRow> {
+    connection
+        .query_row(
+            "SELECT relative_path, config_digest, binary_digest
+             FROM rendered_xray_configs WHERE revision = ?1",
+            [revision.get()],
+            |row| {
+                Ok(RenderedConfigRow {
+                    relative_path: row.get(0)?,
+                    config_digest: row.get(1)?,
+                    binary_digest: row.get(2)?,
+                })
+            },
+        )
+        .optional()?
+        .context("validated revision is missing its rendered Xray config metadata")
 }
 
 fn append_rejected_result(
@@ -453,17 +544,10 @@ fn append_validated_result(
         error_code: None,
         rollback_revision: None,
     };
-    result
-        .validate(revision)
-        .context("generated validated revision result is invalid")?;
-    let report_json =
-        serde_json::to_string(&result).context("failed to encode validated revision result")?;
-    let report_digest = protocol_digest(report_json.as_bytes());
     let relative_path = relative_path
         .to_str()
         .context("rendered Xray config path is not UTF-8")?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    validate_result_transition(&transaction, revision, &result)?;
     transaction.execute(
         "INSERT INTO rendered_xray_configs(
             revision, relative_path, config_digest, binary_digest, validated_at
@@ -476,17 +560,7 @@ fn append_validated_result(
             completed_at.as_datetime().unix_timestamp(),
         ],
     )?;
-    transaction.execute(
-        "INSERT INTO local_revision_results(
-            revision, state, report_json, report_digest, reported_at, created_at
-         ) VALUES (?1, 'validated', ?2, ?3, NULL, ?4)",
-        params![
-            revision.get(),
-            report_json,
-            report_digest.as_str(),
-            completed_at.as_datetime().unix_timestamp(),
-        ],
-    )?;
+    insert_revision_result(&transaction, revision, &result)?;
     transaction.commit()?;
     Ok(())
 }
@@ -496,14 +570,24 @@ fn append_revision_result(
     revision: Revision,
     result: &RevisionResult,
 ) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    insert_revision_result(&transaction, revision, result)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn insert_revision_result(
+    connection: &Connection,
+    revision: Revision,
+    result: &RevisionResult,
+) -> Result<()> {
     result
         .validate(revision)
         .context("generated revision result is invalid")?;
     let report_json = serde_json::to_string(result).context("failed to encode revision result")?;
     let report_digest = protocol_digest(report_json.as_bytes());
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    validate_result_transition(&transaction, revision, result)?;
-    transaction.execute(
+    validate_result_transition(connection, revision, result)?;
+    connection.execute(
         "INSERT INTO local_revision_results(
             revision, state, report_json, report_digest, reported_at, created_at
          ) VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
@@ -515,7 +599,6 @@ fn append_revision_result(
             result.completed_at.as_datetime().unix_timestamp(),
         ],
     )?;
-    transaction.commit()?;
     Ok(())
 }
 

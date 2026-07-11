@@ -53,10 +53,23 @@ enum ReportScope {
 /// request is rejected.
 pub async fn sync_once(data_dir: &Path) -> Result<HostStatus> {
     let _lock = DataDirLock::acquire(data_dir, false)?;
-    sync_once_locked(data_dir).await
+    sync_once_locked(data_dir, NodeRuntimeState::Idle).await
 }
 
-pub(crate) async fn sync_once_locked(data_dir: &Path) -> Result<HostStatus> {
+pub(crate) async fn sync_once_locked(
+    data_dir: &Path,
+    runtime_state: NodeRuntimeState,
+) -> Result<HostStatus> {
+    sync_once_locked_with_runtime_probe(data_dir, || Ok(runtime_state)).await
+}
+
+pub(crate) async fn sync_once_locked_with_runtime_probe<F>(
+    data_dir: &Path,
+    mut runtime_probe: F,
+) -> Result<HostStatus>
+where
+    F: FnMut() -> Result<NodeRuntimeState>,
+{
     let mut connection = open_database(data_dir, false)?;
     migrate(&mut connection)?;
     let controller_value: String = connection
@@ -81,6 +94,9 @@ pub(crate) async fn sync_once_locked(data_dir: &Path) -> Result<HostStatus> {
     )
     .await?;
     let sync_state = crate::load_sync_status(&connection)?;
+    // Observe the managed child immediately before constructing the heartbeat;
+    // earlier network/report work may have taken long enough for it to exit.
+    let runtime_state = runtime_probe()?;
     send_heartbeat(
         &client,
         &controller,
@@ -88,6 +104,7 @@ pub(crate) async fn sync_once_locked(data_dir: &Path) -> Result<HostStatus> {
         &registration,
         &identity,
         sync_state.desired_revision_cursor,
+        runtime_state,
     )
     .await?;
     fetch_and_process_desired(
@@ -183,8 +200,9 @@ async fn send_heartbeat(
     registration: &SyncRegistration,
     identity: &Identity,
     desired_revision_cursor: i64,
+    runtime_state: NodeRuntimeState,
 ) -> Result<()> {
-    let heartbeat = current_heartbeat(connection, desired_revision_cursor)?;
+    let heartbeat = current_heartbeat(connection, desired_revision_cursor, runtime_state)?;
     let heartbeat_body =
         serde_json::to_vec(&heartbeat).context("failed to serialize node heartbeat")?;
     let heartbeat_target = format!("/v1/nodes/{}/heartbeat", registration.node);
@@ -274,6 +292,7 @@ async fn fetch_and_process_desired(
 fn current_heartbeat(
     connection: &Connection,
     desired_revision_cursor: i64,
+    runtime_state: NodeRuntimeState,
 ) -> Result<NodeHeartbeat> {
     let (received_revision_value, validated_revision_value): (i64, i64) = connection.query_row(
         "SELECT
@@ -292,15 +311,22 @@ fn current_heartbeat(
     let desired_revision = optional_revision(desired_revision_cursor, "desired")?;
     let received_revision = optional_revision(received_revision_value, "received")?;
     let validated_revision = optional_revision(validated_revision_value, "validated")?;
+    let applied_revision_value: i64 = connection.query_row(
+        "SELECT COALESCE(applied_revision, 0)
+         FROM xray_active_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let applied_revision = optional_revision(applied_revision_value, "applied")?;
     let heartbeat = NodeHeartbeat {
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
         xray_version: crate::xray::configured_xray_version(connection)?,
-        state: NodeRuntimeState::Idle,
+        state: runtime_state,
         revisions: RevisionProgress {
             desired_revision,
             received_revision,
             validated_revision,
-            applied_revision: None,
+            applied_revision,
         },
         provider_paused: false,
         endpoints: Vec::new(),
@@ -724,8 +750,11 @@ fn controller_error(operation: &str, status: StatusCode, body: &[u8]) -> anyhow:
 
 #[cfg(test)]
 mod tests {
-    use super::{load_unreported_results, ReportScope, MAX_PENDING_REPORTS_PER_SYNC};
+    use super::{
+        current_heartbeat, load_unreported_results, ReportScope, MAX_PENDING_REPORTS_PER_SYNC,
+    };
     use control_protocol::id::Revision;
+    use control_protocol::node::NodeRuntimeState;
     use rusqlite::{params, Connection};
 
     #[test]
@@ -780,5 +809,33 @@ mod tests {
             usize::try_from(MAX_PENDING_REPORTS_PER_SYNC).unwrap()
         );
         assert!(global.iter().all(|report| report.0 < current.get()));
+    }
+
+    #[test]
+    fn heartbeat_reports_the_durable_applied_pointer_and_runtime_state() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE local_revision_results (
+                    revision INTEGER NOT NULL,
+                    state TEXT NOT NULL
+                ) STRICT;
+                 INSERT INTO local_revision_results(revision, state) VALUES
+                    (1, 'received'), (1, 'validated'), (1, 'applied');
+                 CREATE TABLE xray_active_state (
+                    singleton INTEGER PRIMARY KEY,
+                    applied_revision INTEGER
+                 ) STRICT;
+                 INSERT INTO xray_active_state(singleton, applied_revision) VALUES (1, 1);",
+            )
+            .unwrap();
+
+        let heartbeat = current_heartbeat(&connection, 1, NodeRuntimeState::Serving).unwrap();
+
+        assert_eq!(heartbeat.state, NodeRuntimeState::Serving);
+        assert_eq!(heartbeat.revisions.desired_revision.unwrap().get(), 1);
+        assert_eq!(heartbeat.revisions.received_revision.unwrap().get(), 1);
+        assert_eq!(heartbeat.revisions.validated_revision.unwrap().get(), 1);
+        assert_eq!(heartbeat.revisions.applied_revision.unwrap().get(), 1);
     }
 }

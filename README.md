@@ -32,8 +32,11 @@ outbound sync loop with jitter, bounded retry backoff, and graceful process shut
 integration can verify and pin an explicit Xray binary, probe its version, and create a separate
 owner-only REALITY identity without starting the process. Candidate files are immutable,
 owner-only, digest-checked on restart, and never replace a known-good configuration during
-validation. Native service installers, atomic Xray activation/supervision, account synchronization,
-and relay fallback remain under active implementation.
+validation. The long-running `node-host run` service now owns a checksum-revalidated Xray child,
+activates only controller-acknowledged candidates, records the active pointer atomically with
+`applied`, and restores a proven predecessor after startup or loopback-health failure. It remains
+loopback-only: native service installers, the public admission gate, direct/relay reachability,
+account synchronization, and friend-facing setup are still under active implementation.
 
 ## Authoritative Documentation
 

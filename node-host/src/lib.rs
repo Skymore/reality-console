@@ -1,5 +1,6 @@
 //! Persistent local foundation for the Reality Console node host.
 
+mod activation;
 mod enrollment;
 mod service;
 mod sync;
@@ -296,6 +297,10 @@ pub struct HostStatus {
     pub last_sync_at: Option<Timestamp>,
     /// Highest desired-state revision durably accepted by this host.
     pub desired_revision_cursor: i64,
+    /// Last revision that passed local startup and health checks.
+    pub applied_revision: Option<control_protocol::id::Revision>,
+    /// Most recent activation-journal phase, when any attempt exists.
+    pub xray_activation_phase: Option<String>,
     /// Whether an installer-provided, checksum-pinned Xray runtime is configured.
     pub xray_configured: bool,
     /// Explicit validated Xray binary path, when configured.
@@ -577,6 +582,7 @@ fn build_status(
     )?;
     let registration = load_registration_status(connection)?;
     let sync_status = load_sync_status(connection)?;
+    let activation_status = activation::load_activation_status(connection)?;
     let xray_status = xray::load_xray_runtime_status(connection, data_dir)?;
     let (
         xray_binary_path,
@@ -608,6 +614,8 @@ fn build_status(
         last_heartbeat_at: sync_status.last_heartbeat_at,
         last_sync_at: sync_status.last_sync_at,
         desired_revision_cursor: sync_status.desired_revision_cursor,
+        applied_revision: activation_status.applied_revision,
+        xray_activation_phase: activation_status.latest_phase,
         xray_configured: xray_binary_path.is_some(),
         xray_binary_path,
         xray_expected_sha256,
