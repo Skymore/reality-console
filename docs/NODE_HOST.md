@@ -194,12 +194,12 @@ deleted and the invitation remains consumed. Re-pairing requires a new invitatio
 ### 6.4 Headless Development Flow
 
 The current headless implementation exposes `bootstrap`, `init`, `join`, `configure-xray`,
-`sync-once`, `run`, and `status`. `join` consumes the exact
-JSON invitation returned by Control Service, requires both provider-consent flags, reuses the
-installation's owner-only Ed25519/X25519 identities, and persists registration only after verifying
-the controller fingerprint and signed response. On Unix, the invitation file must be a regular
-non-symlink file inaccessible to group and other users. Repeating `join` with the same invitation
-and local identity safely recovers a lost success response without creating another node.
+`sync-once`, `run`, `status`, and macOS preview `service install/status/remove` commands. `join`
+consumes the exact JSON invitation returned by Control Service, requires both provider-consent
+flags, reuses the installation's owner-only Ed25519/X25519 identities, and persists registration
+only after verifying the controller fingerprint and signed response. On Unix, the invitation file
+must be a regular non-symlink file inaccessible to group and other users. Repeating `join` with the
+same invitation and local identity safely recovers a lost success response without creating another node.
 
 This CLI is a development and service integration surface, not the intended friend-facing UX. The
 desktop wrapper will receive the invitation in memory through a QR code or deep link and present
@@ -219,8 +219,9 @@ presented as one `Try again` action: rerunning bootstrap reuses the same identit
 invitation recovery semantics. The optional `accept_router_mapping` choice is persisted locally
 before enrollment; when selected, the signed enrollment advertises PCP, NAT-PMP, and UPnP support
 and binds the mapping consent. The file-based `bootstrap` subcommand exists only for installer and
-headless integration. Native package installation, background-service registration, and the setup
-UI remain separate pending deliverables.
+headless integration. The macOS preview user-service registration is implemented below. Native
+signed package installation, system-service registration, and the setup UI remain separate pending
+deliverables.
 
 `configure-xray` is an installer/service integration command, not friend-facing setup. It accepts
 only an explicit absolute binary path and installer-manifest SHA-256, rejects unsafe file metadata,
@@ -252,14 +253,30 @@ It remains an unverified candidate at Control. Schema 10, PCP/NAT-PMP/UPnP drive
 and release supervision, topology invalidation, bounded retry, and safe local status are now
 implemented.
 
-The current headless `run` command already wraps that cycle in a resilient foreground service. It
+The current headless `run` command already wraps that cycle in a resilient service process. It
 synchronizes immediately, uses a 30-second success interval with bounded jitter, retries failures
 with exponential backoff capped at five minutes, and exits cleanly on Ctrl-C or `SIGTERM`. It holds
 the node data-directory lock for its complete lifetime, so a second service, `sync-once`, runtime
 replacement, or direct database operation cannot become a concurrent Xray owner between polling
 cycles. Timing bounds are configurable for service integration. It does not create a macOS power
 assertion or prevent lock/sleep; sleeping pauses networking and the next wake resumes convergence.
-Native `launchd` and `systemd` installation remains a packaging step rather than protocol behavior.
+On macOS, the preview backend can register that exact process as an owner-only user `LaunchAgent`
+after enrollment. `bootstrap_and_install_user_service` composes the friend-facing in-memory setup
+with registration, while `install_user_service` retries registration without repeating enrollment.
+The generated plist contains only the canonical agent path plus `run --data-dir <canonical path>`;
+it contains no invitation, controller credential, user UUID, REALITY material, or controller-owned
+command. Paths and ownership are checked, launchctl calls have finite timeouts, concurrent service
+changes are locked, and a failed replacement restores and reloads the previous definition. The
+status operation distinguishes definition presence from launchd load state; neither means the node
+has passed external reachability verification.
+
+This preview service is intentionally user-scoped: it survives closing the setup UI and starts at
+that user's next login, but it requires an interactive login session and stops at logout. It makes
+no power assertion, so screen locking works normally and system sleep still pauses the node. The
+signed unattended macOS package remains a separate packaging deliverable using a root-owned
+`LaunchDaemon`; Windows SCM and Linux systemd registration are also still pending. Removing the
+preview service stops the managed process and removes only its plist. It retains node identity and
+state until an explicit local unpair or uninstall flow owns destructive cleanup.
 
 Unlike `sync-once`, `run` also owns the managed Xray child. It revalidates both the explicit binary
 and 0600 candidate immediately before each no-shell spawn, waits up to 10 seconds for the expected
@@ -814,6 +831,10 @@ service if the UI is unavailable.
   Node Host release.
 
 ### 15.2 macOS
+
+The implemented user `LaunchAgent` is a private-preview integration boundary, not the production
+package described below. It exists so the setup UI can deliver a no-terminal friend flow without
+claiming logout-independent or unattended operation.
 
 - Distribute a notarized universal `.pkg` containing a signed app for setup/status and a signed
   agent/Xray payload.

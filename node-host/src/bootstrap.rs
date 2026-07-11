@@ -1,7 +1,10 @@
 use crate::enrollment::{
     join_invitation, parse_invitation_json, read_invitation, require_provider_consent,
 };
-use crate::{configure_xray, initialize, mapping::configure_bootstrap_policy, HostStatus};
+use crate::{
+    configure_xray, initialize, install_user_service, mapping::configure_bootstrap_policy,
+    BackgroundServiceStatus, HostStatus, UserServiceInstallRequest,
+};
 use anyhow::{Context as _, Result};
 use control_protocol::node::CreateNodeInvitationResponse;
 use std::path::{Path, PathBuf};
@@ -19,6 +22,15 @@ pub struct BootstrapRequest {
     accept_host_owner: bool,
     accept_exit_ip: bool,
     accept_router_mapping: bool,
+}
+
+/// Result of the friend-facing setup path after background registration.
+#[derive(Debug)]
+pub struct BootstrapServiceOutcome {
+    /// Enrolled Node Host state.
+    pub host: HostStatus,
+    /// Native service-manager registration state.
+    pub service: BackgroundServiceStatus,
 }
 
 impl BootstrapRequest {
@@ -111,4 +123,28 @@ pub async fn bootstrap(data_dir: &Path, request: BootstrapRequest) -> Result<Hos
     )
     .await
     .context("Node Host bootstrap could not complete controller enrollment")
+}
+
+/// Completes bootstrap and then registers the enrolled host in the native
+/// user-scoped background service.
+///
+/// Enrollment commits before service registration. If launchd registration
+/// fails, retrying this complete operation is safe: bootstrap reuses the same
+/// local identity and controller registration, while service installation
+/// independently restores any previous service definition on failure.
+///
+/// # Errors
+///
+/// Returns a stage-specific bootstrap error or a background-service error. A
+/// service-stage error does not roll back a valid controller enrollment.
+pub async fn bootstrap_and_install_user_service(
+    data_dir: &Path,
+    bootstrap_request: BootstrapRequest,
+    service_request: &UserServiceInstallRequest,
+) -> Result<BootstrapServiceOutcome> {
+    let host = bootstrap(data_dir, bootstrap_request).await?;
+    let service = install_user_service(data_dir, service_request)
+        .await
+        .context("Node Host bootstrap enrolled successfully but background startup failed")?;
+    Ok(BootstrapServiceOutcome { host, service })
 }

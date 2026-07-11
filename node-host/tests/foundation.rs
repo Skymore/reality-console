@@ -146,7 +146,8 @@ fn cli_exposes_single_cycle_sync_command() {
         .stdout(predicate::str::contains("bootstrap"))
         .stdout(predicate::str::contains("sync-once"))
         .stdout(predicate::str::contains("configure-xray"))
-        .stdout(predicate::str::contains("run"));
+        .stdout(predicate::str::contains("run"))
+        .stdout(predicate::str::contains("service"));
 }
 
 #[test]

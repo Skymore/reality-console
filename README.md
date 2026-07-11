@@ -50,10 +50,15 @@ change. Control Service now has a durable, lease-based external TCP preflight qu
 public-address-only executor with DNS pinning, bounded connection time, stale-candidate fencing,
 signed-public-port binding, and append-only results. Bare TCP success deliberately leaves endpoint
 verification `pending`; the VLESS + REALITY canary required for client publication remains under
-implementation, along with native service installers, relay reachability, account synchronization,
-and the friend-facing setup UI/package.
+implementation, along with signed system-service installers, relay reachability, account
+synchronization, and the friend-facing setup UI/package.
+
 The optional probe-worker contract is implemented and dry-run deployable. Control Service can now
-invoke it in explicit `remote-http` mode; live Worker deployment is the next operational step.
+invoke it in explicit `remote-http` mode. Node Host also has a macOS private-preview user
+`LaunchAgent` lifecycle: setup can enroll and register the background process as one retryable
+operation, service replacement rolls back on failure, and status/removal never expose or delete
+node credentials. This preview path requires a logged-in user and does not prevent sleep; signed
+system packages and the end-to-end VLESS + REALITY publication canary remain operational gaps.
 
 ## Authoritative Documentation
 
@@ -124,21 +129,24 @@ that file must be owner-only on Unix:
 ```bash
 chmod 600 invitation.json
 node-host bootstrap \
-  --data-dir ./node-state \
+  --data-dir "$HOME/Library/Application Support/Private Network/Node Host/state" \
   --invitation-file ./invitation.json \
   --display-name "Friend Mac" \
   --xray-binary-path /absolute/path/to/bundled/xray \
   --xray-sha256 64-lowercase-hex-characters \
   --accept-host-owner \
-  --accept-exit-ip
+  --accept-exit-ip \
+  --install-user-service \
+  --agent-binary-path /absolute/installed/path/to/node-host
 
-# Development foreground service; the installer will register this automatically.
-node-host run --data-dir ./node-state
+# Safe registration state; this is not endpoint reachability status.
+node-host service status
 ```
 
 The backend `BootstrapRequest::from_invitation_json` path keeps the invitation in memory for a
-QR/deep-link desktop wrapper. The separate `init`, `join`, and `configure-xray` commands remain
-available as diagnostic and packaging primitives; friends do not need to run them.
+QR/deep-link desktop wrapper. `bootstrap_and_install_user_service` then supplies the one-action
+macOS preview boundary. The separate `init`, `join`, `configure-xray`, and `service` commands remain
+diagnostic and packaging primitives; friends do not need to run them.
 
 Each implementation phase must leave affected applications buildable, update its authoritative
 documentation, and end in a focused commit.

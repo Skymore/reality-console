@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use node_host::{
-    bootstrap, configure_xray, initialize, join, run, status, sync_once, BootstrapRequest,
-    HostStatus, SyncLoopOptions,
+    bootstrap, bootstrap_and_install_user_service, configure_xray, initialize,
+    install_user_service, join, remove_user_service, run, status, sync_once, user_service_status,
+    BackgroundServiceStatus, BootstrapRequest, HostStatus, SyncLoopOptions,
+    UserServiceInstallRequest,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -42,6 +44,12 @@ enum Command {
         /// Enables one finite TCP router mapping after the disclosure is accepted.
         #[arg(long)]
         accept_router_mapping: bool,
+        /// Registers the enrolled host as the current user's macOS `LaunchAgent`.
+        #[arg(long)]
+        install_user_service: bool,
+        /// Explicit installed Node Host agent path; defaults to this executable.
+        #[arg(long, requires = "install_user_service")]
+        agent_binary_path: Option<PathBuf>,
     },
     /// Initialize persistent node-host state.
     Init {
@@ -112,6 +120,28 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         max_backoff_seconds: u64,
     },
+    /// Manage the preview current-user macOS background service.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Register and start an already-enrolled Node Host.
+    Install {
+        /// Persistent state directory for the enrolled Node Host.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Explicit installed Node Host path; defaults to this executable.
+        #[arg(long)]
+        agent_binary_path: Option<PathBuf>,
+    },
+    /// Print safe launchd registration state.
+    Status,
+    /// Stop and unregister the service while retaining identity and state.
+    Remove,
 }
 
 #[tokio::main]
@@ -126,6 +156,8 @@ async fn main() -> Result<()> {
             accept_host_owner,
             accept_exit_ip,
             accept_router_mapping,
+            install_user_service,
+            agent_binary_path,
         } => {
             let request = BootstrapRequest::from_invitation_file(
                 &invitation_file,
@@ -136,7 +168,19 @@ async fn main() -> Result<()> {
                 accept_exit_ip,
                 accept_router_mapping,
             )?;
-            bootstrap(&data_dir, request).await?
+            if install_user_service {
+                let agent_binary_path = agent_binary_path.map_or_else(std::env::current_exe, Ok)?;
+                let outcome = bootstrap_and_install_user_service(
+                    &data_dir,
+                    request,
+                    &UserServiceInstallRequest::new(agent_binary_path),
+                )
+                .await?;
+                print_service_status(&outcome.service);
+                outcome.host
+            } else {
+                bootstrap(&data_dir, request).await?
+            }
         }
         Command::Init {
             data_dir,
@@ -184,9 +228,40 @@ async fn main() -> Result<()> {
             .await?;
             return Ok(());
         }
+        Command::Service { command } => {
+            handle_service_command(command).await?;
+            return Ok(());
+        }
     };
     print_status(&status);
     Ok(())
+}
+
+async fn handle_service_command(command: ServiceCommand) -> Result<()> {
+    let service = match command {
+        ServiceCommand::Install {
+            data_dir,
+            agent_binary_path,
+        } => {
+            let agent_binary_path = agent_binary_path.map_or_else(std::env::current_exe, Ok)?;
+            install_user_service(
+                &data_dir,
+                &UserServiceInstallRequest::new(agent_binary_path),
+            )
+            .await?
+        }
+        ServiceCommand::Status => user_service_status().await?,
+        ServiceCommand::Remove => remove_user_service().await?,
+    };
+    print_service_status(&service);
+    Ok(())
+}
+
+fn print_service_status(status: &BackgroundServiceStatus) {
+    println!("service_platform: {}", status.platform);
+    println!("service_label: {}", status.label);
+    println!("service_installed: {}", status.installed);
+    println!("service_loaded: {}", status.loaded);
 }
 
 fn init_logging() {

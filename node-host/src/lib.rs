@@ -2,6 +2,9 @@
 
 mod activation;
 mod admission;
+mod background;
+#[cfg(target_os = "macos")]
+mod background_macos;
 mod bootstrap;
 mod enrollment;
 mod mapping;
@@ -349,7 +352,13 @@ const MIGRATION_10: &str = "
     ADD COLUMN last_mapping_attempt_at INTEGER;
 ";
 
-pub use bootstrap::{bootstrap, BootstrapRequest};
+pub use background::{
+    install_user_service, remove_user_service, user_service_status, BackgroundServiceStatus,
+    UserServiceInstallRequest, USER_SERVICE_LABEL,
+};
+pub use bootstrap::{
+    bootstrap, bootstrap_and_install_user_service, BootstrapRequest, BootstrapServiceOutcome,
+};
 pub use enrollment::join;
 pub use mapping::{RouterMappingState, RouterMappingStatus};
 pub use service::{run, run_until, SyncLoopOptions};
