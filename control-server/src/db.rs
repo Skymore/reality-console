@@ -10,15 +10,21 @@ use crate::probe::{
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use control_protocol::account::{
+    AccountMetadata, AccountNodeAssignment, AccountNodeAssignmentStatus,
+    AccountNodeProvisioningState, AccountStatus, AccountSummary, CreateAccountRequest,
+    ReplaceAccountNodesRequest,
+};
 use control_protocol::crypto::{Ed25519PublicKey, Sha256Digest};
 use control_protocol::enrollment::{
     enrollment_request_transcript, enrollment_response_transcript, verify_enrollment_proof,
     EnrollmentCryptoError, EnrollmentInvitation,
 };
 use control_protocol::id::{
-    ControllerInstanceId, EndpointId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision,
-    SequenceNumber, SigningKeyId, Timestamp,
+    AssignmentId, ControllerInstanceId, CredentialId, EndpointId, NetworkId, NodeId,
+    NodeInvitationId, NodeKeyId, Revision, SequenceNumber, SigningKeyId, Timestamp, UserId,
 };
+use control_protocol::idempotency::IdempotencyKey;
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate, EndpointMode,
     EndpointReadiness, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
@@ -36,7 +42,7 @@ use fs2::FileExt;
 use rand_core::{OsRng, RngCore as _};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -47,10 +53,14 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
+const IDEMPOTENCY_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
+const BOOTSTRAP_ADMIN_PRINCIPAL: &str = "bootstrap-admin";
+const CREATE_ACCOUNT_ROUTE_ID: &str = "v1.admin.accounts.create";
+const HTTP_CREATED_STATUS: i64 = 201;
 const NODE_REQUEST_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 
 const MIGRATION_1_SQL: &str = r"
@@ -632,6 +642,125 @@ BEGIN
 END;
 ";
 
+const MIGRATION_9_SQL: &str = r"
+CREATE TABLE users (
+    network_id TEXT NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+    display_name TEXT NOT NULL CHECK(length(display_name) BETWEEN 1 AND 128),
+    status TEXT NOT NULL CHECK(status IN ('active', 'disabled', 'deleted')),
+    credential_version INTEGER NOT NULL DEFAULT 1 CHECK(credential_version > 0),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    disabled_at INTEGER,
+    deleted_at INTEGER,
+    PRIMARY KEY(network_id, user_id),
+    CHECK(updated_at >= created_at),
+    CHECK(
+        (status = 'active' AND disabled_at IS NULL AND deleted_at IS NULL)
+        OR (status = 'disabled' AND disabled_at IS NOT NULL AND deleted_at IS NULL)
+        OR (status = 'deleted' AND deleted_at IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE user_node_assignments (
+    network_id TEXT NOT NULL,
+    assignment_id TEXT NOT NULL CHECK(length(assignment_id) = 36),
+    user_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('enabled', 'disabled', 'deleted')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    disabled_at INTEGER,
+    deleted_at INTEGER,
+    PRIMARY KEY(network_id, assignment_id),
+    UNIQUE(network_id, user_id, node_id),
+    UNIQUE(network_id, assignment_id, user_id, node_id),
+    CHECK(updated_at >= created_at),
+    CHECK(
+        (status = 'enabled' AND disabled_at IS NULL AND deleted_at IS NULL)
+        OR (status = 'disabled' AND disabled_at IS NOT NULL AND deleted_at IS NULL)
+        OR (status = 'deleted' AND deleted_at IS NOT NULL)
+    ),
+    FOREIGN KEY(network_id, user_id)
+        REFERENCES users(network_id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE user_node_credentials (
+    network_id TEXT NOT NULL,
+    credential_id TEXT NOT NULL CHECK(length(credential_id) = 36),
+    assignment_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    xray_email TEXT NOT NULL CHECK(length(xray_email) BETWEEN 1 AND 128),
+    vless_uuid TEXT NOT NULL CHECK(length(vless_uuid) = 36),
+    version INTEGER NOT NULL CHECK(version > 0),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'active', 'retiring', 'revoked')),
+    created_at INTEGER NOT NULL,
+    activated_at INTEGER,
+    retire_after INTEGER,
+    revoked_at INTEGER,
+    PRIMARY KEY(network_id, credential_id),
+    UNIQUE(network_id, assignment_id, version),
+    UNIQUE(network_id, node_id, xray_email),
+    UNIQUE(network_id, node_id, vless_uuid),
+    CHECK(
+        (status = 'pending' AND activated_at IS NULL
+            AND retire_after IS NULL AND revoked_at IS NULL)
+        OR (status = 'active' AND activated_at IS NOT NULL
+            AND retire_after IS NULL AND revoked_at IS NULL)
+        OR (status = 'retiring' AND activated_at IS NOT NULL
+            AND retire_after IS NOT NULL AND revoked_at IS NULL)
+        OR (status = 'revoked' AND retire_after IS NULL AND revoked_at IS NOT NULL)
+    ),
+    CHECK(activated_at IS NULL OR activated_at >= created_at),
+    CHECK(retire_after IS NULL OR retire_after > activated_at),
+    CHECK(revoked_at IS NULL OR revoked_at >= created_at),
+    CHECK(activated_at IS NULL OR revoked_at IS NULL OR revoked_at >= activated_at),
+    FOREIGN KEY(network_id, assignment_id, user_id, node_id)
+        REFERENCES user_node_assignments(network_id, assignment_id, user_id, node_id)
+        ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE idempotency_records (
+    network_id TEXT NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+    principal_type TEXT NOT NULL CHECK(length(principal_type) BETWEEN 1 AND 64),
+    principal_id TEXT NOT NULL CHECK(length(principal_id) BETWEEN 1 AND 128),
+    route_id TEXT NOT NULL CHECK(length(route_id) BETWEEN 1 AND 128),
+    idempotency_key_sha256 BLOB NOT NULL CHECK(length(idempotency_key_sha256) = 32),
+    request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+    state TEXT NOT NULL CHECK(state IN ('in_progress', 'completed')),
+    response_status INTEGER CHECK(response_status BETWEEN 100 AND 599),
+    response_json TEXT CHECK(
+        response_json IS NULL OR (json_valid(response_json) AND length(response_json) <= 65536)
+    ),
+    response_sha256 BLOB CHECK(response_sha256 IS NULL OR length(response_sha256) = 32),
+    created_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY(
+        network_id, principal_type, principal_id, route_id, idempotency_key_sha256
+    ),
+    CHECK(expires_at > created_at),
+    CHECK(
+        (state = 'in_progress' AND response_status IS NULL
+            AND response_json IS NULL AND response_sha256 IS NULL
+            AND completed_at IS NULL)
+        OR (state = 'completed' AND response_status IS NOT NULL
+            AND response_json IS NOT NULL AND response_sha256 IS NOT NULL
+            AND completed_at IS NOT NULL AND completed_at >= created_at)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX user_node_assignments_user_status
+    ON user_node_assignments(network_id, user_id, status, node_id);
+CREATE INDEX user_node_credentials_node_status
+    ON user_node_credentials(network_id, node_id, status, user_id);
+CREATE INDEX idempotency_records_expiry
+    ON idempotency_records(network_id, expires_at);
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -678,6 +807,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "endpoint_tcp_probe_attempts",
         sql: MIGRATION_8_SQL,
+    },
+    Migration {
+        version: 9,
+        name: "member_accounts_and_assignments",
+        sql: MIGRATION_9_SQL,
     },
 ];
 
@@ -834,6 +968,84 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
             load_nodes(&guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Creates one active logical member account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when validation, clock, worker, or durable
+    /// storage fails.
+    pub async fn create_account(
+        &self,
+        request: CreateAccountRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<AccountSummary, DatabaseError> {
+        request.validate()?;
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            create_account(&mut guard.connection, &request, &idempotency_key)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Loads safe account and assignment summaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] for worker, storage, or stored-value failures.
+    pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            load_accounts(&guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Atomically replaces the complete enabled node set for one account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when the account or node is unavailable, the
+    /// lifecycle conflicts, credential generation is exhausted, or storage
+    /// fails.
+    pub async fn replace_account_nodes(
+        &self,
+        user_id: UserId,
+        request: ReplaceAccountNodesRequest,
+    ) -> Result<AccountSummary, DatabaseError> {
+        request.validate()?;
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            replace_account_nodes(&mut guard.connection, user_id, &request)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Applies an explicit account lifecycle transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when the account is unknown, a deleted account
+    /// would be restored, credential generation is exhausted, or storage fails.
+    pub async fn set_account_status(
+        &self,
+        user_id: UserId,
+        status: AccountStatus,
+    ) -> Result<AccountSummary, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            set_account_status(&mut guard.connection, user_id, status)
         })
         .await
         .map_err(DatabaseError::Worker)?
@@ -3225,6 +3437,742 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
     Ok(summaries)
 }
 
+fn create_account(
+    connection: &mut Connection,
+    request: &CreateAccountRequest,
+    idempotency_key: &IdempotencyKey,
+) -> Result<AccountSummary, DatabaseError> {
+    request.validate()?;
+    let now = unix_timestamp()?;
+    let expires_at = now
+        .checked_add(IDEMPOTENCY_LIFETIME_SECONDS)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let idempotency_key_sha256: [u8; 32] =
+        Sha256::digest(idempotency_key.as_str().as_bytes()).into();
+    let request_sha256 = create_account_request_digest(request)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    if let Some(summary) = load_create_account_replay(
+        &transaction,
+        &network.network_id,
+        &idempotency_key_sha256,
+        &request_sha256,
+    )? {
+        transaction.commit()?;
+        return Ok(summary);
+    }
+
+    let user_id = UserId::new();
+    let user_id_text = user_id.to_string();
+    transaction.execute(
+        "INSERT INTO users(
+            network_id, user_id, display_name, status, credential_version,
+            created_at, updated_at
+         ) VALUES (?1, ?2, ?3, 'active', 1, ?4, ?4)",
+        params![network.network_id, user_id_text, request.display_name, now,],
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "bootstrap-admin",
+        None,
+        "account.created",
+        "account",
+        Some(&user_id_text),
+        "success",
+        &serde_json::json!({
+            "displayName": request.display_name,
+            "idempotencyKeyHash": Sha256Digest::from_bytes(idempotency_key_sha256),
+        }),
+        now,
+    )?;
+    let summary = load_account(&transaction, &network.network_id, user_id)?;
+    let response_json = serde_json::to_string(&summary)?;
+    let response_sha256: [u8; 32] = Sha256::digest(response_json.as_bytes()).into();
+    transaction.execute(
+        "INSERT INTO idempotency_records(
+            network_id, principal_type, principal_id, route_id,
+            idempotency_key_sha256, request_sha256, state, response_status,
+            response_json, response_sha256, created_at, completed_at, expires_at
+         ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, 'completed', ?6, ?7, ?8, ?9, ?9, ?10)",
+        params![
+            network.network_id,
+            BOOTSTRAP_ADMIN_PRINCIPAL,
+            CREATE_ACCOUNT_ROUTE_ID,
+            idempotency_key_sha256.as_slice(),
+            request_sha256.as_slice(),
+            HTTP_CREATED_STATUS,
+            response_json,
+            response_sha256.as_slice(),
+            now,
+            expires_at,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(summary)
+}
+
+fn load_create_account_replay(
+    connection: &Connection,
+    network_id: &str,
+    idempotency_key_sha256: &[u8; 32],
+    request_sha256: &[u8; 32],
+) -> Result<Option<AccountSummary>, DatabaseError> {
+    let existing = connection
+        .query_row(
+            "SELECT request_sha256, state, response_status, response_json, response_sha256
+             FROM idempotency_records
+             WHERE network_id = ?1 AND principal_type = 'bootstrap-admin'
+               AND principal_id = 'bootstrap-admin' AND route_id = ?2
+               AND idempotency_key_sha256 = ?3",
+            params![
+                network_id,
+                CREATE_ACCOUNT_ROUTE_ID,
+                idempotency_key_sha256.as_slice()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_request, state, status, response_json, stored_response_digest)) = existing
+    else {
+        return Ok(None);
+    };
+    if stored_request.as_slice() != request_sha256 {
+        return Err(DatabaseError::IdempotencyKeyConflict);
+    }
+    let (Some(status), Some(response_json), Some(stored_response_digest)) =
+        (status, response_json, stored_response_digest)
+    else {
+        return Err(DatabaseError::StoredProtocolValue);
+    };
+    let response_digest: [u8; 32] = Sha256::digest(response_json.as_bytes()).into();
+    if state != "completed"
+        || status != HTTP_CREATED_STATUS
+        || stored_response_digest.as_slice() != response_digest
+    {
+        return Err(DatabaseError::StoredProtocolValue);
+    }
+    Ok(Some(serde_json::from_str(&response_json)?))
+}
+
+fn create_account_request_digest(
+    request: &CreateAccountRequest,
+) -> Result<[u8; 32], DatabaseError> {
+    let body = serde_json::to_vec(request)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"private-network-idempotency-v1\0");
+    hasher.update(BOOTSTRAP_ADMIN_PRINCIPAL.as_bytes());
+    hasher.update(b"\0POST\0/v1/admin/accounts\0");
+    hasher.update(body);
+    Ok(hasher.finalize().into())
+}
+
+fn load_accounts(connection: &Connection) -> Result<Vec<AccountSummary>, DatabaseError> {
+    let network = load_network(connection)?;
+    let mut statement = connection.prepare(
+        "SELECT user_id FROM users
+         WHERE network_id = ?1 ORDER BY created_at ASC, user_id ASC",
+    )?;
+    let user_ids = statement
+        .query_map([&network.network_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    user_ids
+        .into_iter()
+        .map(|value| {
+            let user_id = value
+                .parse::<UserId>()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?;
+            load_account(connection, &network.network_id, user_id)
+        })
+        .collect()
+}
+
+fn load_account(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+) -> Result<AccountSummary, DatabaseError> {
+    let stored = connection
+        .query_row(
+            "SELECT display_name, status, created_at, updated_at
+             FROM users WHERE network_id = ?1 AND user_id = ?2",
+            params![network_id, user_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::AccountNotFound)?;
+    let mut statement = connection.prepare(
+        "SELECT assignment.assignment_id, assignment.node_id, assignment.status,
+                CASE
+                    WHEN (?3 != 'active' OR assignment.status != 'enabled')
+                         AND EXISTS(
+                            SELECT 1 FROM user_node_credentials AS credential
+                            WHERE credential.network_id = assignment.network_id
+                              AND credential.assignment_id = assignment.assignment_id
+                              AND credential.activated_at IS NOT NULL
+                         ) THEN 'removal_pending'
+                    WHEN ?3 != 'active' OR assignment.status != 'enabled'
+                        THEN 'not_provisioned'
+                    WHEN EXISTS(
+                        SELECT 1 FROM user_node_credentials AS credential
+                        WHERE credential.network_id = assignment.network_id
+                          AND credential.assignment_id = assignment.assignment_id
+                          AND credential.status = 'active'
+                    ) THEN 'applied'
+                    ELSE 'pending'
+                END
+         FROM user_node_assignments AS assignment
+         WHERE assignment.network_id = ?1 AND assignment.user_id = ?2
+         ORDER BY assignment.node_id ASC",
+    )?;
+    let assignments = statement
+        .query_map(
+            params![network_id, user_id.to_string(), stored.1.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?
+        .map(|row| {
+            let (assignment_id, node_id, status, provisioning_state) = row?;
+            Ok(AccountNodeAssignment {
+                assignment_id: assignment_id
+                    .parse::<AssignmentId>()
+                    .map_err(|_| DatabaseError::StoredProtocolValue)?,
+                node_id: node_id
+                    .parse::<NodeId>()
+                    .map_err(|_| DatabaseError::StoredProtocolValue)?,
+                status: parse_assignment_status(&status)?,
+                provisioning_state: parse_assignment_provisioning_state(&provisioning_state)?,
+            })
+        })
+        .collect::<Result<Vec<_>, DatabaseError>>()?;
+    Ok(AccountSummary {
+        account: AccountMetadata {
+            user_id,
+            display_name: stored.0,
+            status: parse_account_status(&stored.1)?,
+        },
+        assignments,
+        created_at: timestamp(stored.2)?,
+        updated_at: timestamp(stored.3)?,
+    })
+}
+
+fn replace_account_nodes(
+    connection: &mut Connection,
+    user_id: UserId,
+    request: &ReplaceAccountNodesRequest,
+) -> Result<AccountSummary, DatabaseError> {
+    request.validate()?;
+    let now = unix_timestamp()?;
+    let retire_after = now
+        .checked_add(3_600)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let account_status = load_account_status(&transaction, &network.network_id, user_id)?;
+    if account_status != "active" {
+        return Err(DatabaseError::AccountLifecycleConflict {
+            current_status: account_status,
+            requested_status: "replace-nodes".to_string(),
+        });
+    }
+
+    let requested = request.node_ids.iter().copied().collect::<BTreeSet<_>>();
+    validate_assignment_nodes(&transaction, &network.network_id, &requested)?;
+    let existing = load_stored_assignments(&transaction, &network.network_id, user_id)?;
+    let enabled_changed = enable_requested_assignments(
+        &transaction,
+        &network.network_id,
+        user_id,
+        &requested,
+        &existing,
+        now,
+    )?;
+    let disabled_changed = disable_omitted_assignments(
+        &transaction,
+        &network.network_id,
+        &requested,
+        &existing,
+        now,
+        retire_after,
+    )?;
+    let changed = enabled_changed || disabled_changed;
+    if changed {
+        transaction.execute(
+            "UPDATE users SET updated_at = ?1 WHERE network_id = ?2 AND user_id = ?3",
+            params![now, network.network_id, user_id.to_string()],
+        )?;
+    }
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "bootstrap-admin",
+        None,
+        "account.nodes-replaced",
+        "account",
+        Some(&user_id.to_string()),
+        "success",
+        &serde_json::json!({ "nodeCount": requested.len(), "changed": changed }),
+        now,
+    )?;
+    let summary = load_account(&transaction, &network.network_id, user_id)?;
+    transaction.commit()?;
+    Ok(summary)
+}
+
+fn enable_requested_assignments(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+    requested: &BTreeSet<NodeId>,
+    existing: &BTreeMap<NodeId, StoredAssignment>,
+    now: i64,
+) -> Result<bool, DatabaseError> {
+    let mut changed = false;
+    for node_id in requested {
+        match existing.get(node_id) {
+            None => {
+                let assignment_id = AssignmentId::new();
+                connection.execute(
+                    "INSERT INTO user_node_assignments(
+                        network_id, assignment_id, user_id, node_id, status,
+                        created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'enabled', ?5, ?5)",
+                    params![
+                        network_id,
+                        assignment_id.to_string(),
+                        user_id.to_string(),
+                        node_id.to_string(),
+                        now,
+                    ],
+                )?;
+                issue_assignment_credential(
+                    connection,
+                    network_id,
+                    assignment_id,
+                    user_id,
+                    *node_id,
+                    now,
+                )?;
+                changed = true;
+            }
+            Some(assignment) if assignment.status == "disabled" => {
+                revoke_assignment_credentials(
+                    connection,
+                    network_id,
+                    assignment.assignment_id,
+                    now,
+                )?;
+                connection.execute(
+                    "UPDATE user_node_assignments
+                     SET status = 'enabled', disabled_at = NULL, updated_at = ?1
+                     WHERE network_id = ?2 AND assignment_id = ?3 AND status = 'disabled'",
+                    params![now, network_id, assignment.assignment_id.to_string()],
+                )?;
+                issue_assignment_credential(
+                    connection,
+                    network_id,
+                    assignment.assignment_id,
+                    user_id,
+                    *node_id,
+                    now,
+                )?;
+                changed = true;
+            }
+            Some(assignment) if assignment.status == "enabled" => {}
+            Some(assignment) => {
+                return Err(DatabaseError::AccountAssignmentConflict {
+                    node_id: *node_id,
+                    current_status: assignment.status.clone(),
+                });
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn disable_omitted_assignments(
+    connection: &Connection,
+    network_id: &str,
+    requested: &BTreeSet<NodeId>,
+    existing: &BTreeMap<NodeId, StoredAssignment>,
+    now: i64,
+    retire_after: i64,
+) -> Result<bool, DatabaseError> {
+    let mut changed = false;
+    for (node_id, assignment) in existing {
+        if assignment.status == "enabled" && !requested.contains(node_id) {
+            disable_assignment(
+                connection,
+                network_id,
+                assignment.assignment_id,
+                now,
+                retire_after,
+            )?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+#[derive(Clone)]
+struct StoredAssignment {
+    assignment_id: AssignmentId,
+    status: String,
+}
+
+fn load_stored_assignments(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+) -> Result<BTreeMap<NodeId, StoredAssignment>, DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT assignment_id, node_id, status FROM user_node_assignments
+         WHERE network_id = ?1 AND user_id = ?2",
+    )?;
+    let rows = statement.query_map(params![network_id, user_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut assignments = BTreeMap::new();
+    for row in rows {
+        let (assignment_id, node_id, status) = row?;
+        assignments.insert(
+            node_id
+                .parse::<NodeId>()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            StoredAssignment {
+                assignment_id: assignment_id
+                    .parse::<AssignmentId>()
+                    .map_err(|_| DatabaseError::StoredProtocolValue)?,
+                status,
+            },
+        );
+    }
+    Ok(assignments)
+}
+
+fn validate_assignment_nodes(
+    connection: &Connection,
+    network_id: &str,
+    node_ids: &BTreeSet<NodeId>,
+) -> Result<(), DatabaseError> {
+    for node_id in node_ids {
+        let status = connection
+            .query_row(
+                "SELECT status FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+                params![network_id, node_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or(DatabaseError::NodeNotFound)?;
+        if status != "active" {
+            return Err(DatabaseError::NodeUnavailableForAssignment {
+                node_id: *node_id,
+                current_status: status,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn issue_assignment_credential(
+    connection: &Connection,
+    network_id: &str,
+    assignment_id: AssignmentId,
+    user_id: UserId,
+    node_id: NodeId,
+    now: i64,
+) -> Result<CredentialId, DatabaseError> {
+    let previous_version: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM user_node_credentials
+         WHERE network_id = ?1 AND assignment_id = ?2",
+        params![network_id, assignment_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let version = previous_version
+        .checked_add(1)
+        .ok_or(DatabaseError::CredentialVersionOverflow)?;
+    let credential_id = CredentialId::new();
+    let xray_email = format!("{user_id}.{credential_id}@member");
+    connection.execute(
+        "INSERT INTO user_node_credentials(
+            network_id, credential_id, assignment_id, user_id, node_id,
+            xray_email, vless_uuid, version, status, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)",
+        params![
+            network_id,
+            credential_id.to_string(),
+            assignment_id.to_string(),
+            user_id.to_string(),
+            node_id.to_string(),
+            xray_email,
+            Uuid::new_v4().hyphenated().to_string(),
+            version,
+            now,
+        ],
+    )?;
+    Ok(credential_id)
+}
+
+fn revoke_assignment_credentials(
+    connection: &Connection,
+    network_id: &str,
+    assignment_id: AssignmentId,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    connection.execute(
+        "UPDATE user_node_credentials
+         SET status = 'revoked', revoked_at = ?1, retire_after = NULL
+         WHERE network_id = ?2 AND assignment_id = ?3 AND status != 'revoked'",
+        params![now, network_id, assignment_id.to_string()],
+    )?;
+    Ok(())
+}
+
+fn disable_assignment(
+    connection: &Connection,
+    network_id: &str,
+    assignment_id: AssignmentId,
+    now: i64,
+    retire_after: i64,
+) -> Result<(), DatabaseError> {
+    connection.execute(
+        "UPDATE user_node_assignments
+         SET status = 'disabled', disabled_at = ?1, updated_at = ?1
+         WHERE network_id = ?2 AND assignment_id = ?3 AND status = 'enabled'",
+        params![now, network_id, assignment_id.to_string()],
+    )?;
+    connection.execute(
+        "UPDATE user_node_credentials
+         SET status = CASE WHEN status = 'pending' THEN 'revoked' ELSE 'retiring' END,
+             retire_after = CASE WHEN status = 'pending' THEN NULL ELSE ?1 END,
+             revoked_at = CASE WHEN status = 'pending' THEN ?2 ELSE NULL END
+         WHERE network_id = ?3 AND assignment_id = ?4
+           AND status IN ('pending', 'active')",
+        params![retire_after, now, network_id, assignment_id.to_string()],
+    )?;
+    Ok(())
+}
+
+fn set_account_status(
+    connection: &mut Connection,
+    user_id: UserId,
+    requested: AccountStatus,
+) -> Result<AccountSummary, DatabaseError> {
+    let now = unix_timestamp()?;
+    let retire_after = now
+        .checked_add(3_600)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let current = load_account_status(&transaction, &network.network_id, user_id)?;
+    let requested_wire = enum_wire(&requested)?;
+    if current == "deleted" && requested_wire != "deleted" {
+        return Err(DatabaseError::AccountLifecycleConflict {
+            current_status: current,
+            requested_status: requested_wire,
+        });
+    }
+    let changed = current != requested_wire;
+    if changed {
+        apply_account_status_transition(
+            &transaction,
+            &network.network_id,
+            user_id,
+            requested,
+            now,
+            retire_after,
+        )?;
+    }
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "bootstrap-admin",
+        None,
+        "account.status-changed",
+        "account",
+        Some(&user_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "fromStatus": current,
+            "toStatus": requested_wire,
+            "changed": changed,
+        }),
+        now,
+    )?;
+    let summary = load_account(&transaction, &network.network_id, user_id)?;
+    transaction.commit()?;
+    Ok(summary)
+}
+
+fn load_account_status(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+) -> Result<String, DatabaseError> {
+    connection
+        .query_row(
+            "SELECT status FROM users WHERE network_id = ?1 AND user_id = ?2",
+            params![network_id, user_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::AccountNotFound)
+}
+
+fn apply_account_status_transition(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+    requested: AccountStatus,
+    now: i64,
+    retire_after: i64,
+) -> Result<(), DatabaseError> {
+    match requested {
+        AccountStatus::Active => reactivate_account(connection, network_id, user_id, now),
+        AccountStatus::Disabled => {
+            connection.execute(
+                "UPDATE users
+                 SET status = 'disabled', credential_version = credential_version + 1,
+                     disabled_at = ?1, deleted_at = NULL, updated_at = ?1
+                 WHERE network_id = ?2 AND user_id = ?3",
+                params![now, network_id, user_id.to_string()],
+            )?;
+            let assignments = load_stored_assignments(connection, network_id, user_id)?;
+            for assignment in assignments.values() {
+                if assignment.status == "enabled" {
+                    connection.execute(
+                        "UPDATE user_node_credentials
+                         SET status = CASE
+                                WHEN status = 'pending' THEN 'revoked' ELSE 'retiring' END,
+                             retire_after = CASE
+                                WHEN status = 'pending' THEN NULL ELSE ?1 END,
+                             revoked_at = CASE
+                                WHEN status = 'pending' THEN ?2 ELSE NULL END
+                         WHERE network_id = ?3 AND assignment_id = ?4
+                           AND status IN ('pending', 'active')",
+                        params![
+                            retire_after,
+                            now,
+                            network_id,
+                            assignment.assignment_id.to_string()
+                        ],
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        AccountStatus::Deleted => {
+            connection.execute(
+                "UPDATE users
+                 SET status = 'deleted', credential_version = credential_version + 1,
+                     disabled_at = COALESCE(disabled_at, ?1), deleted_at = ?1, updated_at = ?1
+                 WHERE network_id = ?2 AND user_id = ?3",
+                params![now, network_id, user_id.to_string()],
+            )?;
+            connection.execute(
+                "UPDATE user_node_assignments
+                 SET status = 'deleted', deleted_at = ?1,
+                     disabled_at = COALESCE(disabled_at, ?1), updated_at = ?1
+                 WHERE network_id = ?2 AND user_id = ?3 AND status != 'deleted'",
+                params![now, network_id, user_id.to_string()],
+            )?;
+            connection.execute(
+                "UPDATE user_node_credentials
+                 SET status = 'revoked', revoked_at = ?1, retire_after = NULL
+                 WHERE network_id = ?2 AND user_id = ?3 AND status != 'revoked'",
+                params![now, network_id, user_id.to_string()],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn reactivate_account(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    connection.execute(
+        "UPDATE users
+         SET status = 'active', disabled_at = NULL, deleted_at = NULL, updated_at = ?1
+         WHERE network_id = ?2 AND user_id = ?3 AND status = 'disabled'",
+        params![now, network_id, user_id.to_string()],
+    )?;
+    let assignments = load_stored_assignments(connection, network_id, user_id)?;
+    for (node_id, assignment) in assignments {
+        if assignment.status == "enabled" {
+            revoke_assignment_credentials(connection, network_id, assignment.assignment_id, now)?;
+            issue_assignment_credential(
+                connection,
+                network_id,
+                assignment.assignment_id,
+                user_id,
+                node_id,
+                now,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_account_status(value: &str) -> Result<AccountStatus, DatabaseError> {
+    match value {
+        "active" => Ok(AccountStatus::Active),
+        "disabled" => Ok(AccountStatus::Disabled),
+        "deleted" => Ok(AccountStatus::Deleted),
+        _ => Err(DatabaseError::StoredProtocolValue),
+    }
+}
+
+fn parse_assignment_status(value: &str) -> Result<AccountNodeAssignmentStatus, DatabaseError> {
+    match value {
+        "enabled" => Ok(AccountNodeAssignmentStatus::Enabled),
+        "disabled" => Ok(AccountNodeAssignmentStatus::Disabled),
+        "deleted" => Ok(AccountNodeAssignmentStatus::Deleted),
+        _ => Err(DatabaseError::StoredProtocolValue),
+    }
+}
+
+fn parse_assignment_provisioning_state(
+    value: &str,
+) -> Result<AccountNodeProvisioningState, DatabaseError> {
+    match value {
+        "pending" => Ok(AccountNodeProvisioningState::Pending),
+        "applied" => Ok(AccountNodeProvisioningState::Applied),
+        "removal_pending" => Ok(AccountNodeProvisioningState::RemovalPending),
+        "not_provisioned" => Ok(AccountNodeProvisioningState::NotProvisioned),
+        _ => Err(DatabaseError::StoredProtocolValue),
+    }
+}
+
 fn transition_node(
     connection: &mut Connection,
     node_id: NodeId,
@@ -3287,7 +4235,11 @@ fn transition_node(
 
     let credentials_revoked =
         revoke_node_credentials(&transaction, &network.network_id, &node_id, action, now)?;
-    if credentials_revoked > 0 && !status_changed {
+    let (member_assignments_closed, member_credentials_revoked) =
+        close_node_member_access(&transaction, &network.network_id, &node_id, action, now)?;
+    if (credentials_revoked > 0 || member_assignments_closed > 0 || member_credentials_revoked > 0)
+        && !status_changed
+    {
         transaction.execute(
             "UPDATE nodes SET updated_at = ?1 WHERE network_id = ?2 AND node_id = ?3",
             params![now, network.network_id, node_id],
@@ -3304,7 +4256,12 @@ fn transition_node(
             "action": action.wire_name(),
             "credentialsRevoked": credentials_revoked,
             "fromStatus": current_status,
-            "idempotent": !status_changed && credentials_revoked == 0,
+            "idempotent": !status_changed
+                && credentials_revoked == 0
+                && member_assignments_closed == 0
+                && member_credentials_revoked == 0,
+            "memberAssignmentsClosed": member_assignments_closed,
+            "memberCredentialsRevoked": member_credentials_revoked,
             "toStatus": target_status
         }),
         now,
@@ -3362,6 +4319,55 @@ fn revoke_node_credentials(
             params![now, network_id, node_id],
         )
         .map_err(DatabaseError::from)
+}
+
+fn close_node_member_access(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: &str,
+    action: NodeLifecycleAction,
+    now: i64,
+) -> Result<(usize, usize), DatabaseError> {
+    let assignment_filter = match action {
+        NodeLifecycleAction::Approve => return Ok((0, 0)),
+        NodeLifecycleAction::Disable => "status = 'enabled'",
+        NodeLifecycleAction::Revoke => "status != 'deleted'",
+    };
+    transaction.execute(
+        &format!(
+            "UPDATE users SET updated_at = ?1
+             WHERE network_id = ?2 AND EXISTS(
+                SELECT 1 FROM user_node_assignments AS assignment
+                WHERE assignment.network_id = users.network_id
+                  AND assignment.user_id = users.user_id
+                  AND assignment.node_id = ?3 AND {assignment_filter}
+             )"
+        ),
+        params![now, network_id, node_id],
+    )?;
+    let assignments_closed = match action {
+        NodeLifecycleAction::Approve => 0,
+        NodeLifecycleAction::Disable => transaction.execute(
+            "UPDATE user_node_assignments
+             SET status = 'disabled', disabled_at = ?1, updated_at = ?1
+             WHERE network_id = ?2 AND node_id = ?3 AND status = 'enabled'",
+            params![now, network_id, node_id],
+        )?,
+        NodeLifecycleAction::Revoke => transaction.execute(
+            "UPDATE user_node_assignments
+             SET status = 'deleted', disabled_at = COALESCE(disabled_at, ?1),
+                 deleted_at = ?1, updated_at = ?1
+             WHERE network_id = ?2 AND node_id = ?3 AND status != 'deleted'",
+            params![now, network_id, node_id],
+        )?,
+    };
+    let credentials_revoked = transaction.execute(
+        "UPDATE user_node_credentials
+         SET status = 'revoked', revoked_at = ?1, retire_after = NULL
+         WHERE network_id = ?2 AND node_id = ?3 AND status != 'revoked'",
+        params![now, network_id, node_id],
+    )?;
+    Ok((assignments_closed, credentials_revoked))
 }
 
 fn insert_node_lifecycle_audit(
@@ -4022,6 +5028,27 @@ pub enum DatabaseError {
     InvalidNodeRequestSignature,
     #[error("the node was not found")]
     NodeNotFound,
+    #[error("the member account was not found")]
+    AccountNotFound,
+    #[error("the idempotency key was already used for a different request")]
+    IdempotencyKeyConflict,
+    #[error("cannot change account from {current_status} to {requested_status}")]
+    AccountLifecycleConflict {
+        current_status: String,
+        requested_status: String,
+    },
+    #[error("node {node_id} in status {current_status} cannot be assigned")]
+    NodeUnavailableForAssignment {
+        node_id: NodeId,
+        current_status: String,
+    },
+    #[error("node {node_id} has a terminal assignment in status {current_status}")]
+    AccountAssignmentConflict {
+        node_id: NodeId,
+        current_status: String,
+    },
+    #[error("the per-assignment credential version sequence is exhausted")]
+    CredentialVersionOverflow,
     #[error("cannot {action} a node in status {current_status}")]
     NodeLifecycleConflict {
         action: &'static str,

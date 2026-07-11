@@ -61,6 +61,8 @@ pub enum ErrorCode {
     RollbackFailed,
     /// An ordered telemetry batch contains a gap.
     TelemetrySequenceGap,
+    /// An idempotency key was reused with a different canonical request.
+    IdempotencyKeyConflict,
     /// A request conflicts with current resource state.
     Conflict,
     /// The caller exceeded a configured request rate.
@@ -108,6 +110,7 @@ impl ErrorCode {
             Self::AdmissionUnhealthy => "admission_unhealthy",
             Self::RollbackFailed => "rollback_failed",
             Self::TelemetrySequenceGap => "telemetry_sequence_gap",
+            Self::IdempotencyKeyConflict => "idempotency_key_conflict",
             Self::Conflict => "conflict",
             Self::RateLimited => "rate_limited",
             Self::NotFound => "not_found",
@@ -145,6 +148,7 @@ impl ErrorCode {
             "admission_unhealthy" => Self::AdmissionUnhealthy,
             "rollback_failed" => Self::RollbackFailed,
             "telemetry_sequence_gap" => Self::TelemetrySequenceGap,
+            "idempotency_key_conflict" => Self::IdempotencyKeyConflict,
             "conflict" => Self::Conflict,
             "rate_limited" => Self::RateLimited,
             "not_found" => Self::NotFound,
@@ -261,5 +265,19 @@ mod tests {
                 code
             );
         }
+    }
+
+    #[test]
+    fn idempotency_conflict_has_a_stable_wire_value() {
+        let code = ErrorCode::IdempotencyKeyConflict;
+
+        assert_eq!(
+            serde_json::to_string(&code).unwrap(),
+            "\"idempotency_key_conflict\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ErrorCode>("\"idempotency_key_conflict\"").unwrap(),
+            code
+        );
     }
 }

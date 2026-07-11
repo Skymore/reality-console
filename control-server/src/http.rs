@@ -13,7 +13,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use control_protocol::id::{NodeId, Revision};
+use control_protocol::account::{
+    AccountSummary, CreateAccountRequest, ReplaceAccountNodesRequest, SetAccountStatusRequest,
+};
+use control_protocol::id::{NodeId, Revision, UserId};
+use control_protocol::idempotency::{IdempotencyKey, IDEMPOTENCY_KEY_HEADER};
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
     EnrollNodeResponse, NodeCapability, NodeHeartbeat, RevisionResult, SignedDesiredState,
@@ -61,6 +65,15 @@ pub fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/v1/admin/network", get(get_network))
         .route("/v1/admin/nodes", get(get_nodes))
+        .route("/v1/admin/accounts", get(get_accounts).post(create_account))
+        .route(
+            "/v1/admin/accounts/{user_id}/nodes",
+            put(replace_account_nodes),
+        )
+        .route(
+            "/v1/admin/accounts/{user_id}/status",
+            put(set_account_status),
+        )
         .route("/v1/admin/node-invitations", post(create_node_invitation))
         .route("/v1/admin/nodes/{node_id}/approve", post(approve_node))
         .route("/v1/admin/nodes/{node_id}/disable", post(disable_node))
@@ -320,8 +333,13 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::NodeNotFound | DatabaseError::RevisionTargetNotFound => {
             ApiError::not_found(request_id)
         }
+        DatabaseError::AccountNotFound => ApiError::not_found(request_id),
+        DatabaseError::IdempotencyKeyConflict => ApiError::idempotency_key_conflict(request_id),
         DatabaseError::RevisionResultConflict => ApiError::invalid_state_transition(request_id),
-        DatabaseError::NodeLifecycleConflict { .. } => ApiError::conflict(request_id),
+        DatabaseError::NodeLifecycleConflict { .. }
+        | DatabaseError::AccountLifecycleConflict { .. }
+        | DatabaseError::NodeUnavailableForAssignment { .. }
+        | DatabaseError::AccountAssignmentConflict { .. } => ApiError::conflict(request_id),
         other => {
             tracing::error!(request_id = %request_id, error = %other, "database request failed");
             ApiError::internal(request_id)
@@ -375,6 +393,12 @@ impl TryFrom<NetworkRecord> for NetworkResponse {
 #[serde(rename_all = "camelCase")]
 struct NodeListResponse {
     nodes: Vec<NodeSummaryResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountListResponse {
+    accounts: Vec<AccountSummary>,
 }
 
 #[derive(Serialize)]
@@ -491,6 +515,65 @@ async fn get_nodes(
     Ok(Json(NodeListResponse { nodes }))
 }
 
+async fn get_accounts(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<AccountListResponse>, ApiError> {
+    let accounts = state
+        .database
+        .list_accounts()
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(Json(AccountListResponse { accounts }))
+}
+
+async fn create_account(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(StatusCode, Json<AccountSummary>), ApiError> {
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
+    let request: CreateAccountRequest = parse_bounded_json(request, request_id).await?;
+    let account = state
+        .database
+        .create_account(request, idempotency_key)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok((StatusCode::CREATED, Json(account)))
+}
+
+async fn replace_account_nodes(
+    State(state): State<AppState>,
+    Path(path_user_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<Json<AccountSummary>, ApiError> {
+    let user_id = parse_user_id(&path_user_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    let request: ReplaceAccountNodesRequest = parse_bounded_json(request, request_id).await?;
+    let account = state
+        .database
+        .replace_account_nodes(user_id, request)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(Json(account))
+}
+
+async fn set_account_status(
+    State(state): State<AppState>,
+    Path(path_user_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<Json<AccountSummary>, ApiError> {
+    let user_id = parse_user_id(&path_user_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    let request: SetAccountStatusRequest = parse_bounded_json(request, request_id).await?;
+    let account = state
+        .database
+        .set_account_status(user_id, request.status)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(Json(account))
+}
+
 async fn publish_desired_state(
     State(state): State<AppState>,
     Path(path_node_id): Path<String>,
@@ -569,6 +652,24 @@ fn parse_node_id(value: &str) -> Option<NodeId> {
         return None;
     }
     value.parse().ok()
+}
+
+fn parse_user_id(value: &str) -> Option<UserId> {
+    if value.len() != CANONICAL_UUID_LENGTH {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn parse_idempotency_key(
+    headers: &HeaderMap,
+    request_id: RequestId,
+) -> Result<IdempotencyKey, ApiError> {
+    headers
+        .get(IDEMPOTENCY_KEY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| ApiError::validation_failed(request_id))
 }
 
 fn parse_revision(value: &str) -> Option<Revision> {

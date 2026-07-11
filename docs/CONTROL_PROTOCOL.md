@@ -364,8 +364,10 @@ revision to have reached `applied` with the same restored-config digest.
 
 ### Administrator account management
 
-- `POST /v1/admin/accounts` creates one logical account from a bounded display name. It returns no
-  password, VLESS UUID, refresh credential, or device key.
+- `POST /v1/admin/accounts` creates one logical account from a bounded display name and requires a
+  bounded `Idempotency-Key`. An exact retry returns the original `201` body; reusing the key with a
+  different request returns `idempotency_key_conflict`. It returns no password, VLESS UUID,
+  refresh credential, or device key.
 - `GET /v1/admin/accounts` returns safe account metadata and complete assignments sorted by node
   ID.
 - `PUT /v1/admin/accounts/{userId}/nodes` atomically replaces the enabled node set. The request is
@@ -379,7 +381,9 @@ revision to have reached `applied` with the same restored-config digest.
 
 Account mutations require administrator authentication, use canonical UUID paths, and write
 redacted audit events. A safe account summary contains only account identity, display name,
-lifecycle, assignment identity/node/status, and timestamps.
+lifecycle, assignment identity/node/status, provisioning state, and timestamps. Assignment status
+is authorization intent; `provisioningState` independently reports `pending`, `applied`,
+`removalPending`, or `notProvisioned` and must drive operator UI claims.
 
 ### Activate device
 
@@ -440,16 +444,17 @@ Every agent/client sends its semantic version and supported schema versions. The
 at least one previous schema during rolling upgrades. A node never applies unknown fields whose
 semantics affect security; it rejects incompatible required features with a stable error code.
 
-## 10. Initial Implementation Slice
+## 10. Current Implementation Slice
 
-The first executable slice implements:
+The executable Control Service includes health, node invitation/enrollment, replay-resistant node
+authentication, signed heartbeat status, immutable signed desired revisions, monotonic rollout
+results, node lifecycle controls, and controller-owned TCP preflight state. Account migration 9
+also implements administrator account creation/listing, terminal account lifecycle, atomic complete
+node-set replacement, stable assignments, durable account-creation idempotency, explicit
+provisioning state, and distinct pending per-node VLESS credentials.
 
-1. `GET /healthz`.
-2. Admin-authenticated node invitation creation.
-3. Atomic invitation consumption with proof-of-possession and node credential issuance.
-4. Authenticated, replay-resistant heartbeat.
-5. Desired-state fetch with `204` behavior.
-6. Temporary-database integration tests for expiry, one-time use, auth, and idempotency.
-
-Member accounts, bundles, telemetry, reachability, and relay are added in later phases without
-changing the enrollment ownership model.
+`pending` assignment credentials are control-plane intent only. Automatic desired-state
+reconciliation, apply-driven credential promotion/retirement, member activation and sessions,
+encrypted signed profile bundles, telemetry aggregation, protocol-aware endpoint verification, and
+relay remain later slices. Until reconciliation and protocol verification are implemented, account
+assignment APIs must not be presented as proof that a member can connect.

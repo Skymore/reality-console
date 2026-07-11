@@ -49,9 +49,15 @@ PCP, NAT-PMP, then UPnP order, renews and releases its owned lease, and withdraw
 change. Control Service now has a durable, lease-based external TCP preflight queue and a
 public-address-only executor with DNS pinning, bounded connection time, stale-candidate fencing,
 signed-public-port binding, and append-only results. Bare TCP success deliberately leaves endpoint
-verification `pending`; the VLESS + REALITY canary required for client publication remains under
-implementation, along with signed system-service installers, relay reachability, account
-synchronization, and the friend-facing setup UI/package.
+verification `pending`. Control Service migration 9 now owns durable member accounts, atomic
+multi-node assignments, per-node credential rotation, terminal account deletion, and node
+disable/revoke cleanup without exposing VLESS UUIDs through administrator APIs. Account creation is
+durably idempotent across concurrent retries and restarts, while assignment responses separate
+authorization intent from `pending`/`applied`/`removalPending` evidence. Credentials remain
+`pending` until automatic desired-state reconciliation and apply acknowledgement are built;
+the VLESS + REALITY canary required for client publication also remains under implementation, along
+with member sessions and signed bundles, signed system-service installers, relay reachability, and
+the friend-facing setup UI/package.
 
 The optional probe-worker contract is implemented and dry-run deployable. Control Service can now
 invoke it in explicit `remote-http` mode. Node Host also has a macOS private-preview user

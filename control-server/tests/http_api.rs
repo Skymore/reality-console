@@ -2,6 +2,9 @@ use axum::body::{Body, Bytes};
 use axum::http::{header, Request, StatusCode};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use control_protocol::account::{
+    AccountNodeAssignmentStatus, AccountNodeProvisioningState, AccountStatus, AccountSummary,
+};
 use control_protocol::crypto::{
     Ed25519PublicKey, Ed25519Signature, Nonce, Sha256Digest, X25519PublicKey,
 };
@@ -14,6 +17,7 @@ use control_protocol::id::{
     ControllerInstanceId, CredentialId, EndpointId, NodeId, NodeKeyId, Revision, SequenceNumber,
     Timestamp, UserId,
 };
+use control_protocol::idempotency::IDEMPOTENCY_KEY_HEADER;
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate, EndpointMode,
     EndpointReadiness, EndpointSource, EnrollNodeRequest, EnrollNodeResponse, NodeCapability,
@@ -218,6 +222,98 @@ async fn admin_nodes(app: &TestApp) -> axum::response::Response {
         )
         .await
         .unwrap()
+}
+
+async fn admin_json_request(
+    app: &TestApp,
+    method: &str,
+    uri: &str,
+    body: Value,
+) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn admin_accounts(app: &TestApp) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::get("/v1/admin/accounts")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn create_account(app: &TestApp, display_name: &str) -> AccountSummary {
+    let response = create_account_with_key(app, display_name, &Uuid::new_v4().to_string()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    serde_json::from_value(json(response).await).unwrap()
+}
+
+async fn create_account_with_key(
+    app: &TestApp,
+    display_name: &str,
+    idempotency_key: &str,
+) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::post("/v1/admin/accounts")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key)
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "displayName": display_name
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn replace_account_nodes(
+    app: &TestApp,
+    user_id: UserId,
+    node_ids: &[NodeId],
+) -> axum::response::Response {
+    admin_json_request(
+        app,
+        "PUT",
+        &format!("/v1/admin/accounts/{user_id}/nodes"),
+        serde_json::json!({ "nodeIds": node_ids }),
+    )
+    .await
+}
+
+async fn set_account_status(
+    app: &TestApp,
+    user_id: UserId,
+    status: AccountStatus,
+) -> axum::response::Response {
+    admin_json_request(
+        app,
+        "PUT",
+        &format!("/v1/admin/accounts/{user_id}/status"),
+        serde_json::json!({ "status": status }),
+    )
+    .await
 }
 
 fn assert_revoked_state_and_lifecycle_audit(app: &TestApp, node_id: NodeId) {
@@ -2463,6 +2559,606 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
 }
 
 #[tokio::test]
+async fn account_creation_requires_and_durably_replays_an_idempotency_key() {
+    let app = TestApp::new();
+    let missing = admin_json_request(
+        &app,
+        "POST",
+        "/v1/admin/accounts",
+        serde_json::json!({ "displayName": "Alice" }),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json(missing).await["error"]["code"], "validation_failed");
+
+    let key = Uuid::new_v4().to_string();
+    let (first, retry) = tokio::join!(
+        create_account_with_key(&app, "Alice", &key),
+        create_account_with_key(&app, "Alice", &key),
+    );
+    assert_eq!(first.status(), StatusCode::CREATED);
+    assert_eq!(retry.status(), StatusCode::CREATED);
+    let first_bytes = first.into_body().collect().await.unwrap().to_bytes();
+    let retry_bytes = retry.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(first_bytes, retry_bytes);
+
+    let conflict = create_account_with_key(&app, "Different request", &key).await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(conflict).await["error"]["code"],
+        "idempotency_key_conflict"
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM users),
+                (SELECT COUNT(*) FROM idempotency_records),
+                (SELECT length(idempotency_key_sha256) FROM idempotency_records)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (1, 1, 32));
+    let stored_key_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM idempotency_records
+             WHERE CAST(idempotency_key_sha256 AS TEXT) = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_key_count, 0);
+    drop(connection);
+
+    let app = app.restart();
+    let after_restart = create_account_with_key(&app, "Alice", &key).await;
+    assert_eq!(after_restart.status(), StatusCode::CREATED);
+    let after_restart_bytes = after_restart
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(first_bytes, after_restart_bytes);
+}
+
+#[tokio::test]
+async fn account_assignments_are_idempotent_and_redact_credentials() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Alice").await;
+    assert_eq!(account.account.status, AccountStatus::Active);
+    assert!(account.assignments.is_empty());
+
+    let first = enroll_signed_node(&app).await;
+    let second = enroll_signed_node(&app).await;
+    approve_node(&app, first.node_id).await;
+    approve_node(&app, second.node_id).await;
+
+    let response = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[first.node_id, second.node_id],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let raw_response = String::from_utf8(bytes.to_vec()).unwrap();
+    let assigned: AccountSummary = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(assigned.assignments.len(), 2);
+    assert!(assigned
+        .assignments
+        .iter()
+        .all(|assignment| assignment.status == AccountNodeAssignmentStatus::Enabled));
+    assert!(assigned.assignments.iter().all(|assignment| {
+        assignment.provisioning_state == AccountNodeProvisioningState::Pending
+    }));
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT credential_id, node_id, vless_uuid, xray_email, version, status
+             FROM user_node_credentials WHERE user_id = ?1 ORDER BY node_id, version",
+        )
+        .unwrap();
+    let credentials: Vec<(String, String, String, String, i64, String)> = statement
+        .query_map([account.account.user_id.to_string()], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(credentials.len(), 2);
+    assert_ne!(credentials[0].2, credentials[1].2);
+    for credential in &credentials {
+        assert_eq!(credential.4, 1);
+        assert_eq!(credential.5, "pending");
+        assert_eq!(
+            Uuid::parse_str(&credential.2).unwrap().to_string(),
+            credential.2
+        );
+        assert!(!raw_response.contains(&credential.0));
+        assert!(!raw_response.contains(&credential.2));
+        assert!(!raw_response.contains(&credential.3));
+    }
+    assert!(!raw_response.contains("credentialId"));
+    assert!(!raw_response.contains("vlessUuid"));
+    assert!(!raw_response.contains("xrayEmail"));
+    drop(statement);
+    drop(connection);
+
+    let idempotent = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[second.node_id, first.node_id],
+    )
+    .await;
+    assert_eq!(idempotent.status(), StatusCode::OK);
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let credential_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM user_node_credentials WHERE user_id = ?1",
+            [account.account.user_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(credential_count, 2);
+}
+
+#[tokio::test]
+async fn account_assignment_removal_and_restore_rotate_credentials() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Alice").await;
+    let first = enroll_signed_node(&app).await;
+    let second = enroll_signed_node(&app).await;
+    approve_node(&app, first.node_id).await;
+    approve_node(&app, second.node_id).await;
+    let assigned = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[first.node_id, second.node_id],
+    )
+    .await;
+    assert_eq!(assigned.status(), StatusCode::OK);
+    let assigned: AccountSummary = serde_json::from_value(json(assigned).await).unwrap();
+    let second_assignment_id = assigned
+        .assignments
+        .iter()
+        .find(|assignment| assignment.node_id == second.node_id)
+        .unwrap()
+        .assignment_id;
+
+    let removed = replace_account_nodes(&app, account.account.user_id, &[first.node_id]).await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let removed: AccountSummary = serde_json::from_value(json(removed).await).unwrap();
+    let removed_second = removed
+        .assignments
+        .iter()
+        .find(|assignment| assignment.node_id == second.node_id)
+        .unwrap();
+    assert_eq!(removed_second.assignment_id, second_assignment_id);
+    assert_eq!(removed_second.status, AccountNodeAssignmentStatus::Disabled);
+    assert_eq!(
+        removed_second.provisioning_state,
+        AccountNodeProvisioningState::NotProvisioned
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let removed_status: String = connection
+        .query_row(
+            "SELECT status FROM user_node_credentials
+             WHERE user_id = ?1 AND node_id = ?2 ORDER BY version DESC LIMIT 1",
+            [
+                account.account.user_id.to_string(),
+                second.node_id.to_string(),
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(removed_status, "revoked");
+    drop(connection);
+
+    let restored = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[first.node_id, second.node_id],
+    )
+    .await;
+    assert_eq!(restored.status(), StatusCode::OK);
+    let restored: AccountSummary = serde_json::from_value(json(restored).await).unwrap();
+    let restored_second = restored
+        .assignments
+        .iter()
+        .find(|assignment| assignment.node_id == second.node_id)
+        .unwrap();
+    assert_eq!(restored_second.assignment_id, second_assignment_id);
+    assert_eq!(restored_second.status, AccountNodeAssignmentStatus::Enabled);
+    assert_eq!(
+        restored_second.provisioning_state,
+        AccountNodeProvisioningState::Pending
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT version, status FROM user_node_credentials
+             WHERE user_id = ?1 AND node_id = ?2 ORDER BY version",
+        )
+        .unwrap();
+    let versions: Vec<(i64, String)> = statement
+        .query_map(
+            [
+                account.account.user_id.to_string(),
+                second.node_id.to_string(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        versions,
+        vec![(1, "revoked".to_string()), (2, "pending".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn account_assignment_rejects_unavailable_nodes_atomically() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Bob").await;
+    let active = enroll_signed_node(&app).await;
+    let pending = enroll_signed_node(&app).await;
+    approve_node(&app, active.node_id).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[active.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let unavailable = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[active.node_id, pending.node_id],
+    )
+    .await;
+    assert_eq!(unavailable.status(), StatusCode::CONFLICT);
+    assert_eq!(json(unavailable).await["error"]["code"], "conflict");
+
+    let unknown_node = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[active.node_id, NodeId::new()],
+    )
+    .await;
+    assert_eq!(unknown_node.status(), StatusCode::NOT_FOUND);
+
+    let duplicate = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[active.node_id, active.node_id],
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json(duplicate).await["error"]["code"], "validation_failed");
+
+    let unknown_account = replace_account_nodes(&app, UserId::new(), &[active.node_id]).await;
+    assert_eq!(unknown_account.status(), StatusCode::NOT_FOUND);
+    let malformed_account = admin_json_request(
+        &app,
+        "PUT",
+        "/v1/admin/accounts/not-a-user-id/nodes",
+        serde_json::json!({ "nodeIds": [active.node_id] }),
+    )
+    .await;
+    assert_eq!(malformed_account.status(), StatusCode::NOT_FOUND);
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM user_node_assignments WHERE user_id = ?1),
+                (SELECT COUNT(*) FROM user_node_assignments
+                 WHERE user_id = ?1 AND status = 'enabled'),
+                (SELECT COUNT(*) FROM user_node_credentials WHERE user_id = ?1)",
+            [account.account.user_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn account_disable_and_reactivation_rotate_credentials() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Carol").await;
+    let first = enroll_signed_node(&app).await;
+    let second = enroll_signed_node(&app).await;
+    approve_node(&app, first.node_id).await;
+    approve_node(&app, second.node_id).await;
+    assert_eq!(
+        replace_account_nodes(
+            &app,
+            account.account.user_id,
+            &[first.node_id, second.node_id],
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let disabled = set_account_status(&app, account.account.user_id, AccountStatus::Disabled).await;
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let disabled: AccountSummary = serde_json::from_value(json(disabled).await).unwrap();
+    assert_eq!(disabled.account.status, AccountStatus::Disabled);
+    assert!(disabled
+        .assignments
+        .iter()
+        .all(|assignment| assignment.status == AccountNodeAssignmentStatus::Enabled));
+    assert!(disabled.assignments.iter().all(|assignment| {
+        assignment.provisioning_state == AccountNodeProvisioningState::NotProvisioned
+    }));
+    let blocked_replace =
+        replace_account_nodes(&app, account.account.user_id, &[first.node_id]).await;
+    assert_eq!(blocked_replace.status(), StatusCode::CONFLICT);
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let revoked: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM user_node_credentials
+             WHERE user_id = ?1 AND status = 'revoked'",
+            [account.account.user_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(revoked, 2);
+    drop(connection);
+
+    let active = set_account_status(&app, account.account.user_id, AccountStatus::Active).await;
+    assert_eq!(active.status(), StatusCode::OK);
+    let active: AccountSummary = serde_json::from_value(json(active).await).unwrap();
+    assert_eq!(active.account.status, AccountStatus::Active);
+    assert_eq!(
+        set_account_status(&app, account.account.user_id, AccountStatus::Active)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let states: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'revoked' THEN 1 ELSE 0 END)
+             FROM user_node_credentials WHERE user_id = ?1",
+            [account.account.user_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(states, (4, 2, 2));
+}
+
+#[tokio::test]
+async fn account_deletion_is_terminal_redacted_and_durable() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Deleted user").await;
+    let node = enroll_signed_node(&app).await;
+    approve_node(&app, node.node_id).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let deleted = set_account_status(&app, account.account.user_id, AccountStatus::Deleted).await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    let deleted: AccountSummary = serde_json::from_value(json(deleted).await).unwrap();
+    assert_eq!(deleted.account.status, AccountStatus::Deleted);
+    assert!(deleted
+        .assignments
+        .iter()
+        .all(|assignment| assignment.status == AccountNodeAssignmentStatus::Deleted));
+    assert_eq!(
+        set_account_status(&app, account.account.user_id, AccountStatus::Deleted)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let restore = set_account_status(&app, account.account.user_id, AccountStatus::Active).await;
+    assert_eq!(restore.status(), StatusCode::CONFLICT);
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let non_revoked: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM user_node_credentials
+             WHERE user_id = ?1 AND status != 'revoked'",
+            [account.account.user_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(non_revoked, 0);
+    drop(connection);
+
+    let app = app.restart();
+    let listed = admin_accounts(&app).await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let bytes = listed.into_body().collect().await.unwrap().to_bytes();
+    let raw = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(!raw.contains("credentialId"));
+    assert!(!raw.contains("vlessUuid"));
+    assert!(!raw.contains("xrayEmail"));
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(body["accounts"][0]["account"]["status"], "deleted");
+}
+
+#[tokio::test]
+async fn applied_account_disable_exposes_removal_pending_and_rotates_on_restore() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Applied user").await;
+    let node = enroll_signed_node(&app).await;
+    approve_node(&app, node.node_id).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let contradictory = connection.execute(
+        "UPDATE user_node_credentials SET status = 'active'
+         WHERE user_id = ?1 AND node_id = ?2",
+        [
+            account.account.user_id.to_string(),
+            node.node_id.to_string(),
+        ],
+    );
+    assert!(contradictory.is_err());
+    connection
+        .execute(
+            "UPDATE user_node_credentials
+             SET status = 'active', activated_at = created_at
+             WHERE user_id = ?1 AND node_id = ?2",
+            [
+                account.account.user_id.to_string(),
+                node.node_id.to_string(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let listed = json(admin_accounts(&app).await).await;
+    assert_eq!(
+        listed["accounts"][0]["assignments"][0]["provisioningState"],
+        "applied"
+    );
+    let disabled = set_account_status(&app, account.account.user_id, AccountStatus::Disabled).await;
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let disabled: AccountSummary = serde_json::from_value(json(disabled).await).unwrap();
+    assert_eq!(
+        disabled.assignments[0].provisioning_state,
+        AccountNodeProvisioningState::RemovalPending
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let retiring: (String, bool, bool) = connection
+        .query_row(
+            "SELECT status, activated_at IS NOT NULL, retire_after IS NOT NULL
+             FROM user_node_credentials WHERE user_id = ?1 AND node_id = ?2",
+            [
+                account.account.user_id.to_string(),
+                node.node_id.to_string(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(retiring, ("retiring".to_string(), true, true));
+    drop(connection);
+
+    let restored = set_account_status(&app, account.account.user_id, AccountStatus::Active).await;
+    assert_eq!(restored.status(), StatusCode::OK);
+    let restored: AccountSummary = serde_json::from_value(json(restored).await).unwrap();
+    assert_eq!(
+        restored.assignments[0].provisioning_state,
+        AccountNodeProvisioningState::Pending
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let states: (i64, i64) = connection
+        .query_row(
+            "SELECT
+                SUM(CASE WHEN status = 'revoked' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)
+             FROM user_node_credentials WHERE user_id = ?1 AND node_id = ?2",
+            [
+                account.account.user_id.to_string(),
+                node.node_id.to_string(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(states, (1, 1));
+}
+
+#[tokio::test]
+async fn disabling_or_revoking_a_node_closes_member_access() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Dave").await;
+    let node = enroll_signed_node(&app).await;
+    approve_node(&app, node.node_id).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "disable")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let listed = json(admin_accounts(&app).await).await;
+    assert_eq!(
+        listed["accounts"][0]["assignments"][0]["status"],
+        "disabled"
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let credential_status: String = connection
+        .query_row(
+            "SELECT status FROM user_node_credentials WHERE user_id = ?1 AND node_id = ?2",
+            [
+                account.account.user_id.to_string(),
+                node.node_id.to_string(),
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(credential_status, "revoked");
+    drop(connection);
+
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "revoke")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let listed = json(admin_accounts(&app).await).await;
+    assert_eq!(listed["accounts"][0]["assignments"][0]["status"], "deleted");
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT event_type, details_json FROM audit_events
+             WHERE target_type = 'node' AND target_id = ?1
+               AND event_type IN ('node.disabled', 'node.revoked')
+             ORDER BY event_id",
+        )
+        .unwrap();
+    let events: Vec<(String, Value)> = statement
+        .query_map([node.node_id.to_string()], |row| {
+            let details: String = row.get(1)?;
+            Ok((row.get(0)?, serde_json::from_str(&details).unwrap()))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].0, "node.disabled");
+    assert_eq!(events[0].1["memberAssignmentsClosed"], 1);
+    assert_eq!(events[0].1["memberCredentialsRevoked"], 1);
+    assert_eq!(events[1].0, "node.revoked");
+    assert_eq!(events[1].1["memberAssignmentsClosed"], 1);
+    assert_eq!(events[1].1["memberCredentialsRevoked"], 0);
+}
+
+#[tokio::test]
 async fn desired_state_and_result_journal_survive_restart() {
     let app = TestApp::new();
     let node = enroll_signed_node(&app).await;
@@ -2510,5 +3206,5 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (8, 8, 1, 1, 1));
+    assert_eq!(durable, (9, 9, 1, 1, 1));
 }

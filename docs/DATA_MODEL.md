@@ -19,10 +19,13 @@ must not share a SQLite file with Control Service or with each other.
 | Connect | Account metadata, signed bundle cache, health history, selection policy, proxy recovery journal | Authoritative accounts, node management credentials, REALITY private keys |
 | OS credential store or owner-only secret store | Refresh secrets, node authentication secrets, VLESS UUIDs, signing/private keys, REALITY private keys, encrypted response and configuration artifacts | Queryable labels, status, analytics, or audit metadata |
 
-Secret database columns contain only keyed verifier hashes, public keys, digests, or opaque
-`secret_ref`/`artifact_ref` values. A reference is resolved only in a non-renderer service process.
-Deleting a metadata row does not delete referenced material until the retention and reference scan
-permits it.
+Secret database columns normally contain only keyed verifier hashes, public keys, digests, or
+opaque `secret_ref`/`artifact_ref` values. The initial single-process Control Service keeps the
+per-assignment VLESS UUID in its owner-only SQLite database because the same service must deliver it
+to both Node Host and Connect. That column is never selected by administrator summary APIs, never
+opened by a renderer, and is covered by explicit redaction tests. A later split-renderer or remote
+secret-store deployment must replace it with an opaque reference. Deleting a metadata row does not
+delete separately referenced material until the retention and reference scan permits it.
 
 The initial release has one network per Control Service instance. `network_id` is nevertheless
 present in every domain table and every durable token scope. Migration bookkeeping tables are the
@@ -253,18 +256,25 @@ verified endpoint, and has an applied configuration compatible with the profile 
 | Column | Constraint and meaning |
 | --- | --- |
 | `network_id`, `credential_id` | Composite primary key; stable credential UUID |
-| `assignment_id`, `user_id`, `node_id` | Required IDs; triggers verify all three identify the same assignment |
+| `assignment_id`, `user_id`, `node_id` | Required IDs; a composite foreign key verifies all three identify the same assignment |
 | `xray_email` | Immutable non-secret Xray tag, unique per node while active |
-| `vless_secret_ref` | Opaque owner-only secret reference, never exposed to Control renderer |
+| `vless_uuid` | Owner-only UUID secret used only to build node desired state and encrypted member bundles; never returned by administrator APIs |
 | `version` | Positive rotation number unique for an assignment |
 | `status` | `pending`, `active`, `retiring`, or `revoked` |
 | `created_at`, `activated_at`, `retire_after`, `revoked_at` | Rotation lifecycle |
 
-`UNIQUE(network_id, node_id, credential_id)` and `UNIQUE(network_id, assignment_id, version)` apply.
-The service generates a different VLESS UUID for every node assignment. A UUID secret reference may
-not be reused by another credential. Rotation may overlap old and new credentials only until
-`retire_after`; a disabled/deleted user or assignment makes all associated credentials hard-denied
-regardless of their stored status.
+`UNIQUE(network_id, assignment_id, version)`, `UNIQUE(network_id, node_id, xray_email)`, and
+`UNIQUE(network_id, node_id, vless_uuid)` apply. The service generates a different VLESS UUID for
+every node assignment. Rotation may overlap old and new credentials only until `retire_after`; a
+disabled/deleted user or assignment gates bundle publication regardless of cached credential state.
+
+Control Service migration 9 is the executable account/assignment slice. A newly generated
+credential is `pending`: it is durable but is not evidence that Node Host has received, validated,
+or applied it. The desired-state reconciliation phase promotes it only after the exact signed node
+revision reaches `applied`; no Connect bundle may advertise that profile before then. Disabling or
+revoking a node closes its assignments and revokes its stored member credentials in the same
+Control transaction. Remote Xray removal still requires a reachable Node Host and a successfully
+applied replacement revision.
 
 ### 3.5 Immutable desired state and rollout state
 
@@ -353,7 +363,7 @@ applied credentials. Signed bundle bytes are immutable; changed content creates 
 
 | Column | Constraint and meaning |
 | --- | --- |
-| `network_id`, `principal_type`, `principal_id`, `route_id`, `idempotency_key` | Composite primary key |
+| `network_id`, `principal_type`, `principal_id`, `route_id`, `idempotency_key_hash` | Composite primary key; raw keys are never stored |
 | `request_hash` | Hash of method, normalized route, versioned principal scope, and canonical body |
 | `state` | `in_progress` or `completed` |
 | `response_status`, `response_ref`, `response_hash` | Committed response metadata; secret responses use encrypted owner-only artifacts |
@@ -370,6 +380,12 @@ Idempotency records are retained for 24 hours by default and never less than the
 client retry window. One-time enrollment and activation responses that contain a newly issued secret
 use an encrypted response artifact so a lost HTTP response can be replayed safely during that
 window.
+
+Migration 9 materializes this contract first for `POST /v1/admin/accounts`: it stores the canonical
+request hash and the complete secret-free `201` response JSON in the same transaction as the user
+and audit event. Concurrent or post-restart retries therefore return the same account identity and
+body. Secret-bearing activation responses still require the encrypted artifact path before their
+routes are enabled.
 
 ### 3.8 Telemetry and audit
 

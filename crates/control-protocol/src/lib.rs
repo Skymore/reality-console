@@ -10,6 +10,7 @@ pub mod desired;
 pub mod enrollment;
 pub mod error;
 pub mod id;
+pub mod idempotency;
 pub mod node;
 pub mod node_status;
 pub mod probe;

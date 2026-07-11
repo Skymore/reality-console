@@ -202,6 +202,17 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn idempotency_key_conflict(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::IdempotencyKeyConflict,
+            "The idempotency key was already used for a different request.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
     pub fn timeout(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::GATEWAY_TIMEOUT,

@@ -75,6 +75,20 @@ pub enum AccountNodeAssignmentStatus {
     Deleted,
 }
 
+/// Controller evidence for whether one assignment is usable on its node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccountNodeProvisioningState {
+    /// A credential exists as control-plane intent but has not been applied.
+    Pending,
+    /// The exact credential was acknowledged in an applied node revision.
+    Applied,
+    /// The assignment is disabled but prior applied access is not confirmed removed.
+    RemovalPending,
+    /// No credential for this assignment has ever been applied.
+    NotProvisioned,
+}
+
 /// Safe administrator-facing account-to-node assignment metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +99,8 @@ pub struct AccountNodeAssignment {
     pub node_id: NodeId,
     /// Current assignment lifecycle.
     pub status: AccountNodeAssignmentStatus,
+    /// Apply evidence independent from the requested lifecycle state.
+    pub provisioning_state: AccountNodeProvisioningState,
 }
 
 /// Complete safe administrator view of one member and its node set.
