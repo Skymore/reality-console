@@ -1,7 +1,5 @@
 use crate::identity::{ControllerIdentity, IdentityError};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
-use control_protocol::crypto::Sha256Digest;
+use control_protocol::crypto::{ed25519_signing_key_id, Sha256Digest};
 use control_protocol::desired::{
     desired_state_transcript, verify_desired_state_signature, DesiredStateCryptoError,
 };
@@ -15,7 +13,6 @@ use control_protocol::validation::ProtocolValidationError;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 
 pub(crate) const DESIRED_STATE_SCHEMA_VERSION: u16 =
     control_protocol::version::DESIRED_STATE_SCHEMA_VERSION;
@@ -150,18 +147,7 @@ pub(crate) fn verify_stored_desired_state(
 pub(crate) fn controller_signing_key_id(
     identity: &ControllerIdentity,
 ) -> Result<SigningKeyId, DesiredStateError> {
-    let public_key = URL_SAFE_NO_PAD
-        .decode(identity.public_key().as_str())
-        .map_err(|_| DesiredStateError::ControllerKey)?;
-    if public_key.len() != 32 {
-        return Err(DesiredStateError::ControllerKey);
-    }
-    let digest = Sha256::digest(public_key);
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(SigningKeyId::from_uuid(Uuid::from_bytes(bytes)))
+    ed25519_signing_key_id(&identity.public_key()).map_err(|_| DesiredStateError::ControllerKey)
 }
 
 fn sha256_digest(value: &[u8]) -> Sha256Digest {

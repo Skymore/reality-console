@@ -1,12 +1,15 @@
 //! Encoded public cryptographic values carried by the protocol.
 
+use crate::id::SigningKeyId;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::de;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest as _, Sha256};
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
+use uuid::Uuid;
 
 /// Failure to parse a protocol cryptographic value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +88,35 @@ fixed_base64url!(/// An X25519 public key encoded as 32 unpadded base64url bytes
     X25519PublicKey, 32);
 fixed_base64url!(/// An Ed25519 signature encoded as 64 unpadded base64url bytes.
     Ed25519Signature, 64);
+
+/// Derives the stable protocol key identity for an Ed25519 public key.
+///
+/// The first 128 bits of SHA-256 are encoded as a standards-shaped UUID with
+/// fixed version and variant bits. This is an identifier, not a secret or a
+/// replacement for comparing or verifying the complete public key.
+///
+/// # Errors
+///
+/// Returns an error only if the validated public-key representation cannot be
+/// decoded, which indicates an internal invariant violation.
+pub fn ed25519_signing_key_id(
+    public_key: &Ed25519PublicKey,
+) -> Result<SigningKeyId, InvalidEncodedValue> {
+    let public_bytes = URL_SAFE_NO_PAD
+        .decode(public_key.as_str())
+        .map_err(|_| InvalidEncodedValue("stored Ed25519 public key is invalid"))?;
+    if public_bytes.len() != 32 {
+        return Err(InvalidEncodedValue(
+            "stored Ed25519 public key has an invalid length",
+        ));
+    }
+    let digest = Sha256::digest(public_bytes);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(SigningKeyId::from_uuid(Uuid::from_bytes(bytes)))
+}
 
 /// A SHA-256 digest encoded as `sha256:` followed by lowercase hexadecimal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -205,7 +237,7 @@ impl<'de> Deserialize<'de> for Nonce {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ed25519PublicKey, Ed25519Signature, Nonce};
+    use super::{ed25519_signing_key_id, Ed25519PublicKey, Ed25519Signature, Nonce};
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
 
@@ -222,5 +254,24 @@ mod tests {
             .encode([1_u8; 31])
             .parse::<Ed25519PublicKey>()
             .is_err());
+    }
+
+    #[test]
+    fn signing_key_identity_is_stable_and_key_specific() {
+        let first: Ed25519PublicKey = URL_SAFE_NO_PAD.encode([7_u8; 32]).parse().unwrap();
+        let second: Ed25519PublicKey = URL_SAFE_NO_PAD.encode([8_u8; 32]).parse().unwrap();
+
+        assert_eq!(
+            ed25519_signing_key_id(&first).unwrap(),
+            ed25519_signing_key_id(&first).unwrap()
+        );
+        assert_eq!(
+            ed25519_signing_key_id(&first).unwrap().to_string(),
+            "4bb06f8e-4e3a-5715-9201-d573d0aa4237"
+        );
+        assert_ne!(
+            ed25519_signing_key_id(&first).unwrap(),
+            ed25519_signing_key_id(&second).unwrap()
+        );
     }
 }
