@@ -16,12 +16,15 @@ use control_protocol::id::{
 };
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate, EndpointMode,
-    EndpointSource, EnrollNodeRequest, EnrollNodeResponse, NodeCapability, NodeHeartbeat,
-    NodeRuntimeState, ProviderConsent, RevisionProgress, RevisionResult, RevisionResultState,
-    SignedDesiredState,
+    EndpointReadiness, EndpointSource, EnrollNodeRequest, EnrollNodeResponse, NodeCapability,
+    NodeHeartbeat, NodeLifecycleState, NodeRuntimeState, ProviderConsent, RevisionProgress,
+    RevisionResult, RevisionResultState, SignedDesiredState, SignedNodeHeartbeatStatus,
 };
+use control_protocol::node_status::verify_node_heartbeat_status_signature;
 use control_protocol::request_auth::NodeRequestSigningInput;
-use control_server::probe::{TcpProbeCompletion, TcpProbeLoopOptions, TcpProbeResult};
+use control_server::probe::{
+    TcpProbeCompletion, TcpProbeErrorCode, TcpProbeLoopOptions, TcpProbeResult,
+};
 use control_server::{build_router, AppState, Database, ServiceConfig};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use futures_util::stream;
@@ -508,6 +511,42 @@ async fn post_heartbeat(
     app.router.clone().oneshot(request).await.unwrap()
 }
 
+async fn accepted_heartbeat_status(
+    response: axum::response::Response,
+) -> SignedNodeHeartbeatStatus {
+    assert_eq!(response.status(), StatusCode::OK);
+    serde_json::from_value(json(response).await).unwrap()
+}
+
+fn assert_heartbeat_status_authentic(
+    app: &TestApp,
+    node: &SignedNode,
+    heartbeat: &NodeHeartbeat,
+    status: &SignedNodeHeartbeatStatus,
+) {
+    status
+        .document
+        .validate_for(
+            node.node_id,
+            heartbeat.heartbeat_generation,
+            node.controller_instance_id,
+        )
+        .unwrap();
+    verify_node_heartbeat_status_signature(
+        &status.document,
+        &status.signature,
+        &app.controller_public_key,
+    )
+    .unwrap();
+}
+
+fn assert_heartbeat_status_redacted(status: &SignedNodeHeartbeatStatus) {
+    let public_status = serde_json::to_value(status).unwrap();
+    let endpoint = &public_status["document"]["endpoints"][0];
+    assert!(endpoint.get("address").is_none());
+    assert!(endpoint.get("port").is_none());
+}
+
 fn assert_revision_journal_progress(app: &TestApp, node_id: NodeId) {
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
     let progress: (i64, i64, i64, i64, i64) = connection
@@ -702,7 +741,7 @@ async fn admin_node_list_is_complete_and_redacts_key_material() {
             .await
             .unwrap()
             .status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
@@ -1202,7 +1241,15 @@ async fn authenticated_heartbeat_persists_only_pending_endpoint_candidates() {
     let app = TestApp::new();
     let (node, current) = setup_applied_heartbeat(&app).await;
     let response = post_heartbeat(&app, &node, &current, 23).await;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let status = accepted_heartbeat_status(response).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &status);
+    assert_eq!(status.document.lifecycle, NodeLifecycleState::Active);
+    assert_eq!(status.document.endpoints.len(), 1);
+    assert_eq!(
+        status.document.endpoints[0].readiness,
+        EndpointReadiness::Pending
+    );
+    assert_heartbeat_status_redacted(&status);
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
     let stored: (String, String, String, Option<i64>, i64, i64, i64, i64) = connection
@@ -1274,9 +1321,12 @@ async fn authenticated_heartbeat_persists_only_pending_endpoint_candidates() {
         .unwrap();
     drop(connection);
 
+    let response = post_heartbeat(&app, &node, &current, 24).await;
+    let status = accepted_heartbeat_status(response).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &status);
     assert_eq!(
-        post_heartbeat(&app, &node, &current, 24).await.status(),
-        StatusCode::NO_CONTENT
+        status.document.endpoints[0].readiness,
+        EndpointReadiness::Pending
     );
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
     let preserved: String = connection
@@ -1287,6 +1337,22 @@ async fn authenticated_heartbeat_persists_only_pending_endpoint_candidates() {
         )
         .unwrap();
     assert_eq!(preserved, "verified");
+}
+
+#[tokio::test]
+async fn heartbeat_status_refreshes_lifecycle_on_an_exact_retry() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let current = heartbeat();
+
+    let pending = accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 120).await).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &pending);
+    assert_eq!(pending.document.lifecycle, NodeLifecycleState::Pending);
+
+    approve_node(&app, node.node_id).await;
+    let active = accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 121).await).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &active);
+    assert_eq!(active.document.lifecycle, NodeLifecycleState::Active);
 }
 
 #[tokio::test]
@@ -1312,9 +1378,11 @@ async fn heartbeat_candidate_port_must_match_the_signed_public_port() {
 async fn tcp_preflight_is_durable_and_cannot_mark_an_endpoint_verified() {
     let app = TestApp::new();
     let (node, current) = setup_applied_heartbeat(&app).await;
+    let pending = accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 25).await).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &pending);
     assert_eq!(
-        post_heartbeat(&app, &node, &current, 25).await.status(),
-        StatusCode::NO_CONTENT
+        pending.document.endpoints[0].readiness,
+        EndpointReadiness::Pending
     );
 
     let job = app
@@ -1327,6 +1395,14 @@ async fn tcp_preflight_is_durable_and_cannot_mark_an_endpoint_verified() {
     assert_eq!(job.endpoint_id(), current.endpoints[0].endpoint_id);
     assert_eq!(job.address(), "node.example.test");
     assert_eq!(job.port(), 443);
+
+    let checking =
+        accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 122).await).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &checking);
+    assert_eq!(
+        checking.document.endpoints[0].readiness,
+        EndpointReadiness::Checking
+    );
 
     let result = TcpProbeResult::connected(
         IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
@@ -1343,6 +1419,16 @@ async fn tcp_preflight_is_durable_and_cannot_mark_an_endpoint_verified() {
         app.database.complete_tcp_probe(job, result).await.unwrap(),
         TcpProbeCompletion::AlreadyRecorded
     );
+
+    let reachable =
+        accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 123).await).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &reachable);
+    assert_eq!(
+        reachable.document.endpoints[0].readiness,
+        EndpointReadiness::TcpReachable
+    );
+    assert!(reachable.document.endpoints[0].last_checked_at.is_some());
+    assert_eq!(reachable.document.endpoints[0].error_code, None);
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
     let attempt: (String, String, String, i64) = connection
@@ -1389,12 +1475,108 @@ async fn tcp_preflight_is_durable_and_cannot_mark_an_endpoint_verified() {
 }
 
 #[tokio::test]
+async fn current_protocol_verification_outranks_tcp_preflight() {
+    let app = TestApp::new();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 124).await).await;
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    connection
+        .execute(
+            "UPDATE node_endpoint_verifications
+             SET status = 'verified', probe_attempts = 1,
+                 last_probe_at = ?1, last_success_at = ?1, latency_ms = 8,
+                 error_code = NULL, verification_expires_at = ?2, updated_at = ?1
+             WHERE node_id = ?3",
+            rusqlite::params![now, now + 60, node.node_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let verified =
+        accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 127).await).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &verified);
+    assert_eq!(
+        verified.document.endpoints[0].readiness,
+        EndpointReadiness::Verified
+    );
+}
+
+#[tokio::test]
+async fn failed_tcp_preflight_returns_only_a_stable_error_code() {
+    let app = TestApp::new();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 125).await).await;
+    let job = app
+        .database
+        .claim_tcp_probe(Uuid::new_v4(), TcpProbeLoopOptions::default())
+        .await
+        .unwrap()
+        .expect("current direct candidate should be due");
+    assert_eq!(
+        app.database
+            .complete_tcp_probe(
+                job,
+                TcpProbeResult::failed(TcpProbeErrorCode::TcpUnreachable),
+            )
+            .await
+            .unwrap(),
+        TcpProbeCompletion::Recorded
+    );
+
+    let failed = accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 126).await).await;
+    assert_heartbeat_status_authentic(&app, &node, &current, &failed);
+    let endpoint = &failed.document.endpoints[0];
+    assert_eq!(endpoint.readiness, EndpointReadiness::TcpUnreachable);
+    assert!(endpoint.last_checked_at.is_some());
+    assert_eq!(
+        endpoint.error_code.as_deref(),
+        Some("direct_tcp_unreachable")
+    );
+}
+
+#[tokio::test]
+async fn a_claim_from_an_older_heartbeat_is_not_reported_as_checking() {
+    let app = TestApp::new();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 128).await).await;
+    let job = app
+        .database
+        .claim_tcp_probe(Uuid::new_v4(), TcpProbeLoopOptions::default())
+        .await
+        .unwrap()
+        .expect("current direct candidate should be due");
+
+    let mut newer = current.clone();
+    newer.heartbeat_generation = SequenceNumber::new(2).unwrap();
+    let status = accepted_heartbeat_status(post_heartbeat(&app, &node, &newer, 129).await).await;
+    assert_heartbeat_status_authentic(&app, &node, &newer, &status);
+    assert_eq!(
+        status.document.endpoints[0].readiness,
+        EndpointReadiness::Pending
+    );
+    assert_eq!(
+        app.database
+            .complete_tcp_probe(
+                job,
+                TcpProbeResult::connected(
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+                    Duration::from_millis(9),
+                ),
+            )
+            .await
+            .unwrap(),
+        TcpProbeCompletion::CandidateChanged
+    );
+}
+
+#[tokio::test]
 async fn tcp_preflight_discards_success_for_a_withdrawn_candidate() {
     let app = TestApp::new();
     let (node, current) = setup_applied_heartbeat(&app).await;
     assert_eq!(
         post_heartbeat(&app, &node, &current, 26).await.status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
     let job = app
         .database
@@ -1408,7 +1590,7 @@ async fn tcp_preflight_discards_success_for_a_withdrawn_candidate() {
     withdrawn.endpoints.clear();
     assert_eq!(
         post_heartbeat(&app, &node, &withdrawn, 27).await.status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
     assert_eq!(
         app.database
@@ -1449,7 +1631,7 @@ async fn heartbeat_withdraws_missing_candidates_and_rejects_identity_reuse() {
     let (node, current) = setup_applied_heartbeat(&app).await;
     assert_eq!(
         post_heartbeat(&app, &node, &current, 23).await.status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
 
     let revision = current.revisions.applied_revision.unwrap();
@@ -1467,13 +1649,13 @@ async fn heartbeat_withdraws_missing_candidates_and_rejects_identity_reuse() {
         post_heartbeat(&app, &node, &next_heartbeat, 29)
             .await
             .status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
     assert_eq!(
         post_heartbeat(&app, &node, &next_heartbeat, 30)
             .await
             .status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
     let stale = post_heartbeat(&app, &node, &current, 31).await;
     assert_eq!(stale.status(), StatusCode::CONFLICT);
@@ -1538,7 +1720,7 @@ async fn heartbeat_cannot_approve_a_node_or_regress_durable_progress() {
     );
     assert_eq!(
         app.router.clone().oneshot(initial).await.unwrap().status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
 
     let mut regressed = heartbeat();
@@ -2173,7 +2355,7 @@ async fn rollback_requires_validation_and_an_earlier_target_for_the_same_node() 
         post_heartbeat(&app, &node, &rolled_back_heartbeat, 99)
             .await
             .status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
 
     let non_target = revision_result(RevisionResultState::Received, 0, None);
@@ -2222,7 +2404,7 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
         post_heartbeat(&app, &node, &heartbeat(), 100)
             .await
             .status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
 
     let mut forged = heartbeat();
@@ -2244,7 +2426,7 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
         post_heartbeat(&app, &node, &fetched_only, 102)
             .await
             .status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
     let received = revision_result(RevisionResultState::Received, 0, None);
     assert_eq!(
@@ -2268,7 +2450,7 @@ async fn heartbeat_cannot_overwrite_targets_or_invent_journal_progress() {
         post_heartbeat(&app, &node, &old_progress, 104)
             .await
             .status(),
-        StatusCode::NO_CONTENT
+        StatusCode::OK
     );
 
     let mut forged_second = old_progress;

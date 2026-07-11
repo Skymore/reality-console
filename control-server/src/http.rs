@@ -17,6 +17,7 @@ use control_protocol::id::{NodeId, Revision};
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
     EnrollNodeResponse, NodeCapability, NodeHeartbeat, RevisionResult, SignedDesiredState,
+    SignedNodeHeartbeatStatus,
 };
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
 use http_body_util::BodyExt as _;
@@ -156,7 +157,7 @@ async fn node_heartbeat(
     Extension(request_id): Extension<RequestId>,
     Extension(authenticated): Extension<AuthenticatedNode>,
     Extension(body): Extension<SignedBody>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<SignedNodeHeartbeatStatus>, ApiError> {
     if path_node_id != authenticated.node_id.to_string() {
         return Err(ApiError::authentication_failed(request_id));
     }
@@ -165,12 +166,12 @@ async fn node_heartbeat(
     heartbeat
         .validate()
         .map_err(|_| ApiError::validation_failed(request_id))?;
-    state
+    let status = state
         .database
         .record_heartbeat(authenticated.node_id, heartbeat)
         .await
         .map_err(|error| database_api_error(error, request_id))?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(status))
 }
 
 async fn fetch_desired_state(

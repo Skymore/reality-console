@@ -1,7 +1,8 @@
 use crate::config::{validate_network_name, ConfigError};
 use crate::desired::{
-    build_signed_desired_state, verify_stored_desired_state, DesiredStateDraft, DesiredStateError,
-    StoredDesiredState, SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS,
+    build_signed_desired_state, controller_signing_key_id, verify_stored_desired_state,
+    DesiredStateDraft, DesiredStateError, StoredDesiredState,
+    SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS,
 };
 use crate::identity::{set_owner_only, ControllerIdentity, IdentityError};
 use crate::probe::{
@@ -16,13 +17,16 @@ use control_protocol::enrollment::{
 };
 use control_protocol::id::{
     ControllerInstanceId, EndpointId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Revision,
-    SigningKeyId, Timestamp,
+    SequenceNumber, SigningKeyId, Timestamp,
 };
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate, EndpointMode,
-    EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode, NodeCapability, NodeCredential,
-    NodeHeartbeat, PairingPurpose, RevisionResult, RevisionResultState, SignedDesiredState,
+    EndpointReadiness, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
+    NodeCapability, NodeCredential, NodeEndpointStatus, NodeHeartbeat, NodeHeartbeatStatus,
+    NodeLifecycleState, PairingPurpose, RevisionResult, RevisionResultState, SignedDesiredState,
+    SignedNodeHeartbeatStatus,
 };
+use control_protocol::node_status::node_heartbeat_status_transcript;
 use control_protocol::request_auth::{
     verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
 };
@@ -932,11 +936,12 @@ impl Database {
         &self,
         node_id: NodeId,
         heartbeat: NodeHeartbeat,
-    ) -> Result<(), DatabaseError> {
+    ) -> Result<SignedNodeHeartbeatStatus, DatabaseError> {
+        let identity = self.controller_identity.clone();
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
-            record_heartbeat(&mut guard.connection, node_id, &heartbeat)
+            record_heartbeat(&mut guard.connection, &identity, node_id, &heartbeat)
         })
         .await
         .map_err(DatabaseError::Worker)?
@@ -1140,9 +1145,10 @@ fn authenticate_node_request(
 
 fn record_heartbeat(
     connection: &mut Connection,
+    identity: &ControllerIdentity,
     node_id: NodeId,
     heartbeat: &NodeHeartbeat,
-) -> Result<(), DatabaseError> {
+) -> Result<SignedNodeHeartbeatStatus, DatabaseError> {
     heartbeat.validate()?;
     let heartbeat_json = serde_json::to_vec(heartbeat)?;
     let heartbeat_digest: [u8; 32] = Sha256::digest(&heartbeat_json).into();
@@ -1177,8 +1183,17 @@ fn record_heartbeat(
         std::cmp::Ordering::Less => return Err(DatabaseError::NodeHeartbeatStale),
         std::cmp::Ordering::Equal => {
             if previous_digest.as_deref() == Some(&heartbeat_digest[..]) {
+                let response = build_signed_node_heartbeat_status(
+                    &transaction,
+                    identity,
+                    &network,
+                    node_id,
+                    heartbeat.heartbeat_generation,
+                    &status,
+                    now,
+                )?;
                 transaction.commit()?;
-                return Ok(());
+                return Ok(response);
             }
             return Err(DatabaseError::NodeHeartbeatConflict);
         }
@@ -1223,8 +1238,189 @@ fn record_heartbeat(
         heartbeat.heartbeat_generation.get(),
         now,
     )?;
+    let response = build_signed_node_heartbeat_status(
+        &transaction,
+        identity,
+        &network,
+        node_id,
+        heartbeat.heartbeat_generation,
+        &status,
+        now,
+    )?;
     transaction.commit()?;
-    Ok(())
+    Ok(response)
+}
+
+fn build_signed_node_heartbeat_status(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &ControllerIdentity,
+    network: &NetworkRecord,
+    node_id: NodeId,
+    heartbeat_generation: SequenceNumber,
+    lifecycle: &str,
+    now: i64,
+) -> Result<SignedNodeHeartbeatStatus, DatabaseError> {
+    let lifecycle = match lifecycle {
+        "pending" => NodeLifecycleState::Pending,
+        "active" => NodeLifecycleState::Active,
+        _ => return Err(DatabaseError::StoredProtocolValue),
+    };
+    let mut statement = transaction.prepare(
+        "SELECT candidate.endpoint_id, candidate.last_report_generation,
+                verification.status, verification.last_probe_at,
+                verification.verification_expires_at,
+                attempt.status, attempt.candidate_generation, attempt.claim_expires_at,
+                attempt.completed_at, attempt.result_code
+         FROM node_endpoint_candidates AS candidate
+         JOIN node_endpoint_verifications AS verification
+           ON verification.network_id = candidate.network_id
+          AND verification.node_id = candidate.node_id
+          AND verification.endpoint_id = candidate.endpoint_id
+         LEFT JOIN endpoint_probe_attempts AS attempt
+           ON attempt.attempt_id = (
+               SELECT latest.attempt_id
+               FROM endpoint_probe_attempts AS latest
+               WHERE latest.network_id = candidate.network_id
+                 AND latest.node_id = candidate.node_id
+                 AND latest.endpoint_id = candidate.endpoint_id
+                 AND latest.phase = 'tcp'
+               ORDER BY latest.attempt_id DESC
+               LIMIT 1
+           )
+         WHERE candidate.network_id = ?1 AND candidate.node_id = ?2
+           AND candidate.withdrawn_at IS NULL
+         ORDER BY candidate.endpoint_id",
+    )?;
+    let stored = statement
+        .query_map(params![network.network_id, node_id.to_string()], |row| {
+            Ok(StoredNodeEndpointStatus {
+                endpoint_id: row.get(0)?,
+                candidate_generation: row.get(1)?,
+                verification_status: row.get(2)?,
+                verification_last_probe_at: row.get(3)?,
+                verification_expires_at: row.get(4)?,
+                attempt_status: row.get(5)?,
+                attempt_candidate_generation: row.get(6)?,
+                attempt_claim_expires_at: row.get(7)?,
+                attempt_completed_at: row.get(8)?,
+                attempt_result_code: row.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut endpoints = stored
+        .into_iter()
+        .map(|stored| decode_node_endpoint_status(stored, now))
+        .collect::<Result<Vec<_>, _>>()?;
+    endpoints.sort_by_key(|endpoint| endpoint.endpoint_id);
+
+    let controller_instance_id = network
+        .controller_epoch
+        .parse::<ControllerInstanceId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let document = NodeHeartbeatStatus {
+        schema_version: 1,
+        node_id,
+        heartbeat_generation,
+        observed_at: timestamp(now)?,
+        lifecycle,
+        endpoints,
+        signing_key_id: controller_signing_key_id(identity)?,
+        controller_instance_id,
+    };
+    let transcript = node_heartbeat_status_transcript(&document)
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let signature = identity.sign(&transcript)?;
+    Ok(SignedNodeHeartbeatStatus {
+        document,
+        signature,
+    })
+}
+
+struct StoredNodeEndpointStatus {
+    endpoint_id: String,
+    candidate_generation: i64,
+    verification_status: String,
+    verification_last_probe_at: Option<i64>,
+    verification_expires_at: Option<i64>,
+    attempt_status: Option<String>,
+    attempt_candidate_generation: Option<i64>,
+    attempt_claim_expires_at: Option<i64>,
+    attempt_completed_at: Option<i64>,
+    attempt_result_code: Option<String>,
+}
+
+fn decode_node_endpoint_status(
+    stored: StoredNodeEndpointStatus,
+    now: i64,
+) -> Result<NodeEndpointStatus, DatabaseError> {
+    let endpoint_id = stored
+        .endpoint_id
+        .parse::<EndpointId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let verification_is_current = match stored.verification_status.as_str() {
+        "verified" => stored
+            .verification_expires_at
+            .is_some_and(|expires_at| expires_at > now),
+        "pending" | "failed" => false,
+        _ => return Err(DatabaseError::StoredProtocolValue),
+    };
+    if verification_is_current {
+        return Ok(NodeEndpointStatus {
+            endpoint_id,
+            readiness: EndpointReadiness::Verified,
+            last_checked_at: Some(timestamp(
+                stored
+                    .verification_last_probe_at
+                    .ok_or(DatabaseError::StoredProtocolValue)?,
+            )?),
+            error_code: None,
+        });
+    }
+
+    let (readiness, last_checked_at, error_code) = match stored.attempt_status.as_deref() {
+        Some("claimed")
+            if stored.attempt_candidate_generation == Some(stored.candidate_generation)
+                && stored
+                    .attempt_claim_expires_at
+                    .is_some_and(|expires_at| expires_at > now) =>
+        {
+            (EndpointReadiness::Checking, None, None)
+        }
+        Some("claimed" | "cancelled" | "expired") | None => {
+            (EndpointReadiness::Pending, None, None)
+        }
+        Some("succeeded") => (
+            EndpointReadiness::TcpReachable,
+            Some(timestamp(
+                stored
+                    .attempt_completed_at
+                    .ok_or(DatabaseError::StoredProtocolValue)?,
+            )?),
+            None,
+        ),
+        Some("failed") => (
+            EndpointReadiness::TcpUnreachable,
+            Some(timestamp(
+                stored
+                    .attempt_completed_at
+                    .ok_or(DatabaseError::StoredProtocolValue)?,
+            )?),
+            Some(
+                stored
+                    .attempt_result_code
+                    .ok_or(DatabaseError::StoredProtocolValue)?,
+            ),
+        ),
+        Some(_) => return Err(DatabaseError::StoredProtocolValue),
+    };
+    Ok(NodeEndpointStatus {
+        endpoint_id,
+        readiness,
+        last_checked_at,
+        error_code,
+    })
 }
 
 const SELECT_DUE_TCP_PROBE_SQL: &str = r"
