@@ -193,25 +193,33 @@ does not reactivate a disabled node; that requires a future explicit credential-
 
 ```json
 {
-  "schemaVersion": 1,
-  "nodeId": "uuid",
-  "revision": 12,
-  "createdAt": "2026-07-11T20:00:00Z",
-  "minAgentVersion": "0.1.0",
-  "users": [
-    {"userId": "uuid", "credentialId": "uuid", "vlessUuid": "secret", "enabled": true}
-  ],
-  "xray": {
-    "listenPort": 443,
-    "serverNames": ["www.microsoft.com"],
-    "target": "www.microsoft.com:443"
+  "document": {
+    "schemaVersion": 1,
+    "networkId": "uuid",
+    "nodeId": "uuid",
+    "revision": 12,
+    "createdAt": "2026-07-11T20:00:00Z",
+    "minAgentVersion": "0.1.0",
+    "users": [
+      {"userId": "uuid", "credentialId": "uuid", "vlessUuid": "secret", "enabled": true}
+    ],
+    "xray": {
+      "listenPort": 443,
+      "serverNames": ["www.microsoft.com"],
+      "target": "www.microsoft.com:443"
+    },
+    "signingKeyId": "uuid",
+    "controllerInstanceId": "uuid"
   },
   "signature": "base64url-signature"
 }
 ```
 
 Node-local REALITY private keys are referenced or generated locally and are not transported in the
-ordinary desired-state document.
+ordinary desired-state document. The canonical signature transcript binds the exact network, node,
+controller epoch, revision, publication time, agent floor, ordered users, ordered server names,
+closed Xray fields, and signing-key ID. Changing or reordering any covered value invalidates the
+signature.
 
 The initial sync slice implements the authenticated `204` path. Node Host rejects a `200` desired
 state until signature verification and atomic apply are implemented; it never treats an unsigned

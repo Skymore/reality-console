@@ -6,6 +6,7 @@
 
 pub mod account;
 pub mod crypto;
+pub mod desired;
 pub mod enrollment;
 pub mod error;
 pub mod id;

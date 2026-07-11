@@ -435,12 +435,14 @@ pub struct DesiredXrayState {
     pub target: String,
 }
 
-/// Immutable signed desired-state artifact for one node and revision.
+/// Immutable desired-state document for one node and revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SignedDesiredState {
+pub struct DesiredStateDocument {
     /// Desired-state schema version.
     pub schema_version: u16,
+    /// Exact target private network.
+    pub network_id: NetworkId,
     /// Exact target node.
     pub node_id: NodeId,
     /// Monotonic immutable revision.
@@ -457,14 +459,20 @@ pub struct SignedDesiredState {
     pub signing_key_id: SigningKeyId,
     /// Controller epoch used to prevent restore rollback.
     pub controller_instance_id: ControllerInstanceId,
+}
+
+/// Signature envelope for one immutable desired-state document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SignedDesiredState {
+    /// Closed document covered by the controller signature.
+    pub document: DesiredStateDocument,
     /// Signature over the canonical unsigned document.
     pub signature: Ed25519Signature,
 }
 
-impl SignedDesiredState {
+impl DesiredStateDocument {
     /// Validates shape, target, schema support, and monotonicity.
-    ///
-    /// This does not verify [`SignedDesiredState::signature`].
     ///
     /// # Errors
     ///
@@ -473,7 +481,9 @@ impl SignedDesiredState {
     /// bounded Xray fields.
     pub fn validate_for(
         &self,
+        expected_network_id: NetworkId,
         expected_node_id: NodeId,
+        expected_controller_instance_id: ControllerInstanceId,
         last_seen_revision: Option<Revision>,
         supported_schema_versions: &[u16],
     ) -> Result<(), ProtocolValidationError> {
@@ -484,11 +494,25 @@ impl SignedDesiredState {
                 "desired-state schema version is not supported",
             ));
         }
+        if self.network_id != expected_network_id {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::IdentityMismatch,
+                "networkId",
+                "desired state is addressed to another network",
+            ));
+        }
         if self.node_id != expected_node_id {
             return Err(ProtocolValidationError::new(
                 ValidationCode::IdentityMismatch,
                 "nodeId",
                 "desired state is addressed to another node",
+            ));
+        }
+        if self.controller_instance_id != expected_controller_instance_id {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::IdentityMismatch,
+                "controllerInstanceId",
+                "desired state belongs to another controller epoch",
             ));
         }
         if last_seen_revision.is_some_and(|last| self.revision <= last) {
@@ -516,15 +540,43 @@ impl SignedDesiredState {
                     "user and credential IDs must be unique within desired state",
                 ));
             }
-            if user.vless_uuid.expose_secret().is_empty() {
+            let vless_uuid = user.vless_uuid.expose_secret();
+            let canonical_uuid = uuid::Uuid::parse_str(vless_uuid)
+                .map(|value| value.hyphenated().to_string() == *vless_uuid)
+                .unwrap_or(false);
+            if !canonical_uuid {
                 return Err(ProtocolValidationError::new(
-                    ValidationCode::MissingField,
+                    ValidationCode::InvalidFormat,
                     "users.vlessUuid",
-                    "VLESS credential is required",
+                    "VLESS credential must be a canonical lowercase UUID",
                 ));
             }
         }
         self.xray.validate()
+    }
+}
+
+impl SignedDesiredState {
+    /// Validates the enclosed document without verifying its signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`DesiredStateDocument::validate_for`].
+    pub fn validate_for(
+        &self,
+        expected_network_id: NetworkId,
+        expected_node_id: NodeId,
+        expected_controller_instance_id: ControllerInstanceId,
+        last_seen_revision: Option<Revision>,
+        supported_schema_versions: &[u16],
+    ) -> Result<(), ProtocolValidationError> {
+        self.document.validate_for(
+            expected_network_id,
+            expected_node_id,
+            expected_controller_instance_id,
+            last_seen_revision,
+            supported_schema_versions,
+        )
     }
 }
 
@@ -770,10 +822,17 @@ fn validate_short_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{RevisionProgress, RevisionResult, RevisionResultState};
+    use super::{
+        DesiredStateDocument, DesiredUser, DesiredXrayState, RevisionProgress, RevisionResult,
+        RevisionResultState,
+    };
     use crate::crypto::Sha256Digest;
     use crate::error::ErrorCode;
-    use crate::id::{Revision, Timestamp};
+    use crate::id::{
+        ControllerInstanceId, CredentialId, NetworkId, NodeId, Revision, SigningKeyId, Timestamp,
+        UserId,
+    };
+    use crate::secret::Secret;
 
     fn timestamp(value: &str) -> Timestamp {
         value.parse().unwrap()
@@ -805,6 +864,30 @@ mod tests {
             completed_at: timestamp("2026-07-11T20:00:04Z"),
             error_code,
             rollback_revision,
+        }
+    }
+
+    fn desired_document() -> DesiredStateDocument {
+        DesiredStateDocument {
+            schema_version: 1,
+            network_id: NetworkId::new(),
+            node_id: NodeId::new(),
+            revision: Revision::new(1).unwrap(),
+            created_at: timestamp("2026-07-11T20:00:00Z"),
+            min_agent_version: "0.1.0".to_string(),
+            users: vec![DesiredUser {
+                user_id: UserId::new(),
+                credential_id: CredentialId::new(),
+                vless_uuid: Secret::new("2f55c837-7be6-4752-b58a-a7f51401bd89".to_string()),
+                enabled: true,
+            }],
+            xray: DesiredXrayState {
+                listen_port: 443,
+                server_names: vec!["www.microsoft.com".to_string()],
+                target: "www.microsoft.com:443".to_string(),
+            },
+            signing_key_id: SigningKeyId::new(),
+            controller_instance_id: ControllerInstanceId::new(),
         }
     }
 
@@ -849,5 +932,74 @@ mod tests {
         let mut invalid = result(RevisionResultState::Applied);
         invalid.error_code = Some(ErrorCode::ValidationFailed);
         assert!(invalid.validate(revision).is_err());
+    }
+
+    #[test]
+    fn desired_state_is_bound_to_exact_network_node_and_controller() {
+        let document = desired_document();
+        assert!(document
+            .validate_for(
+                document.network_id,
+                document.node_id,
+                document.controller_instance_id,
+                None,
+                &[1],
+            )
+            .is_ok());
+        assert!(document
+            .validate_for(
+                NetworkId::new(),
+                document.node_id,
+                document.controller_instance_id,
+                None,
+                &[1],
+            )
+            .is_err());
+        assert!(document
+            .validate_for(
+                document.network_id,
+                NodeId::new(),
+                document.controller_instance_id,
+                None,
+                &[1],
+            )
+            .is_err());
+        assert!(document
+            .validate_for(
+                document.network_id,
+                document.node_id,
+                ControllerInstanceId::new(),
+                None,
+                &[1],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn desired_state_requires_canonical_vless_credentials_and_newer_revisions() {
+        let mut document = desired_document();
+        document.users[0].vless_uuid =
+            Secret::new("2F55C837-7BE6-4752-B58A-A7F51401BD89".to_string());
+        assert!(document
+            .validate_for(
+                document.network_id,
+                document.node_id,
+                document.controller_instance_id,
+                None,
+                &[1],
+            )
+            .is_err());
+
+        document.users[0].vless_uuid =
+            Secret::new("2f55c837-7be6-4752-b58a-a7f51401bd89".to_string());
+        assert!(document
+            .validate_for(
+                document.network_id,
+                document.node_id,
+                document.controller_instance_id,
+                Some(document.revision),
+                &[1],
+            )
+            .is_err());
     }
 }
