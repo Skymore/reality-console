@@ -1,8 +1,16 @@
 use crate::db::{Database, DatabaseError};
 use async_trait::async_trait;
-use control_protocol::id::{EndpointId, NetworkId, NodeId, Revision};
+use control_protocol::id::{EndpointId, NetworkId, NodeId, RequestId, Revision};
+use control_protocol::probe::{
+    is_public_probe_ipv4, TcpProbeExecutorRequest, TcpProbeExecutorResponse,
+    TcpProbeExecutorResult, MAX_TCP_PROBE_TARGETS, MAX_TCP_PROBE_TIMEOUT_MILLIS,
+    MIN_TCP_PROBE_TIMEOUT_MILLIS, TCP_PROBE_EXECUTOR_SCHEMA_VERSION,
+};
 use control_protocol::secret::Secret;
+use futures_util::StreamExt as _;
+use reqwest::redirect::Policy;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
@@ -11,6 +19,7 @@ use thiserror::Error;
 use tokio::net::{lookup_host, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::{timeout_at, Instant};
+use url::{Host, Url};
 use uuid::Uuid;
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -20,6 +29,11 @@ const DEFAULT_SUCCESS_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_FAILURE_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_NODE_ONLINE_WINDOW: Duration = Duration::from_secs(90);
 const MAX_RESOLVED_ADDRESSES: usize = 16;
+const MAX_REMOTE_RESPONSE_BYTES: usize = 8 * 1024;
+const REMOTE_HTTP_OVERHEAD: Duration = Duration::from_secs(5);
+const REMOTE_PROBE_PATH: &str = "/v1/tcp-probe";
+const MIN_REMOTE_TOKEN_BYTES: usize = 32;
+const MAX_REMOTE_TOKEN_BYTES: usize = 4 * 1024;
 
 /// Selects whether this process executes endpoint probes itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +43,8 @@ pub enum ProbeMode {
     /// Execute TCP preflight from this process. This is valid only when the
     /// controller is outside the candidate node's LAN.
     LocalTcp,
+    /// Resolve and pin targets locally, then invoke an external HTTPS executor.
+    RemoteHttp,
 }
 
 impl FromStr for ProbeMode {
@@ -38,6 +54,7 @@ impl FromStr for ProbeMode {
         match value {
             "disabled" => Ok(Self::Disabled),
             "local-tcp" => Ok(Self::LocalTcp),
+            "remote-http" => Ok(Self::RemoteHttp),
             _ => Err(ProbeModeParseError),
         }
     }
@@ -47,6 +64,74 @@ impl FromStr for ProbeMode {
 #[derive(Debug, Error)]
 #[error("invalid probe mode")]
 pub struct ProbeModeParseError;
+
+/// Validated endpoint and redacted deployment credential for a remote executor.
+#[derive(Clone)]
+pub struct RemoteTcpProbeConfig {
+    endpoint: Url,
+    token: Secret<String>,
+    allow_loopback_http: bool,
+}
+
+impl RemoteTcpProbeConfig {
+    /// Builds production remote-executor configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoteTcpProbeConfigError`] unless the URL is an exact HTTPS
+    /// executor endpoint and the deployment token is a bounded visible-ASCII
+    /// Bearer value without comma separators.
+    pub fn new(endpoint: &str, token: String) -> Result<Self, RemoteTcpProbeConfigError> {
+        Self::build(endpoint, token, false)
+    }
+
+    fn build(
+        endpoint: &str,
+        token: String,
+        allow_loopback_http: bool,
+    ) -> Result<Self, RemoteTcpProbeConfigError> {
+        let endpoint = Url::parse(endpoint).map_err(|_| RemoteTcpProbeConfigError::InvalidUrl)?;
+        validate_remote_endpoint(&endpoint, allow_loopback_http)?;
+        let token_is_valid = (MIN_REMOTE_TOKEN_BYTES..=MAX_REMOTE_TOKEN_BYTES)
+            .contains(&token.len())
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && byte != b',');
+        if !token_is_valid {
+            return Err(RemoteTcpProbeConfigError::InvalidToken);
+        }
+        Ok(Self {
+            endpoint,
+            token: Secret::new(token),
+            allow_loopback_http,
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(endpoint: &str, token: &str) -> Self {
+        Self::build(endpoint, token.to_string(), true).expect("valid test remote probe config")
+    }
+}
+
+impl fmt::Debug for RemoteTcpProbeConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteTcpProbeConfig")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"[redacted]")
+            .field("allow_loopback_http", &self.allow_loopback_http)
+            .finish()
+    }
+}
+
+/// Invalid remote TCP executor deployment configuration.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTcpProbeConfigError {
+    #[error("remote TCP probe URL must be the exact HTTPS /v1/tcp-probe endpoint")]
+    InvalidUrl,
+    #[error("remote TCP probe token must contain 32 to 4096 visible ASCII bytes without commas")]
+    InvalidToken,
+}
 
 /// Timing policy for one resilient TCP preflight worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +243,7 @@ impl TcpProbeJob {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpProbeErrorCode {
     TargetNotPublic,
+    NoSupportedAddress,
     DnsFailed,
     DnsTimeout,
     TooManyAddresses,
@@ -171,6 +257,7 @@ impl TcpProbeErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TargetNotPublic => "direct_target_not_public",
+            Self::NoSupportedAddress => "direct_no_supported_address",
             Self::DnsFailed => "direct_dns_failed",
             Self::DnsTimeout => "direct_dns_timeout",
             Self::TooManyAddresses => "direct_dns_too_many_addresses",
@@ -239,6 +326,40 @@ impl TcpProbeExecutor for SystemTcpProbeExecutor {
     }
 }
 
+/// HTTPS client for a privacy-minimized external TCP executor.
+#[derive(Clone)]
+pub struct RemoteHttpTcpProbeExecutor {
+    client: reqwest::Client,
+    config: RemoteTcpProbeConfig,
+}
+
+impl RemoteHttpTcpProbeExecutor {
+    /// Creates a redirect-free bounded HTTPS executor client.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProbeServiceError::RemoteClientBuild`] when the TLS HTTP
+    /// client cannot be initialized.
+    pub fn new(config: RemoteTcpProbeConfig) -> Result<Self, ProbeServiceError> {
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .connect_timeout(REMOTE_HTTP_OVERHEAD)
+            .https_only(!config.allow_loopback_http)
+            .user_agent("private-network-control/0.1 tcp-preflight")
+            .build()
+            .map_err(|_| ProbeServiceError::RemoteClientBuild)?;
+        Ok(Self { client, config })
+    }
+}
+
+#[async_trait]
+impl TcpProbeExecutor for RemoteHttpTcpProbeExecutor {
+    async fn probe(&self, address: &str, port: u16, timeout: Duration) -> TcpProbeResult {
+        probe_remote_http(self, address, port, timeout).await
+    }
+}
+
 /// Runs the local TCP preflight worker until the supplied shutdown future resolves.
 ///
 /// Database and network failures are isolated to one cycle and retried. A TCP
@@ -257,8 +378,50 @@ where
     F: Future<Output = ()>,
 {
     let options = options.validate()?;
+    run_tcp_until(database, options, SystemTcpProbeExecutor, shutdown).await
+}
+
+/// Runs privacy-minimized TCP preflight through an external HTTP executor.
+///
+/// # Errors
+///
+/// Returns [`ProbeServiceError`] before claiming work when options cannot fit
+/// inside the durable claim lease or the bounded HTTPS client cannot be built.
+pub async fn run_remote_tcp_until<F>(
+    database: Database,
+    options: TcpProbeLoopOptions,
+    config: RemoteTcpProbeConfig,
+    shutdown: F,
+) -> Result<(), ProbeServiceError>
+where
+    F: Future<Output = ()>,
+{
+    let options = options.validate()?;
+    let maximum_cycle = options
+        .connect_timeout
+        .saturating_mul(2)
+        .saturating_add(REMOTE_HTTP_OVERHEAD);
+    if options.connect_timeout.as_millis() > u128::from(MAX_TCP_PROBE_TIMEOUT_MILLIS)
+        || options.connect_timeout.as_millis() < u128::from(MIN_TCP_PROBE_TIMEOUT_MILLIS)
+        || options.claim_lease <= maximum_cycle
+    {
+        return Err(ProbeServiceError::InvalidOptions);
+    }
+    let executor = RemoteHttpTcpProbeExecutor::new(config)?;
+    run_tcp_until(database, options, executor, shutdown).await
+}
+
+async fn run_tcp_until<E, F>(
+    database: Database,
+    options: TcpProbeLoopOptions,
+    executor: E,
+    shutdown: F,
+) -> Result<(), ProbeServiceError>
+where
+    E: TcpProbeExecutor,
+    F: Future<Output = ()>,
+{
     let runner_id = Uuid::new_v4();
-    let executor = SystemTcpProbeExecutor;
     tokio::pin!(shutdown);
 
     loop {
@@ -312,6 +475,133 @@ where
         "TCP endpoint preflight completed"
     );
     Ok(true)
+}
+
+async fn probe_remote_http(
+    executor: &RemoteHttpTcpProbeExecutor,
+    address: &str,
+    port: u16,
+    timeout: Duration,
+) -> TcpProbeResult {
+    if port == 0
+        || timeout.as_millis() < u128::from(MIN_TCP_PROBE_TIMEOUT_MILLIS)
+        || timeout.as_millis() > u128::from(MAX_TCP_PROBE_TIMEOUT_MILLIS)
+    {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    }
+    let started = Instant::now();
+    let Some(dns_deadline) = started.checked_add(timeout) else {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    };
+    let resolved = match resolve_public_targets(address, port, dns_deadline).await {
+        Ok(resolved) => resolved,
+        Err(code) => return TcpProbeResult::failed(code),
+    };
+    let targets = resolved
+        .into_iter()
+        .filter_map(|target| match target.ip() {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        })
+        .take(MAX_TCP_PROBE_TARGETS)
+        .collect::<Vec<_>>();
+    let Some(fallback_address) = targets.first().copied() else {
+        return TcpProbeResult::failed(TcpProbeErrorCode::NoSupportedAddress);
+    };
+    let Ok(timeout_millis) = u32::try_from(timeout.as_millis()) else {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    };
+    let request = TcpProbeExecutorRequest {
+        schema_version: TCP_PROBE_EXECUTOR_SCHEMA_VERSION,
+        request_id: RequestId::new(),
+        targets,
+        port,
+        timeout_millis,
+    };
+    if request.validate().is_err() {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    }
+
+    let http_timeout = timeout.saturating_add(REMOTE_HTTP_OVERHEAD);
+    let Ok(response) = executor
+        .client
+        .post(executor.config.endpoint.clone())
+        .timeout(http_timeout)
+        .bearer_auth(executor.config.token.expose_secret())
+        .json(&request)
+        .send()
+        .await
+    else {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    };
+    if response.status() != reqwest::StatusCode::OK || !response_is_json(&response) {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    }
+    let Some(body) = read_bounded_response(response, MAX_REMOTE_RESPONSE_BYTES).await else {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    };
+    let Ok(response) = serde_json::from_slice::<TcpProbeExecutorResponse>(&body) else {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    };
+    if response.validate_for(&request).is_err() {
+        return TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed);
+    }
+
+    match response.result {
+        TcpProbeExecutorResult::Connected {
+            resolved_address,
+            latency_millis,
+        } => TcpProbeResult::Connected {
+            resolved_address: IpAddr::V4(resolved_address),
+            latency: Duration::from_millis(u64::from(latency_millis)),
+        },
+        TcpProbeExecutorResult::Unreachable { latency_millis } => TcpProbeResult::Failed {
+            code: TcpProbeErrorCode::TcpUnreachable,
+            resolved_address: Some(IpAddr::V4(fallback_address)),
+            latency: Some(Duration::from_millis(u64::from(latency_millis))),
+        },
+        TcpProbeExecutorResult::TimedOut { latency_millis } => TcpProbeResult::Failed {
+            code: TcpProbeErrorCode::TcpTimeout,
+            resolved_address: Some(IpAddr::V4(fallback_address)),
+            latency: Some(Duration::from_millis(u64::from(latency_millis))),
+        },
+        TcpProbeExecutorResult::ExecutorFailed => {
+            TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed)
+        }
+    }
+}
+
+fn response_is_json(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        })
+}
+
+async fn read_bounded_response(response: reqwest::Response, maximum: usize) -> Option<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.ok()?;
+        let next_length = body.len().checked_add(chunk.len())?;
+        if next_length > maximum {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
 }
 
 async fn probe_public_tcp(address: &str, port: u16, timeout: Duration) -> TcpProbeResult {
@@ -396,19 +686,7 @@ fn is_publishable_address(address: IpAddr) -> bool {
 }
 
 fn is_publishable_ipv4(address: Ipv4Addr) -> bool {
-    let octets = address.octets();
-    !address.is_private()
-        && !address.is_loopback()
-        && !address.is_link_local()
-        && !address.is_unspecified()
-        && !address.is_multicast()
-        && !address.is_broadcast()
-        && !address.is_documentation()
-        && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
-        && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-        && !(octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
-        && octets[0] != 0
-        && octets[0] < 240
+    is_public_probe_ipv4(address)
 }
 
 fn is_publishable_ipv6(address: Ipv6Addr) -> bool {
@@ -422,21 +700,67 @@ fn is_publishable_ipv6(address: Ipv6Addr) -> bool {
         && !(segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020))
 }
 
+fn validate_remote_endpoint(
+    endpoint: &Url,
+    allow_loopback_http: bool,
+) -> Result<(), RemoteTcpProbeConfigError> {
+    let Some(host) = endpoint.host() else {
+        return Err(RemoteTcpProbeConfigError::InvalidUrl);
+    };
+    let loopback = match host {
+        Host::Ipv4(address) => address.is_loopback(),
+        Host::Ipv6(address) => address.is_loopback(),
+        Host::Domain(domain) => domain == "localhost" || domain.ends_with(".localhost"),
+    };
+    let host_is_allowed = match host {
+        Host::Ipv4(address) => is_public_probe_ipv4(address) || (allow_loopback_http && loopback),
+        Host::Ipv6(address) => is_publishable_ipv6(address) || (allow_loopback_http && loopback),
+        Host::Domain(_) => !loopback || allow_loopback_http,
+    };
+    let transport_is_allowed = endpoint.scheme() == "https"
+        || (allow_loopback_http && loopback && endpoint.scheme() == "http");
+    if !transport_is_allowed
+        || !host_is_allowed
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.path() != REMOTE_PROBE_PATH
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(RemoteTcpProbeConfigError::InvalidUrl);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ProbeServiceError {
     #[error("TCP probe loop timing options are invalid")]
     InvalidOptions,
+    #[error("remote TCP probe HTTP client could not be initialized")]
+    RemoteClientBuild,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_publishable_address, ProbeMode, SystemTcpProbeExecutor, TcpProbeErrorCode,
-        TcpProbeExecutor, TcpProbeLoopOptions, TcpProbeResult,
+        is_publishable_address, ProbeMode, RemoteHttpTcpProbeExecutor, RemoteTcpProbeConfig,
+        SystemTcpProbeExecutor, TcpProbeErrorCode, TcpProbeExecutor, TcpProbeLoopOptions,
+        TcpProbeResult,
+    };
+    use axum::http::{header, HeaderMap, StatusCode};
+    use axum::response::Redirect;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use control_protocol::probe::{
+        TcpProbeExecutorRequest, TcpProbeExecutorResponse, TcpProbeExecutorResult,
+        TCP_PROBE_EXECUTOR_SCHEMA_VERSION,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::str::FromStr as _;
     use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    const REMOTE_TOKEN: &str = "remote-probe-test-token-with-at-least-32-bytes";
 
     #[test]
     fn mode_is_explicit_and_closed() {
@@ -448,7 +772,47 @@ mod tests {
             ProbeMode::from_str("local-tcp").unwrap(),
             ProbeMode::LocalTcp
         );
+        assert_eq!(
+            ProbeMode::from_str("remote-http").unwrap(),
+            ProbeMode::RemoteHttp
+        );
         assert!(ProbeMode::from_str("tcp").is_err());
+    }
+
+    #[test]
+    fn remote_configuration_is_strict_and_redacts_its_token() {
+        let config = RemoteTcpProbeConfig::new(
+            "https://probe.example/v1/tcp-probe",
+            REMOTE_TOKEN.to_string(),
+        )
+        .unwrap();
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("probe.example"));
+        assert!(!rendered.contains(REMOTE_TOKEN));
+        assert!(RemoteTcpProbeConfig::new(
+            "http://probe.example/v1/tcp-probe",
+            REMOTE_TOKEN.to_string()
+        )
+        .is_err());
+        assert!(RemoteTcpProbeConfig::new(
+            "https://127.0.0.1/v1/tcp-probe",
+            REMOTE_TOKEN.to_string()
+        )
+        .is_err());
+        assert!(
+            RemoteTcpProbeConfig::new("https://probe.example/wrong", REMOTE_TOKEN.to_string())
+                .is_err()
+        );
+        assert!(RemoteTcpProbeConfig::new(
+            "https://probe.example/v1/tcp-probe?target=8.8.8.8",
+            REMOTE_TOKEN.to_string()
+        )
+        .is_err());
+        assert!(RemoteTcpProbeConfig::new(
+            "https://probe.example/v1/tcp-probe",
+            "short".to_string()
+        )
+        .is_err());
     }
 
     #[test]
@@ -493,5 +857,128 @@ mod tests {
             result,
             TcpProbeResult::failed(TcpProbeErrorCode::TargetNotPublic)
         );
+    }
+
+    #[tokio::test]
+    async fn remote_executor_sends_a_bounded_authenticated_request() {
+        let router = Router::new().route(
+            "/v1/tcp-probe",
+            post(
+                |headers: HeaderMap, Json(request): Json<TcpProbeExecutorRequest>| async move {
+                    assert_eq!(
+                        headers
+                            .get(header::AUTHORIZATION)
+                            .unwrap()
+                            .to_str()
+                            .unwrap(),
+                        format!("Bearer {REMOTE_TOKEN}")
+                    );
+                    request.validate().unwrap();
+                    Json(TcpProbeExecutorResponse {
+                        schema_version: TCP_PROBE_EXECUTOR_SCHEMA_VERSION,
+                        request_id: request.request_id,
+                        result: TcpProbeExecutorResult::Connected {
+                            resolved_address: request.targets[0],
+                            latency_millis: 11,
+                        },
+                    })
+                },
+            ),
+        );
+        let endpoint = spawn_mock_executor(router).await;
+        let executor = remote_test_executor(&endpoint);
+        let result = executor.probe("8.8.8.8", 443, Duration::from_secs(1)).await;
+        assert_eq!(
+            result,
+            TcpProbeResult::connected(
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                Duration::from_millis(11)
+            )
+        );
+        assert_eq!(
+            executor
+                .probe("127.0.0.1", 443, Duration::from_secs(1))
+                .await,
+            TcpProbeResult::failed(TcpProbeErrorCode::TargetNotPublic)
+        );
+        assert_eq!(
+            executor
+                .probe("2606:4700:4700::1111", 443, Duration::from_secs(1))
+                .await,
+            TcpProbeResult::failed(TcpProbeErrorCode::NoSupportedAddress)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_executor_rejects_unbound_or_oversized_responses() {
+        let unbound = Router::new().route(
+            "/v1/tcp-probe",
+            post(|Json(request): Json<TcpProbeExecutorRequest>| async move {
+                Json(TcpProbeExecutorResponse {
+                    schema_version: TCP_PROBE_EXECUTOR_SCHEMA_VERSION,
+                    request_id: request.request_id,
+                    result: TcpProbeExecutorResult::Connected {
+                        resolved_address: Ipv4Addr::new(9, 9, 9, 9),
+                        latency_millis: 1,
+                    },
+                })
+            }),
+        );
+        let endpoint = spawn_mock_executor(unbound).await;
+        assert_eq!(
+            remote_test_executor(&endpoint)
+                .probe("8.8.8.8", 443, Duration::from_secs(1))
+                .await,
+            TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed)
+        );
+
+        let oversized = Router::new().route(
+            "/v1/tcp-probe",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    "a".repeat(9 * 1024),
+                )
+            }),
+        );
+        let endpoint = spawn_mock_executor(oversized).await;
+        assert_eq!(
+            remote_test_executor(&endpoint)
+                .probe("8.8.8.8", 443, Duration::from_secs(1))
+                .await,
+            TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed)
+        );
+
+        let redirect = Router::new()
+            .route(
+                "/v1/tcp-probe",
+                post(|| async { Redirect::temporary("/redirected") }),
+            )
+            .route("/redirected", post(panic_if_redirected));
+        let endpoint = spawn_mock_executor(redirect).await;
+        assert_eq!(
+            remote_test_executor(&endpoint)
+                .probe("8.8.8.8", 443, Duration::from_secs(1))
+                .await,
+            TcpProbeResult::failed(TcpProbeErrorCode::ExecutorFailed)
+        );
+    }
+
+    fn remote_test_executor(endpoint: &str) -> RemoteHttpTcpProbeExecutor {
+        RemoteHttpTcpProbeExecutor::new(RemoteTcpProbeConfig::for_test(endpoint, REMOTE_TOKEN))
+            .unwrap()
+    }
+
+    async fn spawn_mock_executor(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}/v1/tcp-probe")
+    }
+
+    async fn panic_if_redirected() -> StatusCode {
+        panic!("remote executor must not follow redirects");
     }
 }

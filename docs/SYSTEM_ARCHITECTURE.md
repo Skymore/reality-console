@@ -182,11 +182,12 @@ probing its own public address would test NAT loopback. A management overlay suc
 secure operations but does not by itself make the Xray endpoint available to ordinary Connect
 clients.
 
-For a home controller, the initial external TCP executor is an optional Cloudflare Worker invoked
-outbound by Control Service. Control resolves and filters DNS locally, sends at most six pinned
-public IPv4 literals plus the signed public port, and retains all node identity plus durable claim
-state locally. The Worker sends no bytes after TCP connect and cannot change verification state.
-It is replaceable by a small VPS executor using the same closed request/response contract.
+For a home controller, the implemented external TCP executor is an optional Cloudflare Worker
+invoked outbound by Control Service's explicit `remote-http` mode. Control resolves and filters DNS
+locally, sends at most six pinned public IPv4 literals plus the signed public port, and retains all
+node identity plus durable claim state locally. The redirect-free bounded client does not use
+environment proxies. The Worker sends no bytes after TCP connect and cannot change verification
+state. It is replaceable by a small VPS executor using the same closed request/response contract.
 
 ## 8. Offline And Failure Behavior
 

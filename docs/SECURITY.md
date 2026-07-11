@@ -509,6 +509,9 @@ evidence never marks an endpoint `verified` or enters a client bundle. A later V
 canary uses a stronger separately scoped identity and is the first phase allowed to affect
 publication. Executor logs and platform observability stay disabled, request bodies and
 authorization headers are never logged, and the token is stored as a platform secret.
+Control accepts only the exact configured HTTPS `/v1/tcp-probe` URL, disables redirects and system
+proxies, bounds the response body, and validates response schema, request identity, pinned address,
+and latency before recording evidence.
 
 ## Relay Trust Boundary
 

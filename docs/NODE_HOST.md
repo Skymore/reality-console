@@ -288,10 +288,11 @@ The public listener and automatic router mapping alone do not prove internet rea
 Service now durably claims and records an external, public-address-only TCP preflight, but the
 in-process runner is valid only when that controller process is outside the node's LAN. A home
 controller probing its own public endpoint measures NAT loopback behavior, not outside
-reachability. Remote probe-worker transport, the protocol-aware VLESS + REALITY canary, IPv6
-admission, relay fallback, bandwidth shaping, and durable quota counters are not implemented in
-this milestone. Until protocol-probe convergence lands, Control makes no claim that a mapped node
-is externally reachable; unsupported routers still require a valid manual TCP forwarding rule.
+reachability. The implemented `remote-http` mode can instead invoke the privacy-minimized external
+TCP executor. The protocol-aware VLESS + REALITY canary, IPv6 admission, relay fallback, bandwidth
+shaping, and durable quota counters are not implemented in this milestone. Until protocol-probe
+convergence lands, Control makes no claim that a mapped node is externally reachable; unsupported
+routers still require a valid manual TCP forwarding rule.
 
 ## 7. Outbound-Only Control Sync
 
@@ -548,9 +549,11 @@ hostname once, rejects the entire answer set if any address is not globally publ
 answer count, and connects only to those pinned socket addresses. Claims are bound to the current
 heartbeat generation and applied revision; stale completions are retained as cancelled evidence.
 `CONTROL_PROBE_MODE=local-tcp` is disabled by default and is not valid when Control Service shares
-the node's LAN. The address is still supplied by the enrolled node, so this local runner is not
-exposed as a public probe API; remote-worker release additionally requires an independent
-address-authorization policy. TCP success remains non-publishable until step 4 is implemented.
+the node's LAN. `remote-http` resolves and filters DNS in Control, pins at most six IPv4 literals,
+requires the signed public port, and invokes an HTTPS executor with a separately scoped token. The
+candidate address is still supplied by the enrolled node, so rate limits, active-node approval,
+and the signed-port restriction remain required. TCP success remains non-publishable until step 4
+is implemented.
 
 ## 11. Automatic Router Mapping
 

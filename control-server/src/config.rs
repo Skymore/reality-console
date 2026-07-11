@@ -1,5 +1,7 @@
 use crate::auth::{BootstrapTokenError, BootstrapTokenVerifier};
-use crate::probe::{ProbeMode, TcpProbeLoopOptions};
+use crate::probe::{
+    ProbeMode, RemoteTcpProbeConfig, RemoteTcpProbeConfigError, TcpProbeLoopOptions,
+};
 use std::env;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::PathBuf;
@@ -23,6 +25,7 @@ pub struct ServiceConfig {
     pub request_timeout: Duration,
     pub probe_mode: ProbeMode,
     pub probe_options: TcpProbeLoopOptions,
+    pub remote_probe: Option<RemoteTcpProbeConfig>,
 }
 
 impl ServiceConfig {
@@ -59,6 +62,9 @@ impl ServiceConfig {
         let probe_mode = env::var("CONTROL_PROBE_MODE")
             .map_or(Ok(ProbeMode::Disabled), |value| value.parse())
             .map_err(|_| ConfigError::InvalidProbeMode)?;
+        let remote_url = optional_env("CONTROL_TCP_PROBE_URL")?;
+        let remote_token = optional_env("CONTROL_TCP_PROBE_TOKEN")?;
+        let remote_probe = build_remote_probe_config(probe_mode, remote_url, remote_token)?;
 
         Ok(Self {
             bind_address,
@@ -69,6 +75,7 @@ impl ServiceConfig {
             request_timeout: Duration::from_secs(request_timeout_seconds),
             probe_mode,
             probe_options: TcpProbeLoopOptions::default(),
+            remote_probe,
         })
     }
 
@@ -87,7 +94,32 @@ impl ServiceConfig {
             request_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECONDS),
             probe_mode: ProbeMode::Disabled,
             probe_options: TcpProbeLoopOptions::default(),
+            remote_probe: None,
         })
+    }
+}
+
+fn optional_env(name: &'static str) -> Result<Option<String>, ConfigError> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidEnvironment(name)),
+    }
+}
+
+fn build_remote_probe_config(
+    mode: ProbeMode,
+    url: Option<String>,
+    token: Option<String>,
+) -> Result<Option<RemoteTcpProbeConfig>, ConfigError> {
+    match (mode, url, token) {
+        (ProbeMode::RemoteHttp, Some(url), Some(token)) => {
+            Ok(Some(RemoteTcpProbeConfig::new(&url, token)?))
+        }
+        (ProbeMode::RemoteHttp, None, _) => Err(ConfigError::MissingRemoteProbeUrl),
+        (ProbeMode::RemoteHttp, _, None) => Err(ConfigError::MissingRemoteProbeToken),
+        (_, None, None) => Ok(None),
+        _ => Err(ConfigError::RemoteProbeSettingsWithoutMode),
     }
 }
 
@@ -151,13 +183,26 @@ pub enum ConfigError {
     InvalidNetworkName,
     #[error("CONTROL_PUBLIC_ORIGIN must be an HTTP(S) origin without credentials or a path")]
     InvalidControllerOrigin,
-    #[error("CONTROL_PROBE_MODE must be disabled or local-tcp")]
+    #[error("CONTROL_PROBE_MODE must be disabled, local-tcp, or remote-http")]
     InvalidProbeMode,
+    #[error("{0} must contain valid UTF-8")]
+    InvalidEnvironment(&'static str),
+    #[error("CONTROL_TCP_PROBE_URL is required for remote-http mode")]
+    MissingRemoteProbeUrl,
+    #[error("CONTROL_TCP_PROBE_TOKEN is required for remote-http mode")]
+    MissingRemoteProbeToken,
+    #[error("CONTROL_TCP_PROBE_URL and CONTROL_TCP_PROBE_TOKEN require remote-http mode")]
+    RemoteProbeSettingsWithoutMode,
+    #[error(transparent)]
+    InvalidRemoteProbe(#[from] RemoteTcpProbeConfigError),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_controller_origin;
+    use super::{build_remote_probe_config, normalize_controller_origin, ConfigError};
+    use crate::probe::ProbeMode;
+
+    const TOKEN: &str = "remote-config-test-token-with-at-least-32-bytes";
 
     #[test]
     fn controller_origin_is_strict_and_canonical() {
@@ -178,5 +223,39 @@ mod tests {
             normalize_controller_origin("http://[::1]:8787/").unwrap(),
             "http://[::1]:8787"
         );
+    }
+
+    #[test]
+    fn remote_probe_settings_are_complete_and_mode_scoped() {
+        assert!(build_remote_probe_config(ProbeMode::Disabled, None, None)
+            .unwrap()
+            .is_none());
+        assert!(build_remote_probe_config(
+            ProbeMode::RemoteHttp,
+            Some("https://probe.example/v1/tcp-probe".to_string()),
+            Some(TOKEN.to_string())
+        )
+        .unwrap()
+        .is_some());
+        assert!(matches!(
+            build_remote_probe_config(ProbeMode::RemoteHttp, None, Some(TOKEN.to_string())),
+            Err(ConfigError::MissingRemoteProbeUrl)
+        ));
+        assert!(matches!(
+            build_remote_probe_config(
+                ProbeMode::RemoteHttp,
+                Some("https://probe.example/v1/tcp-probe".to_string()),
+                None
+            ),
+            Err(ConfigError::MissingRemoteProbeToken)
+        ));
+        assert!(matches!(
+            build_remote_probe_config(
+                ProbeMode::Disabled,
+                Some("https://probe.example/v1/tcp-probe".to_string()),
+                Some(TOKEN.to_string())
+            ),
+            Err(ConfigError::RemoteProbeSettingsWithoutMode)
+        ));
     }
 }

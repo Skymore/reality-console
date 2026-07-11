@@ -1,4 +1,4 @@
-use control_server::probe::run_local_tcp_until;
+use control_server::probe::{run_local_tcp_until, run_remote_tcp_until};
 use control_server::{build_router, AppState, Database, ProbeMode, ServiceConfig};
 use std::error::Error;
 use std::future::IntoFuture as _;
@@ -14,7 +14,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    let config = ServiceConfig::from_env()?;
+    let mut config = ServiceConfig::from_env()?;
+    let probe_mode = config.probe_mode;
+    let probe_options = config.probe_options;
+    let remote_probe = config.remote_probe.take();
     let database = Database::open(&config.database_path, &config.network_display_name)?;
     let state = AppState::new(
         database.clone(),
@@ -37,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         shutdown_signal().await;
         let _ = signal_sender.send(true);
     });
-    let probe_task = match config.probe_mode {
+    let probe_task = match probe_mode {
         ProbeMode::Disabled => None,
         ProbeMode::LocalTcp => {
             tracing::warn!(
@@ -46,7 +49,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut probe_shutdown = shutdown_sender.subscribe();
             Some(tokio::spawn(run_local_tcp_until(
                 database,
-                config.probe_options,
+                probe_options,
+                async move { wait_for_shutdown(&mut probe_shutdown).await },
+            )))
+        }
+        ProbeMode::RemoteHttp => {
+            let Some(remote_probe) = remote_probe else {
+                return Err("remote TCP probe configuration is missing".into());
+            };
+            tracing::info!("external HTTP TCP probing is enabled");
+            let mut probe_shutdown = shutdown_sender.subscribe();
+            Some(tokio::spawn(run_remote_tcp_until(
+                database,
+                probe_options,
+                remote_probe,
                 async move { wait_for_shutdown(&mut probe_shutdown).await },
             )))
         }
@@ -76,7 +92,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 server_result?;
                 probe_result??;
                 if !shutdown_was_requested {
-                    return Err("local TCP probe worker stopped unexpectedly".into());
+                    return Err("TCP probe worker stopped unexpectedly".into());
                 }
             }
         }

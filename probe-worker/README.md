@@ -28,6 +28,14 @@ npx wrangler secret put PROBE_TOKEN
 npm run deploy
 ```
 
+Then configure Control Service with the deployed endpoint and the same token:
+
+```bash
+CONTROL_PROBE_MODE=remote-http
+CONTROL_TCP_PROBE_URL=https://your-worker.workers.dev/v1/tcp-probe
+CONTROL_TCP_PROBE_TOKEN=the-same-dedicated-secret
+```
+
 Keep observability disabled for this Worker. Do not log request bodies, target addresses, or the
 `Authorization` header. The endpoint is `POST /v1/tcp-probe` and requires that secret as a Bearer
 token over HTTPS.

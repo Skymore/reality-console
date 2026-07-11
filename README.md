@@ -49,12 +49,11 @@ PCP, NAT-PMP, then UPnP order, renews and releases its owned lease, and withdraw
 change. Control Service now has a durable, lease-based external TCP preflight queue and a
 public-address-only executor with DNS pinning, bounded connection time, stale-candidate fencing,
 signed-public-port binding, and append-only results. Bare TCP success deliberately leaves endpoint
-verification `pending`;
-the remote worker transport and VLESS + REALITY canary required for client publication remain
-under implementation, along with native service installers, relay reachability, account
-synchronization, and the friend-facing setup UI/package.
-The optional probe-worker contract is now implemented and dry-run deployable; Control Service
-integration and live deployment are the next step.
+verification `pending`; the VLESS + REALITY canary required for client publication remains under
+implementation, along with native service installers, relay reachability, account synchronization,
+and the friend-facing setup UI/package.
+The optional probe-worker contract is implemented and dry-run deployable. Control Service can now
+invoke it in explicit `remote-http` mode; live Worker deployment is the next operational step.
 
 ## Authoritative Documentation
 
@@ -103,6 +102,19 @@ Control Service defaults `CONTROL_PROBE_MODE` to `disabled`. `local-tcp` is a de
 external-controller mode only: the Control Service process must be outside the candidate node's
 LAN, otherwise the result tests router hairpin behavior rather than Internet reachability. TCP
 preflight records evidence but never marks an endpoint verified.
+
+For a home-hosted controller, deploy `probe-worker/` and configure the same dedicated secret on
+both sides:
+
+```bash
+CONTROL_PROBE_MODE=remote-http
+CONTROL_TCP_PROBE_URL=https://private-network-tcp-probe.example.workers.dev/v1/tcp-probe
+CONTROL_TCP_PROBE_TOKEN=unique-visible-ascii-secret-with-at-least-32-bytes
+```
+
+Remote mode requires all three values and accepts only HTTPS. The token is unrelated to the admin,
+node, or member credentials. Control resolves candidate DNS itself and sends only pinned public
+IPv4 literals plus the signed public port.
 
 The installer-oriented Node Host bootstrap accepts the exact JSON returned by
 `POST /v1/admin/node-invitations`. The signed installer supplies the Xray path and hash; these are
