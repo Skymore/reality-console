@@ -192,8 +192,8 @@ deleted and the invitation remains consumed. Re-pairing requires a new invitatio
 
 ### 6.4 Headless Development Flow
 
-The current headless implementation exposes `init`, `join`, `configure-xray`, `sync-once`, `run`,
-and `status`. `join` consumes the exact
+The current headless implementation exposes `bootstrap`, `init`, `join`, `configure-xray`,
+`sync-once`, `run`, and `status`. `join` consumes the exact
 JSON invitation returned by Control Service, requires both provider-consent flags, reuses the
 installation's owner-only Ed25519/X25519 identities, and persists registration only after verifying
 the controller fingerprint and signed response. On Unix, the invitation file must be a regular
@@ -207,6 +207,17 @@ approval and activation remain separate control-plane steps. The operator sees a
 summary and explicitly approves it through Control Service. Heartbeat cannot approve it. Disabling
 the node immediately blocks control authentication; revoking it also atomically revokes all of its
 node credentials.
+
+The backend exposes the friend-facing setup boundary as `BootstrapRequest` plus one `bootstrap`
+operation. The desktop path parses bounded invitation JSON in memory and never places the secret
+in a command-line argument. The signed installer injects its explicit bundled-Xray path and
+manifest SHA-256. Bootstrap first requires both consent decisions, initializes or reuses the
+stable local identity, verifies Xray entirely offline, and only then sends the single-use
+invitation. A damaged runtime therefore cannot consume the invitation. Network failure can be
+presented as one `Try again` action: rerunning bootstrap reuses the same identity, runtime pin, and
+invitation recovery semantics. The file-based `bootstrap` subcommand exists only for installer and
+headless integration. Native package installation, background-service registration, and the setup
+UI remain separate pending deliverables.
 
 `configure-xray` is an installer/service integration command, not friend-facing setup. It accepts
 only an explicit absolute binary path and installer-manifest SHA-256, rejects unsafe file metadata,

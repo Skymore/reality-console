@@ -20,18 +20,45 @@ use control_protocol::node::{
 };
 use control_protocol::secret::Secret;
 use ed25519_dalek::{Signer as _, SigningKey};
-use node_host::{join, status, EnrollmentState};
+use node_host::{bootstrap, join, status, BootstrapRequest, EnrollmentState};
 use predicates::prelude::*;
 use rand_core::{OsRng, RngCore as _};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::str::FromStr as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 
 const INVITATION_SECRET: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY";
+
+#[cfg(unix)]
+struct FakeXray {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+    digest: String,
+}
+
+#[cfg(unix)]
+impl FakeXray {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("xray");
+        let script = b"#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"version\" ]; then printf 'Xray 25.7.1\\n'; exit 0; fi\nexit 64\n";
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            _directory: directory,
+            path,
+            digest: format!("{:x}", Sha256::digest(script)),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ResponseMode {
@@ -212,6 +239,132 @@ async fn happy_path_persists_verified_metadata_without_secrets() {
         .stdout
         .clone();
     assert!(!contains_bytes(&output, INVITATION_SECRET.as_bytes()));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_memory_bootstrap_verifies_runtime_then_enrolls_in_one_call() {
+    let controller = MockController::start(ResponseMode::Valid).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let fake = FakeXray::new();
+    let invitation_json = serde_json::to_vec(&controller.invitation).unwrap();
+    let request = BootstrapRequest::from_invitation_json(
+        &invitation_json,
+        "Friend Mac",
+        fake.path.clone(),
+        fake.digest.clone(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let joined = bootstrap(&data_dir, request).await.unwrap();
+
+    assert_eq!(joined.enrollment_state, EnrollmentState::Enrolled);
+    assert!(joined.xray_configured);
+    assert_eq!(
+        joined.xray_binary_path.as_deref(),
+        Some(fake.path.as_path())
+    );
+    assert_eq!(controller.request_count.load(Ordering::SeqCst), 1);
+    assert!(!temp.path().join("invitation.json").exists());
+    let database = fs::read(data_dir.join("node-host.sqlite3")).unwrap();
+    assert!(!contains_bytes(&database, INVITATION_SECRET.as_bytes()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bootstrap_rejects_a_bad_runtime_before_consuming_the_invitation() {
+    let controller = MockController::start(ResponseMode::Valid).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let fake = FakeXray::new();
+    let invitation_json = serde_json::to_vec(&controller.invitation).unwrap();
+    let request = BootstrapRequest::from_invitation_json(
+        &invitation_json,
+        "Friend Mac",
+        fake.path,
+        "00".repeat(32),
+        true,
+        true,
+    )
+    .unwrap();
+
+    let error = bootstrap(&data_dir, request).await.unwrap_err();
+
+    assert!(error.to_string().contains("bundled Xray runtime"));
+    assert_eq!(controller.request_count.load(Ordering::SeqCst), 0);
+    let current = status(&data_dir).unwrap();
+    assert_eq!(current.enrollment_state, EnrollmentState::NotEnrolled);
+    assert!(!current.xray_configured);
+    assert!(!data_dir.join("reality.x25519.seed").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bootstrap_requires_consent_before_creating_local_state() {
+    let controller = MockController::start(ResponseMode::Valid).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let fake = FakeXray::new();
+    let invitation_json = serde_json::to_vec(&controller.invitation).unwrap();
+    let request = BootstrapRequest::from_invitation_json(
+        &invitation_json,
+        "Friend Mac",
+        fake.path,
+        fake.digest,
+        true,
+        false,
+    )
+    .unwrap();
+
+    let error = bootstrap(&data_dir, request).await.unwrap_err();
+
+    assert!(error.to_string().contains("explicit provider consent"));
+    assert!(!data_dir.exists());
+    assert_eq!(controller.request_count.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrying_bootstrap_reuses_local_identity_and_verified_runtime() {
+    let controller = MockController::start(ResponseMode::RetryOnce).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let fake = FakeXray::new();
+    let invitation_json = serde_json::to_vec(&controller.invitation).unwrap();
+
+    let first_request = BootstrapRequest::from_invitation_json(
+        &invitation_json,
+        "Friend Mac",
+        fake.path.clone(),
+        fake.digest.clone(),
+        true,
+        true,
+    )
+    .unwrap();
+    bootstrap(&data_dir, first_request).await.unwrap_err();
+    let before = status(&data_dir).unwrap();
+    assert_eq!(before.enrollment_state, EnrollmentState::NotEnrolled);
+    assert!(before.xray_configured);
+
+    let retry_request = BootstrapRequest::from_invitation_json(
+        &invitation_json,
+        "Friend Mac",
+        fake.path,
+        fake.digest,
+        true,
+        true,
+    )
+    .unwrap();
+    let joined = bootstrap(&data_dir, retry_request).await.unwrap();
+
+    assert_eq!(joined.identity_public_key, before.identity_public_key);
+    assert_eq!(joined.encryption_public_key, before.encryption_public_key);
+    assert_eq!(joined.reality_public_key, before.reality_public_key);
+    assert_eq!(joined.enrollment_state, EnrollmentState::Enrolled);
+    assert_eq!(controller.request_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

@@ -32,11 +32,14 @@ outbound sync loop with jitter, bounded retry backoff, and graceful process shut
 integration can verify and pin an explicit Xray binary, probe its version, and create a separate
 owner-only REALITY identity without starting the process. Candidate files are immutable,
 owner-only, digest-checked on restart, and never replace a known-good configuration during
-validation. The long-running `node-host run` service now owns a checksum-revalidated Xray child,
+validation. A friend-facing backend bootstrap accepts invitation JSON directly from a desktop
+wrapper, initializes stable local identity, verifies installer-bundled Xray before consuming the
+invitation, and completes enrollment as one idempotent retryable operation. The long-running
+`node-host run` service now owns a checksum-revalidated Xray child,
 activates only controller-acknowledged candidates, records the active pointer atomically with
 `applied`, and restores a proven predecessor after startup or loopback-health failure. It remains
 loopback-only: native service installers, the public admission gate, direct/relay reachability,
-account synchronization, and friend-facing setup are still under active implementation.
+account synchronization, and the friend-facing setup UI/package are still under implementation.
 
 ## Authoritative Documentation
 
@@ -77,31 +80,29 @@ cargo test --manifest-path control-server/Cargo.toml
 cargo test --manifest-path node-host/Cargo.toml
 ```
 
-The development Node Host join flow accepts the exact JSON returned by
-`POST /v1/admin/node-invitations`. Because that file contains a one-time secret, it must be
-owner-only on Unix:
+The installer-oriented Node Host bootstrap accepts the exact JSON returned by
+`POST /v1/admin/node-invitations`. The signed installer supplies the Xray path and hash; these are
+not friend-entered settings. Because the development CLI uses a file containing a one-time secret,
+that file must be owner-only on Unix:
 
 ```bash
 chmod 600 invitation.json
-node-host join \
+node-host bootstrap \
   --data-dir ./node-state \
   --invitation-file ./invitation.json \
   --display-name "Friend Mac" \
+  --xray-binary-path /absolute/path/to/bundled/xray \
+  --xray-sha256 64-lowercase-hex-characters \
   --accept-host-owner \
   --accept-exit-ip
 
 # Development foreground service; the installer will register this automatically.
 node-host run --data-dir ./node-state
-
-# Installer integration only; friends will not enter this manually.
-node-host configure-xray \
-  --data-dir ./node-state \
-  --binary-path /absolute/path/to/bundled/xray \
-  --sha256 64-lowercase-hex-characters
 ```
 
-The future desktop wrapper will pass the same invitation in memory from a QR code or deep link, so
-friends will not need to manage this file or run the CLI.
+The backend `BootstrapRequest::from_invitation_json` path keeps the invitation in memory for a
+QR/deep-link desktop wrapper. The separate `init`, `join`, and `configure-xray` commands remain
+available as diagnostic and packaging primitives; friends do not need to run them.
 
 Each implementation phase must leave affected applications buildable, update its authoritative
 documentation, and end in a focused commit.

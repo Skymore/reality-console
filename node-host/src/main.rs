@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use node_host::{
-    configure_xray, initialize, join, run, status, sync_once, HostStatus, SyncLoopOptions,
+    bootstrap, configure_xray, initialize, join, run, status, sync_once, BootstrapRequest,
+    HostStatus, SyncLoopOptions,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,6 +16,30 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run installer-owned local setup and one-time node enrollment.
+    Bootstrap {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Owner-only JSON file returned by `CreateNodeInvitationResponse`.
+        #[arg(long)]
+        invitation_file: PathBuf,
+        /// Name shown to the network operator.
+        #[arg(long)]
+        display_name: String,
+        /// Explicit absolute path to the installer-bundled Xray executable.
+        #[arg(long)]
+        xray_binary_path: PathBuf,
+        /// Trusted installer-manifest SHA-256 for the bundled Xray executable.
+        #[arg(long)]
+        xray_sha256: String,
+        /// Confirms that you own or are authorized to operate this host.
+        #[arg(long)]
+        accept_host_owner: bool,
+        /// Confirms that this network may expose your public IP as an exit IP.
+        #[arg(long)]
+        accept_exit_ip: bool,
+    },
     /// Initialize persistent node-host state.
     Init {
         /// Persistent state directory.
@@ -89,6 +114,25 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let status = match Cli::parse().command {
+        Command::Bootstrap {
+            data_dir,
+            invitation_file,
+            display_name,
+            xray_binary_path,
+            xray_sha256,
+            accept_host_owner,
+            accept_exit_ip,
+        } => {
+            let request = BootstrapRequest::from_invitation_file(
+                &invitation_file,
+                display_name,
+                xray_binary_path,
+                xray_sha256,
+                accept_host_owner,
+                accept_exit_ip,
+            )?;
+            bootstrap(&data_dir, request).await?
+        }
         Command::Init {
             data_dir,
             controller,

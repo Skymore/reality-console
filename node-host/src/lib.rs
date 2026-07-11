@@ -1,6 +1,7 @@
 //! Persistent local foundation for the Reality Console node host.
 
 mod activation;
+mod bootstrap;
 mod enrollment;
 mod service;
 mod sync;
@@ -250,6 +251,7 @@ const MIGRATION_7: &str = "
     END;
 ";
 
+pub use bootstrap::{bootstrap, BootstrapRequest};
 pub use enrollment::join;
 pub use service::{run, run_until, SyncLoopOptions};
 pub use sync::sync_once;

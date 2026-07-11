@@ -50,13 +50,26 @@ pub async fn join(
     accept_host_owner: bool,
     accept_exit_ip: bool,
 ) -> Result<HostStatus> {
-    if !accept_host_owner || !accept_exit_ip {
-        bail!(
-            "joining requires both --accept-host-owner and --accept-exit-ip after reviewing the provider disclosure"
-        );
-    }
-
+    require_provider_consent(accept_host_owner, accept_exit_ip)?;
     let invitation = read_invitation(invitation_file)?;
+    join_invitation(
+        data_dir,
+        invitation,
+        display_name,
+        accept_host_owner,
+        accept_exit_ip,
+    )
+    .await
+}
+
+pub(crate) async fn join_invitation(
+    data_dir: &Path,
+    invitation: CreateNodeInvitationResponse,
+    display_name: &str,
+    accept_host_owner: bool,
+    accept_exit_ip: bool,
+) -> Result<HostStatus> {
+    require_provider_consent(accept_host_owner, accept_exit_ip)?;
     validate_invitation(&invitation)?;
     let controller = parse_controller(&invitation.controller_origin)?;
 
@@ -88,7 +101,19 @@ pub async fn join(
     build_status(&connection, data_dir, controller, &identity)
 }
 
-fn read_invitation(path: &Path) -> Result<CreateNodeInvitationResponse> {
+pub(crate) fn require_provider_consent(
+    accept_host_owner: bool,
+    accept_exit_ip: bool,
+) -> Result<()> {
+    if !accept_host_owner || !accept_exit_ip {
+        bail!(
+            "joining requires both --accept-host-owner and --accept-exit-ip after reviewing the provider disclosure"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn read_invitation(path: &Path) -> Result<CreateNodeInvitationResponse> {
     let path_metadata =
         std::fs::symlink_metadata(path).context("failed to inspect invitation path")?;
     if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
@@ -112,7 +137,19 @@ fn read_invitation(path: &Path) -> Result<CreateNodeInvitationResponse> {
     if bytes.len() as u64 > MAX_INVITATION_BYTES {
         bail!("invitation file exceeds 64 KiB");
     }
-    serde_json::from_slice(&bytes).context("invitation file is not valid invitation JSON")
+    parse_invitation_json(&bytes)
+}
+
+pub(crate) fn parse_invitation_json(bytes: &[u8]) -> Result<CreateNodeInvitationResponse> {
+    let maximum_bytes = usize::try_from(MAX_INVITATION_BYTES)
+        .context("invitation size limit is unsupported on this platform")?;
+    if bytes.is_empty() || bytes.len() > maximum_bytes {
+        bail!("invitation JSON must contain between 1 byte and 64 KiB");
+    }
+    let invitation: CreateNodeInvitationResponse =
+        serde_json::from_slice(bytes).context("invitation JSON is invalid")?;
+    validate_invitation(&invitation)?;
+    Ok(invitation)
 }
 
 fn validate_invitation(invitation: &CreateNodeInvitationResponse) -> Result<()> {
