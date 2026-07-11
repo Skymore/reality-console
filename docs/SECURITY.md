@@ -165,11 +165,15 @@ short-lived client certificate from the controller's private node CA during pair
 
 ### Controller And Signing Identities
 
-The HTTPS server identity, private node CA, desired-state signing identity, and profile-bundle
-signing identity are separate keys. The signing keys use Ed25519 or an equivalently reviewed
-signature algorithm. Key IDs and validity periods are included with signed artifacts. Separation
-allows TLS certificates to renew without invalidating installed trust and allows one signing-key
-incident to be handled without replacing unrelated trust roots.
+The HTTPS server identity, private node CA, controller-artifact signing identity, and profile-bundle
+signing identity are separate keys. The controller-artifact key signs both desired state and
+redacted node self-status with distinct domain-separated transcripts. Node self-status additionally
+binds the exact heartbeat generation, node ID, controller instance, and signing-key ID, so a status
+cannot be replayed across nodes, controller restores, heartbeat attempts, or artifact types. The
+signing keys use Ed25519 or an equivalently reviewed signature algorithm. Key IDs and validity
+periods are included with signed artifacts. Separation allows TLS certificates to renew without
+invalidating installed trust and allows one signing-key incident to be handled without replacing
+unrelated trust roots.
 
 ## One-Time Pairing And Enrollment
 

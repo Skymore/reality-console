@@ -235,10 +235,14 @@ but never its private bytes. This command does not generate desired config or st
 desired-state fetch. Before heartbeat I/O it durably allocates a positive monotonic generation;
 failed attempts may leave gaps but restart and retry can never reuse a generation for different
 state. This sequence is independent from telemetry. It records heartbeat and complete-cycle
-timestamps locally and uses a fresh nonce for every request. A `200` response is accepted only after
-closed-schema identity, monotonicity, and pinned controller-signature verification. The immutable
-envelope and its digests are committed before a signed `received` result is sent; an interrupted result remains queued and
-is retried before the next heartbeat. When a pinned runtime is available, Node Host checks the
+timestamps locally and uses a fresh nonce for every request. A heartbeat `200` carries only a
+controller-signed, generation-bound lifecycle and endpoint-readiness snapshot. The node accepts it
+only after closed-schema, identity, generation, controller-instance, signing-key, and signature
+verification; a legacy `204` leaves controller status unknown. A desired-state `200` is likewise
+accepted only after closed-schema identity, monotonicity, and pinned controller-signature
+verification. The immutable desired-state envelope and its digests are committed before a signed
+`received` result is sent; an interrupted result remains queued and is retried before the next
+heartbeat. When a pinned runtime is available, Node Host checks the
 minimum agent version, renders typed deterministic Xray JSON with the managed inbound bound only to
 `127.0.0.1`, and runs the pinned binary's bounded offline config test. Success stores a 0600
 immutable candidate plus its config and historical binary digests before reporting `validated`.
@@ -283,8 +287,9 @@ errors, paths, hashes, invitation data, credentials, generated Xray JSON, or pri
 `service live-status` exposes the same contract for diagnostics.
 
 Local IPC success proves that the service process is responsive; it does not prove controller
-approval or Internet reachability. Those remain Control-owned states and must be overlaid by the
-owner UI rather than inferred from `loaded`, `serving`, or an active router lease. The current IPC
+approval or Internet reachability. Those remain Control-owned states and may be shown only from a
+locally persisted, signature-verified heartbeat status. They must never be inferred from `loaded`,
+`serving`, an active router lease, or a successful control connection. The current IPC
 surface is intentionally read-only. Pause, resume, limits, diagnostics, unpair, and uninstall need
 separately versioned methods with local authorization and idempotency before they are exposed.
 

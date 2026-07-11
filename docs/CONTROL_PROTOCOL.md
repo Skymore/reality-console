@@ -201,9 +201,45 @@ required finite mapping/relay lease. A withdrawn identity cannot be reused for c
 state. Nodes never send `status`; the closed candidate schema rejects a forged `verified` field.
 Only controller-owned external probe state can make a candidate eligible for a profile bundle.
 
-The initial implementation returns `204 No Content` after durably accepting the heartbeat. A
-heartbeat never approves a pending node, and revision, heartbeat, plus telemetry cursors cannot
-move backward.
+After durably accepting a heartbeat, Control returns `200 OK` with a controller-signed, redacted
+self-status bound to that exact heartbeat generation:
+
+```json
+{
+  "document": {
+    "schemaVersion": 1,
+    "nodeId": "uuid",
+    "heartbeatGeneration": 184,
+    "observedAt": "2026-07-11T20:00:01Z",
+    "lifecycle": "active",
+    "endpoints": [
+      {
+        "endpointId": "6e005b7a-531b-4e92-a11d-39f47d12e461",
+        "readiness": "tcpReachable",
+        "lastCheckedAt": "2026-07-11T20:00:01Z",
+        "errorCode": null
+      }
+    ],
+    "signingKeyId": "uuid",
+    "controllerInstanceId": "uuid"
+  },
+  "signature": "base64url-signature"
+}
+```
+
+The closed response schema exposes only `pending` or `active` lifecycle and current candidate IDs.
+Endpoint readiness is one of `pending`, `checking`, `tcpReachable`, `tcpUnreachable`, or
+`verified`. `tcpReachable` proves only that an external runner completed a TCP connection;
+`verified` requires current end-to-end protocol-canary evidence. A failed check includes only a
+bounded stable `errorCode`, never an address, probe token, raw error, or credential.
+
+The canonical signature transcript uses domain `control/node-heartbeat-status/v1` and binds the
+schema, node ID, exact heartbeat generation, observation time, lifecycle, uniquely sorted endpoint
+records, signing-key ID, and controller-instance ID. The node verifies the closed schema, all
+identity bindings, and the signature against the controller key pinned at enrollment before it
+persists or displays the status. A legacy `204 No Content` remains a successful heartbeat with
+controller status unknown; it is never interpreted as approval or reachability. A heartbeat never
+approves a pending node, and revision, heartbeat, plus telemetry cursors cannot move backward.
 
 ### Operator node lifecycle
 
