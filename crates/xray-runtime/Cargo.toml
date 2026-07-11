@@ -1,0 +1,28 @@
+[package]
+name = "xray-runtime"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A narrow, verified Xray runtime boundary for Reality Node Host"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "=3.15.0"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
+uuid = { version = "=1.18.1", features = ["serde"] }
+zeroize = "=1.8.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

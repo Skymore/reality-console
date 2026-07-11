@@ -10,7 +10,7 @@ Connect. The final public brand is intentionally not encoded into the protocol o
 - `client/`: independent macOS/Windows Connect application with a bundled Xray supervisor.
 - `control-server/`: standalone lightweight Control Service with authoritative SQLite storage.
 - `node-host/`: headless Node Host core with local identity, state, and CLI foundations.
-- `crates/`: shared versioned protocol and domain types used by every runtime.
+- `crates/`: shared versioned protocol/domain types plus the verified Xray runtime boundary.
 - `docs/`: authoritative architecture, protocol, security, and component designs.
 
 ## Current Status
@@ -25,8 +25,10 @@ implemented. Node Host can also verify, durably retain, and acknowledge signed d
 envelopes without applying them to Xray yet. Control Service exposes redacted node summaries plus
 explicit approve, disable, and revoke operations; enrollment and heartbeat never activate a node
 implicitly. Node Host also has a resilient outbound sync loop with jitter, bounded retry backoff,
-and graceful process shutdown. Native service installers, validated Xray activation, account
-synchronization, and relay fallback remain under active implementation.
+and graceful process shutdown. The Xray runtime crate builds deterministic `VLESS + REALITY`
+configuration, verifies an explicit checksum-pinned binary, and runs bounded version/config tests
+without starting a listener. Native service installers, atomic Xray activation/supervision,
+account synchronization, and relay fallback remain under active implementation.
 
 ## Authoritative Documentation
 
@@ -62,6 +64,7 @@ npm --prefix client run build
 cargo test --manifest-path client/src-tauri/Cargo.toml
 
 cargo test --manifest-path crates/control-protocol/Cargo.toml
+cargo test --manifest-path crates/xray-runtime/Cargo.toml --locked
 cargo test --manifest-path control-server/Cargo.toml
 cargo test --manifest-path node-host/Cargo.toml
 ```
