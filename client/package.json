@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "prepare:xray": "node scripts/prepare-xray-sidecar.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
     "tauri": "tauri"

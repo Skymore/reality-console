@@ -1,31 +1,26 @@
-use serde::Serialize;
-use std::sync::Mutex;
-
-const DEFAULT_SOCKS_ENDPOINT: &str = "127.0.0.1:10808";
-const DEFAULT_HTTP_ENDPOINT: &str = "127.0.0.1:10809";
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalProxyEndpoints {
-    socks: String,
-    http: String,
+    pub socks: String,
+    pub http: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientState {
-    phase: ClientPhase,
-    active_profile_id: Option<String>,
-    mode: Option<ProxyMode>,
-    endpoints: LocalProxyEndpoints,
-    error_code: Option<String>,
-    error_message: Option<String>,
+    pub phase: ClientPhase,
+    pub active_profile_id: Option<String>,
+    pub mode: Option<ProxyMode>,
+    pub endpoints: LocalProxyEndpoints,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-enum ClientPhase {
+pub enum ClientPhase {
     Disconnected,
     Starting,
     Connected,
@@ -33,41 +28,25 @@ enum ClientPhase {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-enum ProxyMode {
+pub enum ProxyMode {
     Manual,
     System,
 }
 
-pub struct ClientRuntime {
-    state: Mutex<ClientState>,
-}
-
-impl Default for ClientRuntime {
-    fn default() -> Self {
+impl ClientState {
+    pub fn disconnected(socks_port: u16, http_port: u16) -> Self {
         Self {
-            state: Mutex::new(ClientState {
-                phase: ClientPhase::Disconnected,
-                active_profile_id: None,
-                mode: None,
-                endpoints: LocalProxyEndpoints {
-                    socks: DEFAULT_SOCKS_ENDPOINT.to_string(),
-                    http: DEFAULT_HTTP_ENDPOINT.to_string(),
-                },
-                error_code: None,
-                error_message: None,
-            }),
+            phase: ClientPhase::Disconnected,
+            active_profile_id: None,
+            mode: None,
+            endpoints: LocalProxyEndpoints {
+                socks: format!("127.0.0.1:{socks_port}"),
+                http: format!("127.0.0.1:{http_port}"),
+            },
+            error_code: None,
+            error_message: None,
         }
-    }
-}
-
-impl ClientRuntime {
-    pub fn snapshot(&self) -> Result<ClientState, String> {
-        self.state
-            .lock()
-            .map(|state| state.clone())
-            .map_err(|_| "client_state_unavailable".to_string())
     }
 }

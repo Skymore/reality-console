@@ -51,6 +51,14 @@ export function getClientState() {
   return invoke<ClientState>("client_get_state")
 }
 
+export function startClient(profileId: string, mode: ProxyMode = "manual") {
+  return invoke<ClientState>("client_start", { profileId, mode })
+}
+
+export function stopClient() {
+  return invoke<ClientState>("client_stop")
+}
+
 export function previewInvitation(invitation: string) {
   return invoke<InvitationPreview>("client_preview_invitation", { invitation })
 }

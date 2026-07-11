@@ -1,14 +1,16 @@
 mod core;
 mod error;
+mod process;
 mod profile;
 mod state;
 
 use core::config::{build_xray_config, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
 use core::invite::{parse_invitation, InvitationPreview};
 use error::ClientError;
+use process::XraySupervisor;
 use profile::{ProfileRepository, StoredProfile};
-use state::{ClientRuntime, ClientState};
-use tauri::{Manager, State};
+use state::{ClientState, ProxyMode};
+use tauri::{AppHandle, Manager, State};
 
 async fn run_blocking<T, F>(task: F) -> Result<T, ClientError>
 where
@@ -26,10 +28,27 @@ where
 }
 
 #[tauri::command]
-fn client_get_state(runtime: State<'_, ClientRuntime>) -> Result<ClientState, ClientError> {
-    runtime
-        .snapshot()
-        .map_err(|code| ClientError::internal(code, "The client state is temporarily unavailable."))
+fn client_get_state(supervisor: State<'_, XraySupervisor>) -> Result<ClientState, ClientError> {
+    supervisor.snapshot()
+}
+
+#[tauri::command]
+async fn client_start(
+    profile_id: String,
+    mode: ProxyMode,
+    app: AppHandle,
+    profiles: State<'_, ProfileRepository>,
+    supervisor: State<'_, XraySupervisor>,
+) -> Result<ClientState, ClientError> {
+    let repository = profiles.inner().clone();
+    let id_for_load = profile_id.clone();
+    let profile = run_blocking(move || repository.load_connection(&id_for_load)).await?;
+    supervisor.start(&app, profile_id, profile, mode).await
+}
+
+#[tauri::command]
+fn client_stop(supervisor: State<'_, XraySupervisor>) -> Result<ClientState, ClientError> {
+    supervisor.stop()
 }
 
 #[tauri::command]
@@ -95,17 +114,22 @@ async fn client_preview_profile(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             let profiles = ProfileRepository::native(app_data_dir)
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(profiles);
+            let supervisor = XraySupervisor::new(app.path().app_data_dir()?)
+                .map_err(|error| std::io::Error::other(error.message))?;
+            app.manage(supervisor);
             Ok(())
         })
-        .manage(ClientRuntime::default())
+        .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             client_get_state,
+            client_start,
+            client_stop,
             client_preview_invitation,
             client_list_profiles,
             client_import_profile,
@@ -113,6 +137,15 @@ pub fn run() {
             client_delete_profile,
             client_preview_profile
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Reality Client");
+        .build(tauri::generate_context!())
+        .expect("error while building Reality Client");
+
+    app.run(|app, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            let _ = app.state::<XraySupervisor>().stop();
+        }
+    });
 }

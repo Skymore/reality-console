@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.sky.realityclient",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run prepare:xray && npm run dev",
     "devUrl": "http://localhost:1421",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run prepare:xray && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -27,6 +27,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [],
+    "externalBin": ["binaries/xray"]
   }
 }
