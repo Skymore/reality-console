@@ -49,6 +49,12 @@ pub enum ErrorCode {
     InvalidStateTransition,
     /// Structured input failed validation.
     ValidationFailed,
+    /// A validated Xray candidate could not be started.
+    XrayStartFailed,
+    /// A started Xray candidate failed bounded local health checks.
+    XrayUnhealthy,
+    /// The previously applied Xray revision could not be restored safely.
+    RollbackFailed,
     /// An ordered telemetry batch contains a gap.
     TelemetrySequenceGap,
     /// A request conflicts with current resource state.
@@ -92,6 +98,9 @@ impl ErrorCode {
             Self::StateConflict => "state_conflict",
             Self::InvalidStateTransition => "invalid_state_transition",
             Self::ValidationFailed => "validation_failed",
+            Self::XrayStartFailed => "xray_start_failed",
+            Self::XrayUnhealthy => "xray_unhealthy",
+            Self::RollbackFailed => "rollback_failed",
             Self::TelemetrySequenceGap => "telemetry_sequence_gap",
             Self::Conflict => "conflict",
             Self::RateLimited => "rate_limited",
@@ -124,6 +133,9 @@ impl ErrorCode {
             "state_conflict" => Self::StateConflict,
             "invalid_state_transition" => Self::InvalidStateTransition,
             "validation_failed" => Self::ValidationFailed,
+            "xray_start_failed" => Self::XrayStartFailed,
+            "xray_unhealthy" => Self::XrayUnhealthy,
+            "rollback_failed" => Self::RollbackFailed,
             "telemetry_sequence_gap" => Self::TelemetrySequenceGap,
             "conflict" => Self::Conflict,
             "rate_limited" => Self::RateLimited,
@@ -221,5 +233,23 @@ mod tests {
 
         assert_eq!(code, ErrorCode::Unknown("future_failure".to_string()));
         assert_eq!(serde_json::to_string(&code).unwrap(), "\"future_failure\"");
+    }
+
+    #[test]
+    fn xray_lifecycle_codes_have_stable_wire_values() {
+        for (code, expected) in [
+            (ErrorCode::XrayStartFailed, "xray_start_failed"),
+            (ErrorCode::XrayUnhealthy, "xray_unhealthy"),
+            (ErrorCode::RollbackFailed, "rollback_failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&code).unwrap(),
+                format!("\"{expected}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ErrorCode>(&format!("\"{expected}\"")).unwrap(),
+                code
+            );
+        }
     }
 }
