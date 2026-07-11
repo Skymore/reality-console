@@ -29,8 +29,8 @@ use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, DesiredUser, EndpointCandidate,
     EndpointMode, EndpointReadiness, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
     NodeCapability, NodeCredential, NodeEndpointStatus, NodeHeartbeat, NodeHeartbeatStatus,
-    NodeLifecycleState, PairingPurpose, RevisionResult, RevisionResultState, SignedDesiredState,
-    SignedNodeHeartbeatStatus,
+    NodeInitialConfiguration, NodeLifecycleState, PairingPurpose, RevisionResult,
+    RevisionResultState, SignedDesiredState, SignedNodeHeartbeatStatus,
 };
 use control_protocol::node_status::node_heartbeat_status_transcript;
 use control_protocol::request_auth::{
@@ -53,13 +53,14 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
 const IDEMPOTENCY_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
 const BOOTSTRAP_ADMIN_PRINCIPAL: &str = "bootstrap-admin";
 const CREATE_ACCOUNT_ROUTE_ID: &str = "v1.admin.accounts.create";
+const NODE_INVITATION_SECRET_DOMAIN: &[u8] = b"private-network/node-invitation-secret/v1\0";
 const HTTP_CREATED_STATUS: i64 = 201;
 const NODE_REQUEST_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 
@@ -825,6 +826,41 @@ BEGIN
 END;
 ";
 
+const MIGRATION_11_SQL: &str = r"
+ALTER TABLE node_invitations ADD COLUMN initial_configuration_json TEXT
+    CHECK(initial_configuration_json IS NULL OR (
+        json_valid(initial_configuration_json)
+        AND length(initial_configuration_json) BETWEEN 2 AND 4096
+    ));
+ALTER TABLE node_invitations ADD COLUMN idempotency_key_sha256 BLOB
+    CHECK(idempotency_key_sha256 IS NULL OR length(idempotency_key_sha256) = 32);
+ALTER TABLE node_invitations ADD COLUMN request_sha256 BLOB
+    CHECK(
+        (idempotency_key_sha256 IS NULL AND request_sha256 IS NULL)
+        OR (idempotency_key_sha256 IS NOT NULL
+            AND request_sha256 IS NOT NULL
+            AND length(request_sha256) = 32)
+    );
+
+CREATE UNIQUE INDEX node_invitations_idempotency
+    ON node_invitations(network_id, idempotency_key_sha256)
+    WHERE idempotency_key_sha256 IS NOT NULL;
+
+ALTER TABLE nodes ADD COLUMN reality_public_key TEXT
+    CHECK(reality_public_key IS NULL OR length(reality_public_key) = 43);
+ALTER TABLE nodes ADD COLUMN reality_short_id TEXT
+    CHECK(
+        (reality_public_key IS NULL AND reality_short_id IS NULL)
+        OR (reality_public_key IS NOT NULL
+            AND reality_short_id IS NOT NULL
+            AND length(reality_short_id) = 16
+            AND reality_short_id NOT GLOB '*[^0-9a-f]*')
+    );
+
+CREATE UNIQUE INDEX nodes_reality_public_key_unique
+    ON nodes(reality_public_key) WHERE reality_public_key IS NOT NULL;
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -881,6 +917,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 10,
         name: "member_desired_state_snapshots",
         sql: MIGRATION_10_SQL,
+    },
+    Migration {
+        version: 11,
+        name: "one_action_node_bootstrap",
+        sql: MIGRATION_11_SQL,
     },
 ];
 
@@ -941,6 +982,8 @@ pub struct NodeSummaryRecord {
     pub platform: String,
     pub agent_version: String,
     pub xray_version: Option<String>,
+    pub public_material_ready: bool,
+    pub onboarding_state: String,
     pub capabilities: Vec<NodeCapability>,
     pub provider_consent: NodeProviderConsentRecord,
     pub last_seen_at: Option<i64>,
@@ -1156,6 +1199,7 @@ impl Database {
         &self,
         request: CreateNodeInvitationRequest,
         controller_origin: String,
+        idempotency_key: IdempotencyKey,
     ) -> Result<CreateNodeInvitationResponse, DatabaseError> {
         request.validate()?;
         let identity = self.controller_identity.clone();
@@ -1167,6 +1211,7 @@ impl Database {
                 &identity,
                 &request,
                 &controller_origin,
+                &idempotency_key,
             )
         })
         .await
@@ -3884,6 +3929,7 @@ struct RawNodeSummary {
     platform: String,
     agent_version: String,
     xray_version: Option<String>,
+    public_material_ready: i64,
     capabilities_json: String,
     consent_policy_version: String,
     consent_host_owner: i64,
@@ -3906,7 +3952,10 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
     let network = load_network(connection)?;
     let mut statement = connection.prepare(
         "SELECT node_id, network_id, display_name, status, platform, agent_version,
-                xray_version, capabilities_json, consent_policy_version,
+                xray_version,
+                CASE WHEN reality_public_key IS NOT NULL AND reality_short_id IS NOT NULL
+                     THEN 1 ELSE 0 END,
+                capabilities_json, consent_policy_version,
                 consent_host_owner, consent_exit_ip, consent_router_mapping,
                 consent_accepted_at,
                 last_seen_at, runtime_state, provider_paused, desired_revision,
@@ -3916,7 +3965,7 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
          WHERE network_id = ?1
          ORDER BY created_at ASC, node_id ASC",
     )?;
-    let rows = statement.query_map([network.network_id], |row| {
+    let rows = statement.query_map([&network.network_id], |row| {
         Ok(RawNodeSummary {
             node_id: row.get(0)?,
             network_id: row.get(1)?,
@@ -3925,28 +3974,30 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
             platform: row.get(4)?,
             agent_version: row.get(5)?,
             xray_version: row.get(6)?,
-            capabilities_json: row.get(7)?,
-            consent_policy_version: row.get(8)?,
-            consent_host_owner: row.get(9)?,
-            consent_exit_ip: row.get(10)?,
-            consent_router_mapping: row.get(11)?,
-            consent_accepted_at: row.get(12)?,
-            last_seen_at: row.get(13)?,
-            runtime_state: row.get(14)?,
-            provider_paused: row.get(15)?,
-            desired_revision: row.get(16)?,
-            received_revision: row.get(17)?,
-            validated_revision: row.get(18)?,
-            applied_revision: row.get(19)?,
-            telemetry_cursor: row.get(20)?,
-            created_at: row.get(21)?,
-            updated_at: row.get(22)?,
+            public_material_ready: row.get(7)?,
+            capabilities_json: row.get(8)?,
+            consent_policy_version: row.get(9)?,
+            consent_host_owner: row.get(10)?,
+            consent_exit_ip: row.get(11)?,
+            consent_router_mapping: row.get(12)?,
+            consent_accepted_at: row.get(13)?,
+            last_seen_at: row.get(14)?,
+            runtime_state: row.get(15)?,
+            provider_paused: row.get(16)?,
+            desired_revision: row.get(17)?,
+            received_revision: row.get(18)?,
+            validated_revision: row.get(19)?,
+            applied_revision: row.get(20)?,
+            telemetry_cursor: row.get(21)?,
+            created_at: row.get(22)?,
+            updated_at: row.get(23)?,
         })
     })?;
 
     let mut summaries = Vec::new();
     for row in rows {
         let row = row?;
+        let onboarding_state = derive_node_onboarding_state(connection, &network.network_id, &row)?;
         summaries.push(NodeSummaryRecord {
             node_id: row
                 .node_id
@@ -3958,6 +4009,8 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
             platform: row.platform,
             agent_version: row.agent_version,
             xray_version: row.xray_version,
+            public_material_ready: row.public_material_ready != 0,
+            onboarding_state,
             capabilities: serde_json::from_str(&row.capabilities_json)?,
             provider_consent: NodeProviderConsentRecord {
                 policy_version: row.consent_policy_version,
@@ -3979,6 +4032,82 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
         });
     }
     Ok(summaries)
+}
+
+fn derive_node_onboarding_state(
+    connection: &Connection,
+    network_id: &str,
+    node: &RawNodeSummary,
+) -> Result<String, DatabaseError> {
+    let state = if matches!(node.status.as_str(), "disabled" | "revoked") {
+        "unavailable"
+    } else if node.provider_paused != 0 {
+        "paused"
+    } else if node.status == "pending" {
+        "awaitingApproval"
+    } else if node.last_seen_at.is_none() {
+        "awaitingHeartbeat"
+    } else if node.desired_revision.is_none() {
+        "awaitingConfiguration"
+    } else if node.applied_revision != node.desired_revision {
+        let terminal_failure = connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM node_revision_results
+                WHERE network_id = ?1 AND node_id = ?2 AND revision = ?3
+                  AND state IN ('rejected', 'rolledBack')
+             )",
+            params![network_id, node.node_id, node.desired_revision],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if terminal_failure {
+            "needsAttention"
+        } else {
+            "applyingConfiguration"
+        }
+    } else if matches!(
+        node.runtime_state.as_deref(),
+        Some("degraded" | "quarantined")
+    ) {
+        "needsAttention"
+    } else if node.runtime_state.as_deref() != Some("serving") {
+        "applyingConfiguration"
+    } else {
+        let endpoint_state = connection.query_row(
+            "SELECT
+                EXISTS(
+                    SELECT 1
+                    FROM node_endpoint_candidates AS candidate
+                    JOIN node_endpoint_verifications AS verification
+                      ON verification.network_id = candidate.network_id
+                     AND verification.node_id = candidate.node_id
+                     AND verification.endpoint_id = candidate.endpoint_id
+                    WHERE candidate.network_id = ?1 AND candidate.node_id = ?2
+                      AND candidate.applied_revision = ?3
+                      AND candidate.withdrawn_at IS NULL
+                      AND verification.status = 'verified'
+                      AND verification.verification_expires_at > ?4
+                ),
+                EXISTS(
+                    SELECT 1 FROM node_endpoint_candidates AS candidate
+                    WHERE candidate.network_id = ?1 AND candidate.node_id = ?2
+                      AND candidate.applied_revision = ?3
+                      AND candidate.withdrawn_at IS NULL
+                )",
+            params![
+                network_id,
+                node.node_id,
+                node.applied_revision,
+                unix_timestamp()?
+            ],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        )?;
+        match endpoint_state {
+            (true, _) => "ready",
+            (false, true) => "checkingEndpoint",
+            (false, false) => "awaitingEndpoint",
+        }
+    };
+    Ok(state.to_string())
 }
 
 fn create_account(
@@ -4990,25 +5119,50 @@ fn create_node_invitation(
     identity: &ControllerIdentity,
     request: &CreateNodeInvitationRequest,
     controller_origin: &str,
+    idempotency_key: &IdempotencyKey,
 ) -> Result<CreateNodeInvitationResponse, DatabaseError> {
     let now = unix_timestamp()?;
     let expires_at = now
         .checked_add(i64::from(request.expires_in_seconds))
         .ok_or(DatabaseError::TimestampOverflow)?;
-    let invitation_id = NodeInvitationId::new();
-    let mut secret_bytes = [0_u8; INVITATION_SECRET_BYTES];
-    OsRng.fill_bytes(&mut secret_bytes);
-    let invitation_secret = URL_SAFE_NO_PAD.encode(secret_bytes);
-    let secret_verifier = Sha256::digest(invitation_secret.as_bytes());
-    let fingerprint = identity.fingerprint();
-    let network = load_network(connection)?;
+    let idempotency_key_sha256: [u8; 32] =
+        Sha256::digest(idempotency_key.as_str().as_bytes()).into();
+    let request_sha256: [u8; 32] = Sha256::digest(serde_json::to_vec(request)?).into();
+    let initial_configuration_json = request
+        .initial_configuration
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
 
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    if let Some(invitation) = load_node_invitation_replay(
+        &transaction,
+        identity,
+        &network.network_id,
+        &idempotency_key_sha256,
+        &request_sha256,
+    )? {
+        transaction.commit()?;
+        return Ok(invitation);
+    }
+    let invitation_id = NodeInvitationId::new();
+    let invitation_secret = derive_invitation_secret(
+        identity,
+        &network.network_id,
+        &idempotency_key_sha256,
+        &request_sha256,
+    )?;
+    let secret_verifier = Sha256::digest(invitation_secret.as_bytes());
+    let fingerprint = identity.fingerprint();
     transaction.execute(
         "INSERT INTO node_invitations(
             invitation_id, network_id, purpose, intended_display_name, secret_verifier,
-            controller_origin, controller_fingerprint, expires_at, created_at
-         ) VALUES (?1, ?2, 'node-enrollment', ?3, ?4, ?5, ?6, ?7, ?8)",
+            controller_origin, controller_fingerprint, expires_at, created_at,
+            initial_configuration_json, idempotency_key_sha256, request_sha256
+         ) VALUES (
+            ?1, ?2, 'node-enrollment', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+         )",
         params![
             invitation_id.to_string(),
             network.network_id,
@@ -5018,6 +5172,9 @@ fn create_node_invitation(
             fingerprint.as_str(),
             expires_at,
             now,
+            initial_configuration_json,
+            idempotency_key_sha256.as_slice(),
+            request_sha256.as_slice(),
         ],
     )?;
     insert_audit_event(
@@ -5032,7 +5189,9 @@ fn create_node_invitation(
         &serde_json::json!({
             "expiresAt": timestamp(expires_at)?.to_string(),
             "intendedDisplayName": request.display_name,
-            "purpose": "node-enrollment"
+            "purpose": "node-enrollment",
+            "automaticBootstrap": request.initial_configuration.is_some(),
+            "idempotencyKeyHash": Sha256Digest::from_bytes(idempotency_key_sha256)
         }),
         now,
     )?;
@@ -5048,6 +5207,82 @@ fn create_node_invitation(
     })
 }
 
+fn derive_invitation_secret(
+    identity: &ControllerIdentity,
+    network_id: &str,
+    idempotency_key_sha256: &[u8; 32],
+    request_sha256: &[u8; 32],
+) -> Result<String, DatabaseError> {
+    let mut transcript = Sha256::new();
+    transcript.update(NODE_INVITATION_SECRET_DOMAIN);
+    transcript.update(network_id.as_bytes());
+    transcript.update(idempotency_key_sha256);
+    transcript.update(request_sha256);
+    let proof = identity.sign(&transcript.finalize())?;
+    let secret: [u8; INVITATION_SECRET_BYTES] = Sha256::digest(proof.as_str().as_bytes()).into();
+    Ok(URL_SAFE_NO_PAD.encode(secret))
+}
+
+fn load_node_invitation_replay(
+    connection: &Connection,
+    identity: &ControllerIdentity,
+    network_id: &str,
+    idempotency_key_sha256: &[u8; 32],
+    request_sha256: &[u8; 32],
+) -> Result<Option<CreateNodeInvitationResponse>, DatabaseError> {
+    let stored = connection
+        .query_row(
+            "SELECT request_sha256, invitation_id, expires_at, controller_origin,
+                    controller_fingerprint, secret_verifier
+             FROM node_invitations
+             WHERE network_id = ?1 AND idempotency_key_sha256 = ?2",
+            params![network_id, idempotency_key_sha256.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_request, invitation_id, expires_at, origin, fingerprint, secret_verifier)) =
+        stored
+    else {
+        return Ok(None);
+    };
+    if stored_request.as_slice() != request_sha256 {
+        return Err(DatabaseError::IdempotencyKeyConflict);
+    }
+    let invitation_secret =
+        derive_invitation_secret(identity, network_id, idempotency_key_sha256, request_sha256)?;
+    let expected_verifier = Sha256::digest(invitation_secret.as_bytes());
+    if secret_verifier.len() != expected_verifier.len()
+        || secret_verifier
+            .as_slice()
+            .ct_eq(expected_verifier.as_slice())
+            .unwrap_u8()
+            != 1
+    {
+        return Err(DatabaseError::StoredProtocolValue);
+    }
+    Ok(Some(CreateNodeInvitationResponse {
+        invitation_id: invitation_id
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        purpose: PairingPurpose::NodeEnrollment,
+        expires_at: timestamp(expires_at)?,
+        invitation_secret: Secret::new(invitation_secret),
+        controller_origin: origin,
+        controller_fingerprint: fingerprint
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+    }))
+}
+
 fn enroll_node(
     connection: &mut Connection,
     identity: &ControllerIdentity,
@@ -5055,7 +5290,7 @@ fn enroll_node(
 ) -> Result<NodeEnrollmentResult, DatabaseError> {
     let now = unix_timestamp()?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let network = load_network(&transaction)?;
+    let mut network = load_network(&transaction)?;
     let validated =
         match validate_enrollment_attempt(&transaction, &network, identity, request, now) {
             Ok(validated) => validated,
@@ -5081,12 +5316,22 @@ fn enroll_node(
     let ValidatedEnrollment::New {
         invitation_id,
         request_transcript,
+        initial_configuration,
     } = validated
     else {
         unreachable!("existing enrollment returned above");
     };
     let created = insert_node_records(&transaction, &network.network_id, request, now)?;
     consume_invitation(&transaction, &invitation_id, created.node_id, now)?;
+    let automatic_bootstrap = apply_invitation_bootstrap(
+        &transaction,
+        identity,
+        &mut network,
+        created.node_id,
+        initial_configuration,
+        &invitation_id,
+        now,
+    )?;
     let response = build_enrollment_response(&network, identity, &created, &request_transcript)?;
 
     insert_audit_event(
@@ -5103,7 +5348,9 @@ fn enroll_node(
             "invitationId": invitation_id,
             "platform": request.platform,
             "providerConsentPolicyVersion": request.provider_consent.policy_version,
-            "routerMappingAccepted": request.provider_consent.router_mapping_accepted
+            "routerMappingAccepted": request.provider_consent.router_mapping_accepted,
+            "automaticBootstrap": automatic_bootstrap,
+            "publicMaterialReady": request.public_material.is_some()
         }),
         now,
     )?;
@@ -5114,10 +5361,64 @@ fn enroll_node(
     })
 }
 
+fn apply_invitation_bootstrap(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &ControllerIdentity,
+    network: &mut NetworkRecord,
+    node_id: NodeId,
+    configuration: Option<NodeInitialConfiguration>,
+    invitation_id: &str,
+    now: i64,
+) -> Result<bool, DatabaseError> {
+    let Some(configuration) = configuration else {
+        return Ok(false);
+    };
+    let updated = transaction.execute(
+        "UPDATE nodes SET status = 'active', updated_at = ?1
+         WHERE network_id = ?2 AND node_id = ?3 AND status = 'pending'",
+        params![now, network.network_id, node_id.to_string()],
+    )?;
+    if updated != 1 {
+        return Err(DatabaseError::DesiredStatePublicationConflict {
+            current_status: "pending-transition-failed".to_string(),
+        });
+    }
+    publish_compiled_desired_state(
+        transaction,
+        identity,
+        network,
+        node_id,
+        DesiredStateConfigurationDraft {
+            min_agent_version: configuration.min_agent_version,
+            xray: configuration.xray,
+        },
+        &[],
+        "invitation-bootstrap",
+        now,
+    )?;
+    insert_audit_event(
+        transaction,
+        Some(&network.network_id),
+        "admin",
+        None,
+        "node.approved",
+        "node",
+        Some(&node_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "automatic": true,
+            "invitationId": invitation_id,
+        }),
+        now,
+    )?;
+    Ok(true)
+}
+
 enum ValidatedEnrollment {
     New {
         invitation_id: String,
         request_transcript: Vec<u8>,
+        initial_configuration: Option<NodeInitialConfiguration>,
     },
     Existing {
         created: CreatedNode,
@@ -5139,6 +5440,13 @@ fn validate_enrollment_attempt(
         // unauthenticated audit-log amplification path.
         return Err(DatabaseError::InvitationInvalid);
     };
+    if invitation
+        .initial_configuration
+        .as_ref()
+        .is_some_and(|configuration| configuration.validate().is_err())
+    {
+        return Err(DatabaseError::StoredProtocolValue);
+    }
 
     validate_invitation_state(transaction, network, identity, &invitation, now)?;
     let invitation_id = invitation
@@ -5167,6 +5475,39 @@ fn validate_enrollment_attempt(
             now,
         );
     }
+    if request.display_name != invitation.intended_display_name {
+        return reject_enrollment(
+            transaction,
+            &network.network_id,
+            Some(&invitation.invitation_id),
+            "display-name-mismatch",
+            DatabaseError::EnrollmentDisplayNameMismatch,
+            now,
+        );
+    }
+    if invitation.initial_configuration.is_some() && request.public_material.is_none() {
+        return reject_enrollment(
+            transaction,
+            &network.network_id,
+            Some(&invitation.invitation_id),
+            "public-material-required",
+            DatabaseError::NodePublicMaterialRequired,
+            now,
+        );
+    }
+    if invitation.initial_configuration.is_some()
+        && (!request.capabilities.contains(&NodeCapability::Xray)
+            || !request.capabilities.contains(&NodeCapability::DirectTcp))
+    {
+        return reject_enrollment(
+            transaction,
+            &network.network_id,
+            Some(&invitation.invitation_id),
+            "bootstrap-capabilities-required",
+            DatabaseError::NodeBootstrapCapabilitiesRequired,
+            now,
+        );
+    }
     if let Some(consumed_node_id) = invitation.consumed_node_id.as_deref() {
         if let Some(created) =
             load_existing_enrollment(transaction, &network.network_id, consumed_node_id, request)?
@@ -5188,6 +5529,7 @@ fn validate_enrollment_attempt(
     Ok(ValidatedEnrollment::New {
         invitation_id: invitation.invitation_id,
         request_transcript,
+        initial_configuration: invitation.initial_configuration,
     })
 }
 
@@ -5236,6 +5578,7 @@ fn load_existing_enrollment(
     node_id: &str,
     request: &EnrollNodeRequest,
 ) -> Result<Option<CreatedNode>, DatabaseError> {
+    let capabilities_json = serde_json::to_string(&request.capabilities)?;
     transaction
         .query_row(
             "SELECT n.node_id, c.node_credential_id, c.expires_at
@@ -5244,6 +5587,12 @@ fn load_existing_enrollment(
                ON c.network_id = n.network_id AND c.node_id = n.node_id
              WHERE n.network_id = ?1 AND n.node_id = ?2
                AND n.identity_public_key = ?3 AND n.encryption_public_key = ?4
+               AND COALESCE(n.reality_public_key, '') = COALESCE(?5, '')
+               AND COALESCE(n.reality_short_id, '') = COALESCE(?6, '')
+               AND n.platform = ?7 AND n.capabilities_json = ?8
+               AND n.consent_policy_version = ?9
+               AND n.consent_host_owner = ?10 AND n.consent_exit_ip = ?11
+               AND n.consent_router_mapping = ?12 AND n.consent_accepted_at = ?13
                AND c.identity_public_key = ?3 AND c.revoked_at IS NULL
              ORDER BY c.created_at DESC LIMIT 1",
             params![
@@ -5251,6 +5600,25 @@ fn load_existing_enrollment(
                 node_id,
                 request.identity_public_key.as_str(),
                 request.encryption_public_key.as_str(),
+                request
+                    .public_material
+                    .as_ref()
+                    .map(|material| material.reality_public_key.as_str()),
+                request
+                    .public_material
+                    .as_ref()
+                    .map(|material| material.reality_short_id.as_str()),
+                request.platform,
+                capabilities_json,
+                request.provider_consent.policy_version,
+                i64::from(request.provider_consent.host_owner_consented),
+                i64::from(request.provider_consent.exit_ip_disclosure_accepted),
+                i64::from(request.provider_consent.router_mapping_accepted),
+                request
+                    .provider_consent
+                    .accepted_at
+                    .as_datetime()
+                    .unix_timestamp(),
             ],
             |row| {
                 let node_id = row.get::<_, String>(0)?;
@@ -5292,8 +5660,12 @@ fn insert_node_records(
             node_id, network_id, display_name, status, agent_version, platform,
             capabilities_json, identity_public_key, encryption_public_key,
             consent_policy_version, consent_host_owner, consent_exit_ip,
-            consent_router_mapping, consent_accepted_at, created_at, updated_at
-         ) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, 1, 1, ?10, ?11, ?12, ?12)",
+            consent_router_mapping, consent_accepted_at, created_at, updated_at,
+            reality_public_key, reality_short_id
+         ) VALUES (
+            ?1, ?2, ?3, 'pending', ?4, ?5, ?6, ?7, ?8, ?9, 1, 1,
+            ?10, ?11, ?12, ?12, ?13, ?14
+         )",
         params![
             created.node_id.to_string(),
             network_id,
@@ -5311,6 +5683,14 @@ fn insert_node_records(
                 .as_datetime()
                 .unix_timestamp(),
             now,
+            request
+                .public_material
+                .as_ref()
+                .map(|material| material.reality_public_key.as_str()),
+            request
+                .public_material
+                .as_ref()
+                .map(|material| material.reality_short_id.as_str()),
         ],
     )?;
     transaction.execute(
@@ -5393,11 +5773,13 @@ fn reject_enrollment<T>(
 
 struct InvitationRecord {
     invitation_id: String,
+    intended_display_name: String,
     controller_origin: String,
     controller_fingerprint: String,
     expires_at: i64,
     consumed_node_id: Option<String>,
     cancelled_at: Option<i64>,
+    initial_configuration: Option<NodeInitialConfiguration>,
 }
 
 fn load_invitation(
@@ -5406,19 +5788,32 @@ fn load_invitation(
 ) -> Result<Option<InvitationRecord>, DatabaseError> {
     transaction
         .query_row(
-            "SELECT invitation_id, controller_origin, controller_fingerprint,
-                    expires_at, consumed_node_id, cancelled_at
+            "SELECT invitation_id, intended_display_name, controller_origin,
+                    controller_fingerprint, expires_at, consumed_node_id, cancelled_at,
+                    initial_configuration_json
              FROM node_invitations
              WHERE secret_verifier = ?1 AND purpose = 'node-enrollment'",
             [verifier],
             |row| {
+                let initial_configuration_json = row.get::<_, Option<String>>(7)?;
                 Ok(InvitationRecord {
                     invitation_id: row.get(0)?,
-                    controller_origin: row.get(1)?,
-                    controller_fingerprint: row.get(2)?,
-                    expires_at: row.get(3)?,
-                    consumed_node_id: row.get(4)?,
-                    cancelled_at: row.get(5)?,
+                    intended_display_name: row.get(1)?,
+                    controller_origin: row.get(2)?,
+                    controller_fingerprint: row.get(3)?,
+                    expires_at: row.get(4)?,
+                    consumed_node_id: row.get(5)?,
+                    cancelled_at: row.get(6)?,
+                    initial_configuration: initial_configuration_json
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
                 })
             },
         )
@@ -5588,6 +5983,12 @@ pub enum DatabaseError {
     InvitationCancelled,
     #[error("the node enrollment proof is invalid")]
     InvalidEnrollmentProof,
+    #[error("the enrollment display name does not match the invitation")]
+    EnrollmentDisplayNameMismatch,
+    #[error("automatic node bootstrap requires verified public REALITY material")]
+    NodePublicMaterialRequired,
+    #[error("automatic node bootstrap requires Xray and direct TCP capabilities")]
+    NodeBootstrapCapabilitiesRequired,
     #[error("node authentication failed")]
     NodeAuthenticationFailed,
     #[error("the node or node credential is revoked")]
@@ -5676,6 +6077,9 @@ impl DatabaseError {
                 | Self::InvitationConsumed
                 | Self::InvitationCancelled
                 | Self::InvalidEnrollmentProof
+                | Self::EnrollmentDisplayNameMismatch
+                | Self::NodePublicMaterialRequired
+                | Self::NodeBootstrapCapabilitiesRequired
                 | Self::ControllerIdentityMismatch
         )
     }

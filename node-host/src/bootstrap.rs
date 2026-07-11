@@ -3,11 +3,18 @@ use crate::enrollment::{
 };
 use crate::{
     configure_xray, initialize, install_user_service, mapping::configure_bootstrap_policy,
-    BackgroundServiceStatus, HostStatus, UserServiceInstallRequest,
+    parse_controller, BackgroundServiceStatus, HostStatus, UserServiceInstallRequest,
 };
 use anyhow::{Context as _, Result};
-use control_protocol::node::CreateNodeInvitationResponse;
+use control_protocol::crypto::Sha256Digest;
+use control_protocol::id::Timestamp;
+use control_protocol::node::{
+    decode_node_setup_code, CreateNodeInvitationResponse, NodeSetupInvitation,
+    NODE_SETUP_CODE_PREFIX,
+};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
+use url::Url;
 
 /// Complete installer-owned input for one friend-facing Node Host setup.
 ///
@@ -33,8 +40,78 @@ pub struct BootstrapServiceOutcome {
     pub service: BackgroundServiceStatus,
 }
 
+/// Secret-free setup information suitable for the provider confirmation UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeSetupPreview {
+    /// Operator-selected node name.
+    pub display_name: String,
+    /// Pinned Control Service origin.
+    pub controller_origin: Url,
+    /// Pinned controller identity fingerprint for an optional advanced check.
+    pub controller_fingerprint: Sha256Digest,
+    /// Absolute one-time-code expiry.
+    pub expires_at: Timestamp,
+}
+
+/// Decodes a setup code without initializing local state or contacting Control.
+///
+/// The returned preview deliberately omits the invitation ID and bearer
+/// secret. It retains the controller fingerprint for an optional advanced
+/// identity check. The caller should retain the original code only in memory
+/// until bootstrap completes.
+///
+/// # Errors
+///
+/// Returns an error when the setup code or controller origin is invalid.
+pub fn inspect_setup_code(setup_code: &str) -> Result<NodeSetupPreview> {
+    let setup = decode_setup_input(setup_code)?;
+    let controller_origin = parse_controller(&setup.invitation.controller_origin)
+        .context("Node Host setup code contains an invalid controller origin")?;
+    Ok(NodeSetupPreview {
+        display_name: setup.display_name,
+        controller_origin,
+        controller_fingerprint: setup.invitation.controller_fingerprint,
+        expires_at: setup.invitation.expires_at,
+    })
+}
+
 impl BootstrapRequest {
-    /// Builds a setup request from invitation JSON held in memory by a desktop UI.
+    /// Builds a one-action setup request from a pasted or QR-scanned code.
+    ///
+    /// The operator-selected node name and controller identity come from the
+    /// code. Xray path and digest still come from the signed installer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the setup code is malformed or unsupported.
+    pub fn from_setup_code(
+        setup_code: &str,
+        xray_binary_path: PathBuf,
+        xray_sha256: impl Into<String>,
+        accept_host_owner: bool,
+        accept_exit_ip: bool,
+        accept_router_mapping: bool,
+    ) -> Result<Self> {
+        let NodeSetupInvitation {
+            display_name,
+            invitation,
+        } = decode_setup_input(setup_code)?;
+        Ok(Self {
+            invitation,
+            display_name,
+            xray_binary_path,
+            xray_sha256: xray_sha256.into(),
+            accept_host_owner,
+            accept_exit_ip,
+            accept_router_mapping,
+        })
+    }
+
+    /// Builds a legacy integration request from raw invitation JSON.
+    ///
+    /// Desktop applications should use [`Self::from_setup_code`] so the
+    /// operator-bound display name and link-origin checks cannot be bypassed.
     ///
     /// # Errors
     ///
@@ -62,7 +139,7 @@ impl BootstrapRequest {
 
     /// Builds an installer integration request from an owner-only invitation file.
     ///
-    /// Desktop applications should prefer [`Self::from_invitation_json`] so the
+    /// Desktop applications should prefer [`Self::from_setup_code`] so the
     /// one-time secret never needs a filesystem artifact.
     ///
     /// # Errors
@@ -87,6 +164,31 @@ impl BootstrapRequest {
             accept_router_mapping,
         })
     }
+}
+
+fn decode_setup_input(value: &str) -> Result<NodeSetupInvitation> {
+    let value = value.trim();
+    if value.starts_with(NODE_SETUP_CODE_PREFIX) {
+        return decode_node_setup_code(value).context("Node Host setup code is invalid");
+    }
+    let link = Url::parse(value).context("Node Host setup link is invalid")?;
+    if link.path() != "/join/node"
+        || link.query().is_some()
+        || !link.username().is_empty()
+        || link.password().is_some()
+    {
+        anyhow::bail!("Node Host setup link has an unsupported shape");
+    }
+    let setup_code = link
+        .fragment()
+        .context("Node Host setup link has no invitation fragment")?;
+    let setup = decode_node_setup_code(setup_code).context("Node Host setup link is invalid")?;
+    let link_origin = parse_controller(&link.origin().ascii_serialization())?;
+    let invitation_origin = parse_controller(&setup.invitation.controller_origin)?;
+    if link_origin != invitation_origin {
+        anyhow::bail!("Node Host setup link controller does not match its invitation");
+    }
+    Ok(setup)
 }
 
 /// Performs idempotent local setup, bundled-Xray verification, and enrollment.

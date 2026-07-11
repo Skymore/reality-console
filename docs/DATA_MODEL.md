@@ -156,10 +156,12 @@ revokes the family. The raw refresh credential is returned once and is never sto
 
 ### 3.3 Nodes and reachability
 
-`node_invitations` stores `(network_id, invitation_id)`, a bounded `display_name`, keyed
-`secret_hash`, `created_by_admin_id`, `created_at`, `expires_at`, and nullable `consumed_at` and
-`consumed_by_node_id`. The secret hash is unique in the network. A trigger and application check
-forbid changing a consumed invitation back to unused.
+`node_invitations` stores `(network_id, invitation_id)`, the intended display name, SHA-256 secret
+verifier, controller origin/fingerprint, expiry, optional initial-configuration JSON, creation and
+consumption state, plus SHA-256 request/idempotency-key digests. A partial unique index on
+`(network_id, idempotency_key_sha256)` makes invitation creation retryable. The bearer secret is
+derived with a domain-separated controller signature and request/key digests, so an exact retry can
+reconstruct it without storing plaintext. A different request under the same key is a conflict.
 
 `nodes`
 
@@ -175,11 +177,18 @@ forbid changing a consumed invitation back to unused.
 | `last_heartbeat_generation` | Last accepted positive Node Host snapshot generation |
 | `last_heartbeat_sha256` | Canonical 32-byte digest used to recognize exact retries |
 | `consent_router_mapping` | Signed provider choice allowing narrow automatic mapping |
+| `reality_public_key`, `reality_short_id` | Nullable all-or-nothing node-generated public material; the private key never leaves Node Host |
 | `created_at`, `approved_at`, `revoked_at`, `removed_at` | Lifecycle timestamps |
 
 Node enrollment consumes the invitation, inserts `nodes`, inserts the first authentication
-credential, and writes an audit event in one `BEGIN IMMEDIATE` transaction. Exactly one concurrent
-consumer succeeds.
+credential, and writes an audit event in one `BEGIN IMMEDIATE` transaction. A preconfigured
+invitation additionally changes the node to active and publishes its signed initial revision and
+empty member snapshot before that transaction commits. Exactly one concurrent consumer succeeds;
+any failure leaves the invitation unconsumed and no partial node or revision.
+
+Control Service migration 11 adds idempotent preconfigured invitations and node public REALITY
+material. Operator summaries expose only material readiness and a conservative derived onboarding
+state; raw node keys and short IDs stay out of list/get responses.
 
 `node_auth_credentials` stores `(network_id, node_credential_id)`, `node_id`, the node-generated
 identity public key, optional certificate serial/issuer metadata, `not_before`, `expires_at`,
@@ -444,7 +453,7 @@ revocation, purge, migration, backup restore, and recovery-fence actions are man
 
 ## 4. Node Host Local Schema
 
-The implemented Node Host migration version is 10. The database is owner-only and bound to one
+The implemented Node Host migration version is 12. The database is owner-only and bound to one
 enrolled `node_id`; it uses the same SQLite contract and migration table. The list below includes
 implemented tables and later planned policy/telemetry expansions.
 
@@ -455,9 +464,15 @@ implemented tables and later planned policy/telemetry expansions.
   reserved permanent-UPnP flag, stable last mapping error and attempt time, and update time. The
   current agent always leaves the reserved flag disabled and rejects permanent leases. Local policy
   always overrides controller desire toward less sharing.
+- `provider_consent_receipt`: singleton invitation-bound disclosure version, required host-owner
+  and exit-IP confirmations, router-mapping choice, and acceptance time. It is committed before
+  enrollment network I/O and reused byte-for-byte on retry; a different invitation may replace it
+  only while the installation remains unenrolled.
 - `controller_registration`: controller URL, network ID, controller epoch, pinned signing public
   keys, node-auth `secret_ref`, credential ID, supported schema versions, last contact, and
   credential-rotation state.
+- `controller_status_state`: latest signature-verified controller lifecycle and endpoint-readiness
+  snapshot, with immutable transcript/envelope digests and non-regressing heartbeat generation.
 - `xray_runtime_config`: installer-supplied absolute binary path, trusted SHA-256, bounded version
   probe result, and configuration/update times. The separate REALITY private seed remains in the
   owner-only secret store; only its public key and derived short ID are exposed by safe status.

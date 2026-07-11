@@ -27,8 +27,9 @@ deterministic loopback-only Xray candidate, run the checksum-pinned binary's off
 and acknowledge `received` plus `validated` or `rejected` without activating Xray. Control Service
 exposes redacted node summaries plus
 explicit approve, disable, and revoke operations; it can publish immutable signed revisions and
-record monotonic receive/validate/apply/rollback results. Enrollment and heartbeat never activate
-a node implicitly or overwrite controller-owned desired state. Heartbeat endpoints are retained as
+record monotonic receive/validate/apply/rollback results. Manual enrollment and heartbeat never
+activate a node implicitly or overwrite controller-owned desired state; a preconfigured invitation
+is explicit administrator pre-approval and atomically publishes revision 1. Heartbeat endpoints are retained as
 revision-bound candidates only; Control owns a separate verification record that starts `pending`
 and legacy node-asserted `verified` rows are discarded. Durable heartbeat generations make exact
 retries idempotent and prevent delayed snapshots from withdrawing newer candidates. Node Host also
@@ -36,9 +37,10 @@ has a resilient outbound sync loop with jitter, bounded retry backoff, and grace
 shutdown. Its installer integration can verify and pin an explicit Xray binary, probe its version, and create a separate
 owner-only REALITY identity without starting the process. Candidate files are immutable,
 owner-only, digest-checked on restart, and never replace a known-good configuration during
-validation. A friend-facing backend bootstrap accepts invitation JSON directly from a desktop
-wrapper, initializes stable local identity, verifies installer-bundled Xray before consuming the
-invitation, and completes enrollment as one idempotent retryable operation. The long-running
+validation. A friend-facing backend bootstrap accepts a one-time setup code or HTTPS fragment link
+directly from a desktop wrapper, initializes stable local identity, verifies installer-bundled Xray
+before consuming the invitation, retains the exact provider-consent receipt, and completes v2
+enrollment as one idempotent retryable operation. The long-running
 `node-host run` service now owns both a checksum-revalidated Xray child and a byte-transparent IPv4
 admission gate. It activates only controller-acknowledged candidates, requires the signed public
 port to bind and reach Xray through a local canary before recording `applied`, and restores both
@@ -54,7 +56,9 @@ multi-node assignments, authoritative full-snapshot compilation, per-node creden
 terminal account deletion, and node disable/revoke cleanup. Account creation is durably idempotent
 across concurrent retries and restarts. Exact applied revision snapshots drive
 `pending`/`applied`/`removalPending`/`removed` evidence, and administrator APIs never return member
-UUIDs or signed artifacts. The VLESS + REALITY canary required for client publication remains under
+UUIDs or signed artifacts. Migration 11 adds idempotent preconfigured node delivery, automatic initial
+revision publication, stored public REALITY material, and evidence-based onboarding state. The
+VLESS + REALITY canary required for client publication remains under
 implementation, along with member activation/sessions and signed bundles, signed system-service
 installers, relay reachability, and the friend-facing setup UI/package.
 
@@ -128,10 +132,13 @@ Remote mode requires all three values and accepts only HTTPS. The token is unrel
 node, or member credentials. Control resolves candidate DNS itself and sends only pinned public
 IPv4 literals plus the signed public port.
 
-The installer-oriented Node Host bootstrap accepts the exact JSON returned by
-`POST /v1/admin/node-invitations`. The signed installer supplies the Xray path and hash; these are
-not friend-entered settings. Because the development CLI uses a file containing a one-time secret,
-that file must be owner-only on Unix:
+`POST /v1/admin/node-invitations` requires `Idempotency-Key` and returns one `setupCode` plus an
+HTTPS fragment `setupLink`; it does not return raw invitation fields. The desktop backend passes
+either value to `BootstrapRequest::from_setup_code` and supplies installer-owned Xray and agent
+paths. Friends enter no JSON, controller URL, node name, port, hash, or command-line argument.
+
+The file command below remains a diagnostic compatibility path for a separately extracted raw
+invitation and therefore requires an owner-only file on Unix:
 
 ```bash
 chmod 600 invitation.json
@@ -154,10 +161,11 @@ node-host service live-status \
   --data-dir "$HOME/Library/Application Support/Private Network/Node Host/state"
 ```
 
-The backend `BootstrapRequest::from_invitation_json` path keeps the invitation in memory for a
-QR/deep-link desktop wrapper. `bootstrap_and_install_user_service` then supplies the one-action
-macOS preview boundary. The separate `init`, `join`, `configure-xray`, and `service` commands remain
-diagnostic and packaging primitives; friends do not need to run them.
+`NodeSetupSessionStore`, `inspect_setup_code`, `BootstrapRequest::from_setup_code`,
+`bootstrap_and_install_user_service`, and `query_node_setup_status` form the one-action macOS
+backend boundary. Setup status remains conservative through external protocol verification. The
+separate `init`, `join`, `configure-xray`, and `service` commands are diagnostic and packaging
+primitives; friends do not need to run them.
 
 Each implementation phase must leave affected applications buildable, update its authoritative
 documentation, and end in a focused commit.

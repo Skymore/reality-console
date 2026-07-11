@@ -5,7 +5,8 @@ semantic changes require a new API version.
 
 ## 1. Transport And Conventions
 
-- Base path: `/v1`.
+- Base path: `/v1`; one-action Node Host enrollment uses `/v2/nodes/enroll` because its signed
+  transcript adds node-local public REALITY material.
 - JSON request and response bodies use `camelCase`.
 - HTTPS is mandatory outside loopback development.
 - IDs are lowercase UUID strings. Time values are RFC 3339 UTC strings unless a field explicitly
@@ -75,30 +76,66 @@ fall back to a generic localized error.
 
 `POST /v1/admin/node-invitations`
 
+Requires `Idempotency-Key`. An exact retry returns the identical invitation delivery without
+storing its plaintext secret; reusing the key with another request returns
+`idempotency_key_conflict`.
+
 ```json
 {
   "displayName": "Friend Mac mini",
-  "expiresInSeconds": 900
+  "expiresInSeconds": 900,
+  "initialConfiguration": {
+    "minAgentVersion": "0.1.0",
+    "xray": {
+      "listenPort": 10443,
+      "publicPort": 8443,
+      "serverNames": ["www.microsoft.com"],
+      "target": "www.microsoft.com:443"
+    }
+  }
 }
 ```
 
-The response contains an invitation ID, expiry, and a single-use high-entropy enrollment secret.
-The UI may encode it as a QR/deep link. A human-entered short code requires server-side rate limits
-and is resolved to the high-entropy secret; six decimal digits alone are not a node credential.
+```json
+{
+  "displayName": "Friend Mac mini",
+  "expiresAt": "2026-07-11T20:15:00Z",
+  "setupCode": "pn-node-v1.base64url-payload",
+  "setupLink": "https://control.example/join/node#pn-node-v1.base64url-payload"
+}
+```
+
+The response deliberately omits raw invitation fields. `setupCode` and the fragment portion of
+`setupLink` are the same 256-bit one-time bearer material and must be shown only at creation. The
+fragment is not sent in an HTTP request or Referer. Node Host accepts either value, verifies that a
+link origin exactly matches the invitation's pinned controller origin, and keeps the material in
+memory. The code is intentionally long; a human-short code would require a separate rendezvous
+service, online lookup, attempt throttling, and abuse controls.
+
+`initialConfiguration` is optional only for diagnostic/manual enrollment. Its presence records the
+administrator's explicit pre-approval. A successful compatible enrollment then activates the node
+and publishes revision 1 atomically; it never makes the node member-shareable without later
+protocol verification.
 
 ### Enroll
 
-`POST /v1/nodes/enroll`
+`POST /v1/nodes/enroll` is the legacy/manual flow without `publicMaterial`.
+
+`POST /v2/nodes/enroll` is the one-action flow and requires node-local public REALITY material.
 
 ```json
 {
   "invitationSecret": "single-use-secret",
   "agentVersion": "0.1.0",
   "platform": "macos-arm64",
-  "displayName": "Living room Mac",
+  "displayName": "Friend Mac mini",
   "capabilities": ["xray", "direct-tcp", "pcp", "nat-pmp", "upnp"],
   "identityPublicKey": "base64url-ed25519-public-key",
   "encryptionPublicKey": "base64url-x25519-public-key",
+  "publicMaterial": {
+    "realityPublicKey": "base64url-x25519-public-key",
+    "realityShortId": "0123456789abcdef"
+  },
   "nonce": "base64url-random-nonce",
   "proof": "base64url-signature-over-enrollment-transcript",
   "providerConsent": {
@@ -111,27 +148,49 @@ and is resolved to the high-entropy secret; six decimal digits alone are not a n
 }
 ```
 
-The transaction verifies and consumes the invitation, creates `nodeId`, issues the first node
-credential, and writes an audit event. Concurrent consumption has exactly one winner. The proof
-covers invitation purpose, controller origin, both public keys, nonce, software version, and
-capabilities so it cannot be replayed for a different identity.
+The transaction verifies the invitation-bound display name, consumes the invitation, creates
+`nodeId`, issues the first node credential, and writes an audit event. Concurrent consumption has
+exactly one winner. A preconfigured invitation additionally requires `xray`, `direct-tcp`, and
+public REALITY material, then activates the new node and publishes the complete initial revision in
+that same transaction. Any insert, activation, publication, or audit failure rolls back the node,
+revision, and invitation consumption together.
+
+The REALITY private key never leaves Node Host. Public material is generated only after the signed
+installer's Xray binary passes checksum and version verification, and is covered by the node's
+enrollment proof. Administrator node summaries expose only `publicMaterialReady`, never the public
+key or short ID; those values are read internally when building a verified member profile.
 PCP, NAT-PMP, or UPnP capabilities require `direct-tcp` and
 `providerConsent.routerMappingAccepted=true`; a node cannot advertise router-changing behavior
 without binding the provider's choice into its proof.
 
 The enrollment proof uses a deterministic binary transcript. Every field is encoded as
 `u16be(labelLength) || labelUtf8 || u32be(valueLength) || valueBytes`. The request domain is
-`control/node-enrollment/request/v1`; fields are purpose, controller origin and fingerprint,
+`control/node-enrollment/request/v1` for a request without public material and
+`control/node-enrollment/request/v2` when public material is present. Fields are purpose,
+controller origin and fingerprint,
 invitation ID and expiry, both node public keys, nonce, agent version, platform, display name,
-sorted capabilities, and every provider-consent field. The response domain is
+sorted capabilities, optional REALITY public material, and every provider-consent field. The
+response domain is
 `control/node-enrollment/response/v1` and binds the request-transcript SHA-256 digest, network,
 node and controller identities, issued credential, controller signing public key, and controller
 nonce. The shared protocol crate is the only implementation of this encoding.
 
-If the first success response is lost, repeating the exact signed enrollment with the same
-invitation and node key pair returns `200 OK` with the existing node and credential identity. A
-first successful enrollment returns `201 Created`. Reusing the invitation with a different key
-pair returns `409 Conflict`; retry recovery never creates a second node or credential.
+If the first success response is lost, repeating the exact signed enrollment returns `200 OK` with
+the existing node and credential identity. Recovery compares node keys, public REALITY material,
+platform, capabilities, consent version/choices/time, and invitation-bound display name. Changing
+one of those fields returns `409 Conflict`; it is never silently accepted as the original attempt.
+A first successful enrollment returns `201 Created`.
+
+Node Host migration 12 persists the complete consent receipt before network I/O, so retry uses the
+same `acceptedAt` and choices rather than manufacturing a new ceremony. A new invitation may
+replace that receipt only while the installation is still unenrolled and the provider confirms the
+choices again.
+
+Administrator node summaries include one conservative `onboardingState`:
+`awaitingApproval`, `awaitingHeartbeat`, `awaitingConfiguration`, `applyingConfiguration`,
+`awaitingEndpoint`, `checkingEndpoint`, `ready`, `paused`, `needsAttention`, or `unavailable`.
+`ready` requires a current controller-owned protocol verification. Enrollment, background-service
+registration, Xray startup, and bare TCP reachability cannot produce it.
 
 ### Authenticated node requests
 
@@ -466,6 +525,11 @@ and 10 implement administrator account creation/listing, terminal account lifecy
 multi-node target compilation, stable assignments, durable account-creation idempotency, immutable
 per-revision member snapshots, apply-driven credential activation/removal, explicit provisioning
 state, and distinct per-node VLESS credentials.
+
+Control migration 11 and Node Host migration 12 implement idempotent setup-code/link delivery,
+strict v2 enrollment with node public REALITY material, invitation-bound consent replay,
+pre-approved initial revision publication, and conservative onboarding progress. A real
+Control-to-Node Host integration test covers creation through initial revision validation.
 
 Member activation and sessions, encrypted signed profile bundles, telemetry aggregation,
 protocol-aware endpoint verification, and relay remain later slices. Even an `applied` assignment

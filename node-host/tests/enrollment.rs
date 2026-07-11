@@ -15,12 +15,16 @@ use control_protocol::id::{
     ControllerInstanceId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, Timestamp,
 };
 use control_protocol::node::{
-    CreateNodeInvitationResponse, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
-    NodeCapability, NodeCredential, PairingPurpose,
+    encode_node_setup_code, CreateNodeInvitationRequest, CreateNodeInvitationResponse,
+    DesiredXrayState, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
+    NodeCapability, NodeCredential, NodeInitialConfiguration, PairingPurpose,
 };
 use control_protocol::secret::Secret;
+use control_server::{build_router, AppState, Database, ServiceConfig};
 use ed25519_dalek::{Signer as _, SigningKey};
-use node_host::{bootstrap, join, status, BootstrapRequest, EnrollmentState};
+use node_host::{
+    bootstrap, inspect_setup_code, join, status, sync_once, BootstrapRequest, EnrollmentState,
+};
 use predicates::prelude::*;
 use rand_core::{OsRng, RngCore as _};
 use rusqlite::Connection;
@@ -49,7 +53,7 @@ impl FakeXray {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("xray");
-        let script = b"#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"version\" ]; then printf 'Xray 25.7.1\\n'; exit 0; fi\nexit 64\n";
+        let script = b"#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = \"version\" ]; then printf 'Xray 25.7.1\\n'; exit 0; fi\nif [ \"$#\" -eq 4 ] && [ \"$1\" = \"run\" ] && [ \"$2\" = \"-test\" ] && [ \"$3\" = \"-config\" ] && [ -r \"$4\" ]; then exit 0; fi\nexit 64\n";
         fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
@@ -123,6 +127,7 @@ impl MockController {
         };
         let router = Router::new()
             .route("/v1/nodes/enroll", post(enroll))
+            .route("/v2/nodes/enroll", post(enroll))
             .with_state(state);
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
@@ -259,10 +264,23 @@ async fn in_memory_bootstrap_verifies_runtime_then_enrolls_in_one_call() {
     let temp = tempfile::tempdir().unwrap();
     let data_dir = temp.path().join("state");
     let fake = FakeXray::new();
-    let invitation_json = serde_json::to_vec(&controller.invitation).unwrap();
-    let request = BootstrapRequest::from_invitation_json(
-        &invitation_json,
-        "Friend Mac",
+    let setup_code = encode_node_setup_code("Friend Mac", &controller.invitation).unwrap();
+    let pasted_setup_code = format!("  {}\n", setup_code.expose_secret());
+    let preview = inspect_setup_code(&pasted_setup_code).unwrap();
+    assert_eq!(preview.display_name, "Friend Mac");
+    assert_eq!(
+        preview.controller_origin.as_str().trim_end_matches('/'),
+        controller.invitation.controller_origin
+    );
+    assert!(!format!("{preview:?}").contains(INVITATION_SECRET));
+    let setup_link = format!(
+        "{}/join/node#{}",
+        controller.invitation.controller_origin,
+        setup_code.expose_secret()
+    );
+    assert_eq!(inspect_setup_code(&setup_link).unwrap(), preview);
+    let request = BootstrapRequest::from_setup_code(
+        &setup_link,
         fake.path.clone(),
         fake.digest.clone(),
         true,
@@ -288,6 +306,96 @@ async fn in_memory_bootstrap_verifies_runtime_then_enrolls_in_one_call() {
     assert!(!temp.path().join("invitation.json").exists());
     let database = fs::read(data_dir.join("node-host.sqlite3")).unwrap();
     assert!(!contains_bytes(&database, INVITATION_SECRET.as_bytes()));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_code_bootstraps_against_control_and_fetches_the_initial_revision() {
+    const ADMIN_TOKEN: &str = "node-host-e2e-admin-token-with-entropy";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let control_temp = tempfile::tempdir().unwrap();
+    let mut config =
+        ServiceConfig::for_test(control_temp.path().join("control.sqlite3"), ADMIN_TOKEN).unwrap();
+    config.controller_origin.clone_from(&origin);
+    let database = Database::open(&config.database_path, &config.network_display_name).unwrap();
+    let state = AppState::new(
+        database,
+        config.bootstrap_token,
+        config.controller_origin,
+        config.request_timeout,
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, build_router(state)).await.unwrap();
+    });
+
+    let invitation_request = CreateNodeInvitationRequest {
+        display_name: "E2E friend node".to_string(),
+        expires_in_seconds: 900,
+        initial_configuration: Some(NodeInitialConfiguration {
+            min_agent_version: "0.1.0".to_string(),
+            xray: DesiredXrayState {
+                listen_port: 10_443,
+                public_port: Some(8_443),
+                server_names: vec!["www.microsoft.com".to_string()],
+                target: "www.microsoft.com:443".to_string(),
+            },
+        }),
+    };
+    let delivery: serde_json::Value = reqwest::Client::new()
+        .post(format!("{origin}/v1/admin/node-invitations"))
+        .bearer_auth(ADMIN_TOKEN)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&invitation_request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let setup_link = delivery["setupLink"].as_str().unwrap();
+
+    let node_temp = tempfile::tempdir().unwrap();
+    let data_dir = node_temp.path().join("state");
+    let fake = FakeXray::new();
+    let request =
+        BootstrapRequest::from_setup_code(setup_link, fake.path, fake.digest, true, true, true)
+            .unwrap();
+    let enrolled = bootstrap(&data_dir, request).await.unwrap();
+    assert_eq!(enrolled.enrollment_state, EnrollmentState::Enrolled);
+
+    sync_once(&data_dir).await.unwrap();
+    sync_once(&data_dir).await.unwrap();
+    let synced = status(&data_dir).unwrap();
+    assert_eq!(synced.desired_revision_cursor, 1);
+    assert_eq!(
+        synced.controller_status.unwrap().lifecycle,
+        control_protocol::node::NodeLifecycleState::Active
+    );
+
+    let nodes: serde_json::Value = reqwest::Client::new()
+        .get(format!("{origin}/v1/admin/nodes"))
+        .bearer_auth(ADMIN_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(nodes["nodes"][0]["status"], "active");
+    assert_eq!(nodes["nodes"][0]["revisions"]["desiredRevision"], 1);
+    assert_eq!(nodes["nodes"][0]["revisions"]["validatedRevision"], 1);
+    assert_eq!(
+        nodes["nodes"][0]["onboardingState"],
+        "applyingConfiguration"
+    );
+
+    server.abort();
 }
 
 #[cfg(unix)]
@@ -368,6 +476,15 @@ async fn retrying_bootstrap_reuses_local_identity_and_verified_runtime() {
     let before = status(&data_dir).unwrap();
     assert_eq!(before.enrollment_state, EnrollmentState::NotEnrolled);
     assert!(before.xray_configured);
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    let accepted_before: i64 = connection
+        .query_row(
+            "SELECT accepted_at FROM provider_consent_receipt WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
 
     let retry_request = BootstrapRequest::from_invitation_json(
         &invitation_json,
@@ -386,6 +503,15 @@ async fn retrying_bootstrap_reuses_local_identity_and_verified_runtime() {
     assert_eq!(joined.reality_public_key, before.reality_public_key);
     assert_eq!(joined.enrollment_state, EnrollmentState::Enrolled);
     assert_eq!(controller.request_count.load(Ordering::SeqCst), 2);
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    let receipt: (i64, i64) = connection
+        .query_row(
+            "SELECT accepted_at, COUNT(*) FROM provider_consent_receipt",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(receipt, (accepted_before, 1));
 }
 
 #[tokio::test]

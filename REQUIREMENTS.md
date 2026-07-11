@@ -65,10 +65,11 @@ and join the network with no administrative access.
 ### 4.2 Add a contributed node
 
 1. The operator creates a short-lived node invitation.
-2. The provider installs Node Host, enters the invitation, reviews the exit-IP disclosure, and sets
-   local limits.
-3. Node Host creates a device identity, enrolls over outbound HTTPS, downloads Xray, and receives
-   desired state.
+2. The provider installs Node Host, opens the invitation link or pastes its code, reviews the
+   exit-IP disclosure, and sets local limits. They enter no controller URL, node name, port, hash,
+   JSON, or shell command.
+3. Node Host verifies its installer-bundled Xray, creates device and REALITY identities, enrolls
+   over outbound HTTPS, and receives the invitation-bound initial desired state.
 4. Node Host tests direct reachability. It attempts supported router mapping protocols only with
    explicit consent and uses an assigned relay when direct reachability is unavailable.
 5. Control marks the node shareable only after an external probe succeeds.
@@ -106,6 +107,9 @@ and join the network with no administrative access.
 - `NOD-006`: provider pause and removal take effect locally even when Control Service is offline.
 - `NOD-007`: provider limits include schedule, monthly transfer cap, and an optional bandwidth or
   concurrent-session limit where the platform can enforce it safely.
+- `NOD-008`: setup reports enrollment, background service, configuration application, endpoint
+  discovery, TCP checking, and protocol verification as distinct evidence states; only the last
+  may be described as ready for members.
 
 ### Reachability
 
@@ -186,8 +190,8 @@ High availability is not a product requirement for the initial private network.
 The first complete private-network release is accepted only when:
 
 1. An operator can create an account and node invitation from Control.
-2. A clean Node Host installation can enroll without Docker, JSON, SSH, or an inbound management
-   port.
+2. A clean Node Host installation can consume one link/code and enroll with its initial revision
+   without Docker, JSON, SSH, manual Xray fields, or an inbound management port.
 3. Direct and relay endpoint probes produce deterministic shareable/not-shareable states.
 4. An activated Connect installation automatically receives at least two node profiles and connects
    without manual URI import.

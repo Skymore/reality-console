@@ -19,9 +19,10 @@ use control_protocol::id::{
 };
 use control_protocol::idempotency::IDEMPOTENCY_KEY_HEADER;
 use control_protocol::node::{
-    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EndpointCandidate, EndpointMode,
-    EndpointReadiness, EndpointSource, EnrollNodeRequest, EnrollNodeResponse, NodeCapability,
-    NodeHeartbeat, NodeLifecycleState, NodeRuntimeState, ProviderConsent, RevisionProgress,
+    decode_node_setup_code, CreateNodeInvitationRequest, CreateNodeInvitationResponse,
+    DesiredXrayState, EndpointCandidate, EndpointMode, EndpointReadiness, EndpointSource,
+    EnrollNodeRequest, EnrollNodeResponse, NodeCapability, NodeHeartbeat, NodeInitialConfiguration,
+    NodeLifecycleState, NodePublicMaterial, NodeRuntimeState, ProviderConsent, RevisionProgress,
     RevisionResult, RevisionResultState, SignedDesiredState, SignedNodeHeartbeatStatus,
 };
 use control_protocol::node_status::verify_node_heartbeat_status_signature;
@@ -109,11 +110,13 @@ async fn create_invitation(app: &TestApp, expires_in_seconds: u32) -> CreateNode
         .oneshot(
             Request::post("/v1/admin/node-invitations")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(IDEMPOTENCY_KEY_HEADER, Uuid::new_v4().to_string())
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&CreateNodeInvitationRequest {
                         display_name: "Friend host".to_string(),
                         expires_in_seconds,
+                        initial_configuration: None,
                     })
                     .unwrap(),
                 ))
@@ -122,8 +125,63 @@ async fn create_invitation(app: &TestApp, expires_in_seconds: u32) -> CreateNode
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+    let body = json(response).await;
+    decode_node_setup_code(body["setupCode"].as_str().unwrap())
+        .unwrap()
+        .invitation
+}
+
+async fn create_automatic_invitation(app: &TestApp) -> (CreateNodeInvitationResponse, String) {
+    let request = CreateNodeInvitationRequest {
+        display_name: "Friend host".to_string(),
+        expires_in_seconds: 900,
+        initial_configuration: Some(NodeInitialConfiguration {
+            min_agent_version: "0.1.0".to_string(),
+            xray: DesiredXrayState {
+                listen_port: 10_443,
+                public_port: Some(8_443),
+                server_names: vec!["www.microsoft.com".to_string()],
+                target: "www.microsoft.com:443".to_string(),
+            },
+        }),
+    };
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/v1/admin/node-invitations")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, Uuid::new_v4().to_string())
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = json(response).await;
+    let setup_code = body["setupCode"].as_str().unwrap().to_string();
+    let invitation = decode_node_setup_code(&setup_code).unwrap().invitation;
+    (invitation, setup_code)
+}
+
+async fn post_invitation_with_key(
+    app: &TestApp,
+    request: &CreateNodeInvitationRequest,
+    idempotency_key: &str,
+) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::post("/v1/admin/node-invitations")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key)
+                .body(Body::from(serde_json::to_vec(request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 fn signed_enrollment(invitation: &CreateNodeInvitationResponse) -> (EnrollNodeRequest, Vec<u8>) {
@@ -147,7 +205,7 @@ fn signed_enrollment_with_key(
         invitation_secret: invitation.invitation_secret.clone(),
         agent_version: "0.1.0".to_string(),
         platform: "macos-arm64".to_string(),
-        display_name: "Living room Mac".to_string(),
+        display_name: "Friend host".to_string(),
         capabilities: vec![
             NodeCapability::Xray,
             NodeCapability::DirectTcp,
@@ -156,6 +214,10 @@ fn signed_enrollment_with_key(
             NodeCapability::Upnp,
         ],
         identity_public_key,
+        public_material: Some(NodePublicMaterial {
+            reality_public_key: encryption_public_key.clone(),
+            reality_short_id: "0123456789abcdef".to_string(),
+        }),
         encryption_public_key,
         nonce,
         proof: Ed25519Signature::from_str(&URL_SAFE_NO_PAD.encode([0_u8; 64])).unwrap(),
@@ -182,11 +244,35 @@ fn signed_enrollment_with_key(
     (request, transcript, signing_key)
 }
 
+fn resign_enrollment(
+    invitation: &CreateNodeInvitationResponse,
+    request: &mut EnrollNodeRequest,
+    signing_key: &SigningKey,
+) {
+    let invitation_context = EnrollmentInvitation {
+        invitation_id: invitation.invitation_id,
+        purpose: invitation.purpose,
+        expires_at: invitation.expires_at,
+        controller_origin: &invitation.controller_origin,
+        controller_fingerprint: &invitation.controller_fingerprint,
+    };
+    let transcript = enrollment_request_transcript(&invitation_context, request).unwrap();
+    request.proof = Ed25519Signature::from_str(
+        &URL_SAFE_NO_PAD.encode(signing_key.sign(&transcript).to_bytes()),
+    )
+    .unwrap();
+}
+
 async fn enroll(app: &TestApp, request: &EnrollNodeRequest) -> axum::response::Response {
+    let path = if request.public_material.is_some() {
+        "/v2/nodes/enroll"
+    } else {
+        "/v1/nodes/enroll"
+    };
     app.router
         .clone()
         .oneshot(
-            Request::post("/v1/nodes/enroll")
+            Request::post(path)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::to_vec(request).unwrap()))
                 .unwrap(),
@@ -960,11 +1046,18 @@ async fn admin_node_list_is_complete_and_redacts_key_material() {
     );
 
     let connection = rusqlite::Connection::open(app.database_path()).unwrap();
-    let (identity_public_key, encryption_public_key): (String, String) = connection
+    let (identity_public_key, encryption_public_key, reality_public_key, reality_short_id): (
+        String,
+        String,
+        String,
+        String,
+    ) = connection
         .query_row(
-            "SELECT identity_public_key, encryption_public_key FROM nodes WHERE node_id = ?1",
+            "SELECT identity_public_key, encryption_public_key,
+                    reality_public_key, reality_short_id
+             FROM nodes WHERE node_id = ?1",
             [node.node_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap();
     drop(connection);
@@ -975,6 +1068,8 @@ async fn admin_node_list_is_complete_and_redacts_key_material() {
     let raw = std::str::from_utf8(&bytes).unwrap();
     assert!(!raw.contains(&identity_public_key));
     assert!(!raw.contains(&encryption_public_key));
+    assert!(!raw.contains(&reality_public_key));
+    assert!(!raw.contains(&reality_short_id));
     assert!(!raw.contains("identityPublicKey"));
     assert!(!raw.contains("encryptionPublicKey"));
 
@@ -984,11 +1079,13 @@ async fn admin_node_list_is_complete_and_redacts_key_material() {
     let summary = &nodes[0];
     assert_eq!(summary["nodeId"], node.node_id.to_string());
     assert!(Uuid::parse_str(summary["networkId"].as_str().unwrap()).is_ok());
-    assert_eq!(summary["displayName"], "Living room Mac");
+    assert_eq!(summary["displayName"], "Friend host");
     assert_eq!(summary["status"], "pending");
     assert_eq!(summary["platform"], "macos-arm64");
     assert_eq!(summary["agentVersion"], "0.2.0");
     assert_eq!(summary["xrayVersion"], "26.7.11");
+    assert_eq!(summary["publicMaterialReady"], true);
+    assert_eq!(summary["onboardingState"], "awaitingApproval");
     assert_eq!(
         summary["capabilities"],
         serde_json::json!(["xray", "direct-tcp", "pcp", "nat-pmp", "upnp"])
@@ -1271,6 +1368,125 @@ async fn creates_and_enrolls_with_mutually_verified_proofs() {
 }
 
 #[tokio::test]
+async fn invitation_creation_is_durably_idempotent_without_returning_raw_invitation_fields() {
+    let app = TestApp::new();
+    let key = Uuid::new_v4().to_string();
+    let request = CreateNodeInvitationRequest {
+        display_name: "Friend host".to_string(),
+        expires_in_seconds: 900,
+        initial_configuration: None,
+    };
+    let first = post_invitation_with_key(&app, &request, &key).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = json(first).await;
+    assert!(first_body["setupCode"].is_string());
+    let setup_link = url::Url::parse(first_body["setupLink"].as_str().unwrap()).unwrap();
+    assert_eq!(setup_link.path(), "/join/node");
+    assert_eq!(setup_link.fragment(), first_body["setupCode"].as_str());
+    assert_eq!(first_body["displayName"], "Friend host");
+    assert!(first_body.get("invitationSecret").is_none());
+    assert!(first_body.get("invitationId").is_none());
+    assert!(first_body.get("controllerFingerprint").is_none());
+    let decoded = decode_node_setup_code(first_body["setupCode"].as_str().unwrap()).unwrap();
+    let raw_secret = decoded.invitation.invitation_secret.expose_secret().clone();
+
+    let replay = post_invitation_with_key(&app, &request, &key).await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(json(replay).await, first_body);
+
+    let conflicting = CreateNodeInvitationRequest {
+        display_name: "Different host".to_string(),
+        ..request
+    };
+    let conflict = post_invitation_with_key(&app, &conflicting, &key).await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(conflict).await["error"]["code"],
+        "idempotency_key_conflict"
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM node_invitations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    drop(connection);
+    let database = std::fs::read(app.database_path()).unwrap();
+    assert!(!database
+        .windows(raw_secret.len())
+        .any(|window| window == raw_secret.as_bytes()));
+}
+
+#[tokio::test]
+async fn setup_code_automatically_enrolls_approves_and_publishes_one_initial_state() {
+    let app = TestApp::new();
+    let (invitation, setup_code) = create_automatic_invitation(&app).await;
+    let decoded = decode_node_setup_code(&setup_code).unwrap();
+    assert_eq!(decoded.display_name, "Friend host");
+    assert_eq!(decoded.invitation, invitation);
+
+    let (request, _, signing_key) = signed_enrollment_with_key(&invitation);
+    let response = enroll(&app, &request).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let enrolled: EnrollNodeResponse = serde_json::from_value(json(response).await).unwrap();
+    let node = SignedNode {
+        node_id: enrolled.node_id,
+        key_id: enrolled.credential.key_id,
+        controller_instance_id: enrolled.controller_instance_id,
+        signing_key,
+    };
+
+    let nodes = json(admin_nodes(&app).await).await;
+    assert_eq!(nodes["nodes"][0]["status"], "active");
+    assert_eq!(nodes["nodes"][0]["publicMaterialReady"], true);
+    assert_eq!(nodes["nodes"][0]["onboardingState"], "awaitingHeartbeat");
+    assert_eq!(nodes["nodes"][0]["revisions"]["desiredRevision"], 1);
+    let desired_response = fetch_desired(&app, &node, 0, 231).await;
+    assert_eq!(desired_response.status(), StatusCode::OK);
+    let desired: SignedDesiredState = serde_json::from_value(json(desired_response).await).unwrap();
+    assert!(desired.document.users.is_empty());
+    assert_eq!(desired.document.xray.listen_port, 10_443);
+    assert_eq!(desired.document.xray.public_port, Some(8_443));
+
+    let retry = enroll(&app, &request).await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM nodes),
+                (SELECT COUNT(*) FROM config_revisions),
+                (SELECT COUNT(*) FROM node_revision_member_snapshots)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn automatic_bootstrap_requires_public_material_without_consuming_the_invitation() {
+    let app = TestApp::new();
+    let (invitation, _) = create_automatic_invitation(&app).await;
+    let (valid_request, _, signing_key) = signed_enrollment_with_key(&invitation);
+    let mut missing_material = valid_request.clone();
+    missing_material.public_material = None;
+    resign_enrollment(&invitation, &mut missing_material, &signing_key);
+
+    let rejected = enroll(&app, &missing_material).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json(rejected).await["error"]["code"], "validation_failed");
+
+    let accepted = enroll(&app, &valid_request).await;
+    assert_eq!(accepted.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn concurrent_invitation_consumption_has_one_winner() {
     let app = TestApp::new();
     let invitation = create_invitation(&app, 900).await;
@@ -1307,6 +1523,22 @@ async fn identical_enrollment_retry_recovers_the_existing_identity() {
     assert_eq!(retry.node_id, first.node_id);
     assert_eq!(retry.credential.key_id, first.credential.key_id);
     assert_eq!(retry.credential.expires_at, first.credential.expires_at);
+}
+
+#[tokio::test]
+async fn enrollment_recovery_rejects_changed_provider_consent_and_capabilities() {
+    let app = TestApp::new();
+    let invitation = create_invitation(&app, 900).await;
+    let (request, _, signing_key) = signed_enrollment_with_key(&invitation);
+    assert_eq!(enroll(&app, &request).await.status(), StatusCode::CREATED);
+
+    let mut changed = request;
+    changed.capabilities = vec![NodeCapability::Xray, NodeCapability::DirectTcp];
+    changed.provider_consent.router_mapping_accepted = false;
+    resign_enrollment(&invitation, &mut changed, &signing_key);
+    let rejected = enroll(&app, &changed).await;
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
+    assert_eq!(json(rejected).await["error"]["code"], "invitation_consumed");
 }
 
 #[tokio::test]
@@ -1401,10 +1633,12 @@ async fn invitation_lifetime_is_bounded() {
         .oneshot(
             Request::post("/v1/admin/node-invitations")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(IDEMPOTENCY_KEY_HEADER, Uuid::new_v4().to_string())
                 .body(Body::from(
                     serde_json::to_vec(&CreateNodeInvitationRequest {
                         display_name: "Too long lived".to_string(),
                         expires_in_seconds: 3_601,
+                        initial_configuration: None,
                     })
                     .unwrap(),
                 ))
@@ -1425,6 +1659,7 @@ async fn malformed_and_chunked_oversized_json_use_stable_errors() {
         .oneshot(
             Request::post("/v1/admin/node-invitations")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(IDEMPOTENCY_KEY_HEADER, Uuid::new_v4().to_string())
                 .body(Body::from("{"))
                 .unwrap(),
         )
@@ -1442,6 +1677,7 @@ async fn malformed_and_chunked_oversized_json_use_stable_errors() {
         .oneshot(
             Request::post("/v1/admin/node-invitations")
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(IDEMPOTENCY_KEY_HEADER, Uuid::new_v4().to_string())
                 .body(Body::from_stream(chunks))
                 .unwrap(),
         )
@@ -3712,5 +3948,5 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (10, 10, 1, 1, 1));
+    assert_eq!(durable, (11, 11, 1, 1, 1));
 }

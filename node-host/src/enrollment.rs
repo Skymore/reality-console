@@ -12,11 +12,12 @@ use control_protocol::enrollment::{
 use control_protocol::error::ErrorEnvelope;
 use control_protocol::node::{
     CreateNodeInvitationResponse, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
-    NodeCapability, PairingPurpose, ProviderConsent,
+    NodeCapability, NodePublicMaterial, PairingPurpose, ProviderConsent,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore as _};
 use reqwest::{redirect::Policy, StatusCode};
+use rusqlite::{params, OptionalExtension as _};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read as _;
@@ -78,8 +79,6 @@ pub(crate) async fn join_invitation(
     migrate(&mut connection)?;
     configure_controller(&connection, &controller)?;
     let identity = Identity::load_or_create(data_dir)?;
-    let router_mapping_accepted = crate::mapping::load_policy(&connection)?.enabled;
-
     if let Some(existing) = load_registration(&connection)? {
         if existing.invitation_id != invitation.invitation_id.to_string() {
             bail!("node host is already enrolled with a different invitation");
@@ -87,13 +86,30 @@ pub(crate) async fn join_invitation(
         if existing.controller_fingerprint != invitation.controller_fingerprint.as_str() {
             bail!("stored controller fingerprint does not match the invitation");
         }
+        return build_status(&connection, data_dir, controller, &identity);
     }
+    let router_mapping_accepted = crate::mapping::load_policy(&connection)?.enabled;
+    let provider_consent = load_or_create_provider_consent(
+        &connection,
+        invitation.invitation_id,
+        accept_host_owner,
+        accept_exit_ip,
+        router_mapping_accepted,
+    )?;
+    let public_material =
+        crate::xray::load_xray_runtime_status(&connection, data_dir)?.map(|runtime| {
+            NodePublicMaterial {
+                reality_public_key: runtime.reality_public_key,
+                reality_short_id: runtime.reality_short_id,
+            }
+        });
 
     let (request, request_transcript) = build_enrollment_request(
         &invitation,
         display_name,
         &identity,
-        router_mapping_accepted,
+        provider_consent,
+        public_material,
     )?;
     let response = post_enrollment(&controller, &request).await?;
     verify_controller_response(&invitation, &request_transcript, &response)?;
@@ -190,14 +206,15 @@ fn build_enrollment_request(
     invitation: &CreateNodeInvitationResponse,
     display_name: &str,
     identity: &Identity,
-    router_mapping_accepted: bool,
+    provider_consent: ProviderConsent,
+    public_material: Option<NodePublicMaterial>,
 ) -> Result<(EnrollNodeRequest, Vec<u8>)> {
     let mut nonce_bytes = [0_u8; NONCE_BYTES];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_str(&URL_SAFE_NO_PAD.encode(nonce_bytes))
         .context("failed to encode enrollment nonce")?;
     let mut capabilities = vec![NodeCapability::Xray, NodeCapability::DirectTcp];
-    if router_mapping_accepted {
+    if provider_consent.router_mapping_accepted {
         capabilities.extend([
             NodeCapability::Pcp,
             NodeCapability::NatPmp,
@@ -212,15 +229,10 @@ fn build_enrollment_request(
         capabilities,
         identity_public_key: identity.ed25519_public()?,
         encryption_public_key: identity.x25519_public()?,
+        public_material,
         nonce,
         proof: zero_signature()?,
-        provider_consent: ProviderConsent {
-            policy_version: PROVIDER_CONSENT_POLICY_VERSION.to_string(),
-            host_owner_consented: true,
-            exit_ip_disclosure_accepted: true,
-            router_mapping_accepted,
-            accepted_at: control_protocol::id::Timestamp::from_datetime(OffsetDateTime::now_utc()),
-        },
+        provider_consent,
     };
     request
         .validate()
@@ -238,12 +250,109 @@ fn build_enrollment_request(
     Ok((request, transcript))
 }
 
+fn load_or_create_provider_consent(
+    connection: &rusqlite::Connection,
+    invitation_id: control_protocol::id::NodeInvitationId,
+    host_owner_consented: bool,
+    exit_ip_disclosure_accepted: bool,
+    router_mapping_accepted: bool,
+) -> Result<ProviderConsent> {
+    require_provider_consent(host_owner_consented, exit_ip_disclosure_accepted)?;
+    let stored = connection
+        .query_row(
+            "SELECT invitation_id, policy_version, host_owner_consented,
+                    exit_ip_disclosure_accepted, router_mapping_accepted, accepted_at
+             FROM provider_consent_receipt WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let invitation_id_text = invitation_id.to_string();
+    if let Some((
+        stored_invitation_id,
+        policy_version,
+        stored_host_owner,
+        stored_exit_ip,
+        stored_router_mapping,
+        accepted_at,
+    )) = stored
+    {
+        if stored_invitation_id == invitation_id_text {
+            if policy_version != PROVIDER_CONSENT_POLICY_VERSION
+                || stored_host_owner != host_owner_consented
+                || stored_exit_ip != exit_ip_disclosure_accepted
+                || stored_router_mapping != router_mapping_accepted
+            {
+                bail!("provider consent differs from the durable enrollment attempt");
+            }
+            return Ok(ProviderConsent {
+                policy_version,
+                host_owner_consented: stored_host_owner,
+                exit_ip_disclosure_accepted: stored_exit_ip,
+                router_mapping_accepted: stored_router_mapping,
+                accepted_at: control_protocol::id::Timestamp::from_datetime(
+                    OffsetDateTime::from_unix_timestamp(accepted_at)
+                        .context("stored provider consent time is invalid")?,
+                ),
+            });
+        }
+        if load_registration(connection)?.is_some() {
+            bail!("node host is already enrolled with a different invitation");
+        }
+    }
+
+    let accepted_at = OffsetDateTime::now_utc().unix_timestamp();
+    connection.execute(
+        "INSERT INTO provider_consent_receipt(
+            singleton, invitation_id, policy_version, host_owner_consented,
+            exit_ip_disclosure_accepted, router_mapping_accepted, accepted_at
+         ) VALUES (1, ?1, ?2, 1, 1, ?3, ?4)
+         ON CONFLICT(singleton) DO UPDATE SET
+            invitation_id = excluded.invitation_id,
+            policy_version = excluded.policy_version,
+            host_owner_consented = excluded.host_owner_consented,
+            exit_ip_disclosure_accepted = excluded.exit_ip_disclosure_accepted,
+            router_mapping_accepted = excluded.router_mapping_accepted,
+            accepted_at = excluded.accepted_at",
+        params![
+            invitation_id_text,
+            PROVIDER_CONSENT_POLICY_VERSION,
+            i64::from(router_mapping_accepted),
+            accepted_at,
+        ],
+    )?;
+    Ok(ProviderConsent {
+        policy_version: PROVIDER_CONSENT_POLICY_VERSION.to_string(),
+        host_owner_consented: true,
+        exit_ip_disclosure_accepted: true,
+        router_mapping_accepted,
+        accepted_at: control_protocol::id::Timestamp::from_datetime(
+            OffsetDateTime::from_unix_timestamp(accepted_at)
+                .context("provider consent time is invalid")?,
+        ),
+    })
+}
+
 async fn post_enrollment(
     controller: &url::Url,
     request: &EnrollNodeRequest,
 ) -> Result<EnrollNodeResponse> {
+    let path = if request.public_material.is_some() {
+        "/v2/nodes/enroll"
+    } else {
+        "/v1/nodes/enroll"
+    };
     let endpoint = controller
-        .join("/v1/nodes/enroll")
+        .join(path)
         .context("failed to construct enrollment endpoint")?;
     let client = control_http_client().context("failed to initialize enrollment HTTP client")?;
     let response = client

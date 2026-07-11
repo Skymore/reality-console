@@ -9,7 +9,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const REQUEST_DOMAIN: &[u8] = b"control/node-enrollment/request/v1";
+const REQUEST_V1_DOMAIN: &[u8] = b"control/node-enrollment/request/v1";
+const REQUEST_V2_DOMAIN: &[u8] = b"control/node-enrollment/request/v2";
 const RESPONSE_DOMAIN: &[u8] = b"control/node-enrollment/response/v1";
 
 /// Invitation metadata pinned into a node's enrollment proof.
@@ -35,7 +36,12 @@ pub fn enrollment_request_transcript(
     invitation: &EnrollmentInvitation<'_>,
     request: &EnrollNodeRequest,
 ) -> Result<Vec<u8>, EnrollmentCryptoError> {
-    let mut transcript = Transcript::new(REQUEST_DOMAIN)?;
+    let domain = if request.public_material.is_some() {
+        REQUEST_V2_DOMAIN
+    } else {
+        REQUEST_V1_DOMAIN
+    };
+    let mut transcript = Transcript::new(domain)?;
     transcript.text("purpose", purpose_name(invitation.purpose))?;
     transcript.text("controller-origin", invitation.controller_origin)?;
     transcript.text(
@@ -66,6 +72,11 @@ pub fn enrollment_request_transcript(
     transcript.bytes("capability-count", &capability_count.to_be_bytes())?;
     for capability in capabilities {
         transcript.text("capability", capability)?;
+    }
+
+    if let Some(material) = &request.public_material {
+        transcript.text("reality-public-key", material.reality_public_key.as_str())?;
+        transcript.text("reality-short-id", &material.reality_short_id)?;
     }
 
     transcript.text(

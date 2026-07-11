@@ -285,12 +285,15 @@ impl Drop for SocketPathGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local_api::{LocalServicePhase, LOCAL_API_SOCKET_FILE};
+    use crate::local_api::{LocalServicePhase, NodeSetupPhase, LOCAL_API_SOCKET_FILE};
     use crate::{RouterMappingState, RouterMappingStatus};
     use control_protocol::id::{
-        ControllerInstanceId, NodeId, SequenceNumber, SigningKeyId, Timestamp,
+        ControllerInstanceId, EndpointId, NodeId, Revision, SequenceNumber, SigningKeyId, Timestamp,
     };
-    use control_protocol::node::{NodeHeartbeatStatus, NodeLifecycleState, NodeRuntimeState};
+    use control_protocol::node::{
+        EndpointReadiness, NodeEndpointStatus, NodeHeartbeatStatus, NodeLifecycleState,
+        NodeRuntimeState,
+    };
     use std::os::unix::fs::symlink;
     use time::OffsetDateTime;
     use uuid::Uuid;
@@ -331,6 +334,46 @@ mod tests {
             },
             last_error: None,
         }
+    }
+
+    #[test]
+    fn setup_phase_requires_controller_and_protocol_verification_evidence() {
+        let mut status = fixture_status();
+        assert_eq!(status.setup_phase(), NodeSetupPhase::WaitingForApproval);
+
+        status.controller_status.as_mut().unwrap().lifecycle = NodeLifecycleState::Active;
+        assert_eq!(
+            status.setup_phase(),
+            NodeSetupPhase::WaitingForConfiguration
+        );
+
+        status.desired_revision_cursor = 1;
+        assert_eq!(status.setup_phase(), NodeSetupPhase::ApplyingConfiguration);
+
+        status.applied_revision = Some(Revision::new(1).unwrap());
+        status.phase = LocalServicePhase::Serving;
+        status.runtime_state = NodeRuntimeState::Serving;
+        assert_eq!(
+            status.setup_phase(),
+            NodeSetupPhase::EstablishingReachability
+        );
+
+        status
+            .controller_status
+            .as_mut()
+            .unwrap()
+            .endpoints
+            .push(NodeEndpointStatus {
+                endpoint_id: EndpointId::new(),
+                readiness: EndpointReadiness::TcpReachable,
+                last_checked_at: Some(Timestamp::from_datetime(OffsetDateTime::now_utc())),
+                error_code: None,
+            });
+        assert_eq!(status.setup_phase(), NodeSetupPhase::WaitingForVerification);
+
+        status.controller_status.as_mut().unwrap().endpoints[0].readiness =
+            EndpointReadiness::Verified;
+        assert_eq!(status.setup_phase(), NodeSetupPhase::Ready);
     }
 
     #[tokio::test]

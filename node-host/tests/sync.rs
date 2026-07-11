@@ -528,7 +528,7 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     assert!(synced.last_sync_at.is_some());
     assert!(synced.controller_status.is_none());
     assert_eq!(synced.desired_revision_cursor, 0);
-    assert_eq!(synced.schema_version, 11);
+    assert_eq!(synced.schema_version, 12);
 
     let captured = controller.captured();
     assert_eq!(captured.len(), 2);

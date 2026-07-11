@@ -3,7 +3,9 @@ use anyhow::{Context as _, Result};
 #[cfg(target_os = "macos")]
 use control_protocol::id::RequestId;
 use control_protocol::id::{NodeId, Revision, Timestamp};
-use control_protocol::node::{NodeHeartbeatStatus, NodeRuntimeState};
+use control_protocol::node::{
+    EndpointReadiness, NodeHeartbeatStatus, NodeLifecycleState, NodeRuntimeState,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
@@ -64,6 +66,54 @@ impl LocalServicePhase {
 }
 
 impl fmt::Display for LocalServicePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Provider-facing progress for the complete one-action setup journey.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NodeSetupPhase {
+    /// Background service is starting or has not completed its first sync.
+    Starting,
+    /// Control has enrolled the identity but has not activated it.
+    WaitingForApproval,
+    /// The node is active but has not fetched a first desired revision.
+    WaitingForConfiguration,
+    /// A desired revision is being received, validated, or activated.
+    ApplyingConfiguration,
+    /// Local service is healthy and establishing a direct or relay endpoint.
+    EstablishingReachability,
+    /// Control is checking a reported endpoint from outside the node network.
+    WaitingForVerification,
+    /// A protocol-verified endpoint is ready for member publication.
+    Ready,
+    /// Provider pause is active.
+    Paused,
+    /// A local failure or quarantine requires provider attention.
+    NeedsAttention,
+}
+
+impl NodeSetupPhase {
+    /// Returns the stable wire value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::WaitingForApproval => "waitingForApproval",
+            Self::WaitingForConfiguration => "waitingForConfiguration",
+            Self::ApplyingConfiguration => "applyingConfiguration",
+            Self::EstablishingReachability => "establishingReachability",
+            Self::WaitingForVerification => "waitingForVerification",
+            Self::Ready => "ready",
+            Self::Paused => "paused",
+            Self::NeedsAttention => "needsAttention",
+        }
+    }
+}
+
+impl fmt::Display for NodeSetupPhase {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -155,6 +205,48 @@ pub struct LocalServiceStatus {
 }
 
 impl LocalServiceStatus {
+    /// Derives setup progress without overstating local or TCP-only evidence.
+    #[must_use]
+    pub fn setup_phase(&self) -> NodeSetupPhase {
+        if self.phase == LocalServicePhase::Paused {
+            return NodeSetupPhase::Paused;
+        }
+        if self.last_error.is_some()
+            || matches!(
+                self.phase,
+                LocalServicePhase::Degraded | LocalServicePhase::Quarantined
+            )
+        {
+            return NodeSetupPhase::NeedsAttention;
+        }
+        let Some(controller) = &self.controller_status else {
+            return NodeSetupPhase::Starting;
+        };
+        if controller.lifecycle == NodeLifecycleState::Pending {
+            return NodeSetupPhase::WaitingForApproval;
+        }
+        if self.desired_revision_cursor == 0 {
+            return NodeSetupPhase::WaitingForConfiguration;
+        }
+        if self.applied_revision.map(Revision::get) != Some(self.desired_revision_cursor)
+            || self.runtime_state != NodeRuntimeState::Serving
+        {
+            return NodeSetupPhase::ApplyingConfiguration;
+        }
+        if controller
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.readiness == EndpointReadiness::Verified)
+        {
+            return NodeSetupPhase::Ready;
+        }
+        if controller.endpoints.is_empty() {
+            NodeSetupPhase::EstablishingReachability
+        } else {
+            NodeSetupPhase::WaitingForVerification
+        }
+    }
+
     pub(crate) fn from_host(
         service_instance_id: Uuid,
         host: &HostStatus,
@@ -253,6 +345,16 @@ impl LocalServiceStatus {
     }
 }
 
+/// Safe provider-facing setup status returned by the desktop backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeSetupStatus {
+    /// Derived end-to-end progress.
+    pub setup_phase: NodeSetupPhase,
+    /// Complete safe local service snapshot used to explain that progress.
+    pub local: LocalServiceStatus,
+}
+
 pub(crate) fn phase_for_runtime(runtime_state: NodeRuntimeState) -> LocalServicePhase {
     match runtime_state {
         NodeRuntimeState::Pending | NodeRuntimeState::Idle => LocalServicePhase::Idle,
@@ -321,6 +423,19 @@ pub async fn query_local_service_status(data_dir: &Path) -> Result<LocalServiceS
         let _ = data_dir;
         anyhow::bail!("the local Node Host status API is not implemented on this platform");
     }
+}
+
+/// Queries the service and derives conservative one-action setup progress.
+///
+/// # Errors
+///
+/// Returns the same errors as [`query_local_service_status`].
+pub async fn query_node_setup_status(data_dir: &Path) -> Result<NodeSetupStatus> {
+    let local = query_local_service_status(data_dir).await?;
+    Ok(NodeSetupStatus {
+        setup_phase: local.setup_phase(),
+        local,
+    })
 }
 
 #[cfg(target_os = "macos")]

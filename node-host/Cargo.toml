@@ -40,6 +40,7 @@ nix = { version = "0.30", default-features = false, features = ["socket", "user"
 [dev-dependencies]
 assert_cmd = "2"
 axum = "0.8"
+control-server = { path = "../control-server" }
 predicates = "3"
 tempfile = "3"
 

@@ -19,11 +19,11 @@ use control_protocol::account::{
 use control_protocol::id::{NodeId, Revision, Timestamp, UserId};
 use control_protocol::idempotency::{IdempotencyKey, IDEMPOTENCY_KEY_HEADER};
 use control_protocol::node::{
-    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
-    EnrollNodeResponse, NodeCapability, NodeHeartbeat, RevisionResult, SignedDesiredState,
-    SignedNodeHeartbeatStatus,
+    encode_node_setup_code, CreateNodeInvitationRequest, EnrollNodeRequest, EnrollNodeResponse,
+    NodeCapability, NodeHeartbeat, RevisionResult, SignedDesiredState, SignedNodeHeartbeatStatus,
 };
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
+use control_protocol::secret::Secret;
 use http_body_util::BodyExt as _;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -101,7 +101,8 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/v1/nodes/enroll", post(enroll_node))
+        .route("/v1/nodes/enroll", post(enroll_node_v1))
+        .route("/v2/nodes/enroll", post(enroll_node_v2))
         .merge(authenticated_node_routes)
         .merge(admin_routes)
         .fallback(not_found)
@@ -251,26 +252,65 @@ async fn create_node_invitation(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     request: Request,
-) -> Result<(axum::http::StatusCode, Json<CreateNodeInvitationResponse>), ApiError> {
+) -> Result<(axum::http::StatusCode, Json<NodeInvitationDeliveryResponse>), ApiError> {
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
     let body: CreateNodeInvitationRequest = parse_bounded_json(request, request_id).await?;
     body.validate()
         .map_err(|_| ApiError::validation_failed(request_id))?;
-    let response = state
+    let display_name = body.display_name.clone();
+    let invitation = state
         .database
-        .create_node_invitation(body, state.controller_origin)
+        .create_node_invitation(body, state.controller_origin, idempotency_key)
         .await
         .map_err(|error| database_api_error(error, request_id))?;
-    Ok((axum::http::StatusCode::CREATED, Json(response)))
+    let setup_code = encode_node_setup_code(&display_name, &invitation).map_err(|error| {
+        tracing::error!(request_id = %request_id, error = %error, "failed to encode node setup code");
+        ApiError::internal(request_id)
+    })?;
+    let setup_link = Secret::new(format!(
+        "{}/join/node#{}",
+        invitation.controller_origin.trim_end_matches('/'),
+        setup_code.expose_secret()
+    ));
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(NodeInvitationDeliveryResponse {
+            display_name,
+            expires_at: invitation.expires_at,
+            setup_code,
+            setup_link,
+        }),
+    ))
 }
 
-async fn enroll_node(
+async fn enroll_node_v1(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     request: Request,
 ) -> Result<(axum::http::StatusCode, Json<EnrollNodeResponse>), ApiError> {
+    enroll_node(state, request_id, request, false).await
+}
+
+async fn enroll_node_v2(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(axum::http::StatusCode, Json<EnrollNodeResponse>), ApiError> {
+    enroll_node(state, request_id, request, true).await
+}
+
+async fn enroll_node(
+    state: AppState,
+    request_id: RequestId,
+    request: Request,
+    requires_public_material: bool,
+) -> Result<(axum::http::StatusCode, Json<EnrollNodeResponse>), ApiError> {
     let body: EnrollNodeRequest = parse_bounded_json(request, request_id).await?;
     body.validate()
         .map_err(|_| ApiError::validation_failed(request_id))?;
+    if body.public_material.is_some() != requires_public_material {
+        return Err(ApiError::validation_failed(request_id));
+    }
     let response = state
         .database
         .enroll_node(body)
@@ -312,7 +352,12 @@ async fn read_bounded_body(mut body: Body, request_id: RequestId) -> Result<Vec<
 
 fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
     match error {
-        DatabaseError::Validation(_) => ApiError::validation_failed(request_id),
+        DatabaseError::Validation(_)
+        | DatabaseError::EnrollmentDisplayNameMismatch
+        | DatabaseError::NodePublicMaterialRequired
+        | DatabaseError::NodeBootstrapCapabilitiesRequired => {
+            ApiError::validation_failed(request_id)
+        }
         DatabaseError::InvitationInvalid => ApiError::invitation_invalid(request_id),
         DatabaseError::InvitationExpired => ApiError::invitation_expired(request_id),
         DatabaseError::InvitationConsumed => ApiError::invitation_consumed(request_id),
@@ -408,6 +453,15 @@ struct AccountListResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct NodeInvitationDeliveryResponse {
+    display_name: String,
+    expires_at: Timestamp,
+    setup_code: Secret<String>,
+    setup_link: Secret<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DesiredStatePublicationResponse {
     node_id: NodeId,
     revision: Revision,
@@ -440,6 +494,8 @@ struct NodeSummaryResponse {
     platform: String,
     agent_version: String,
     xray_version: Option<String>,
+    public_material_ready: bool,
+    onboarding_state: String,
     capabilities: Vec<NodeCapability>,
     provider_consent: ProviderConsentResponse,
     last_seen_at: Option<String>,
@@ -485,6 +541,8 @@ impl TryFrom<NodeSummaryRecord> for NodeSummaryResponse {
             platform: record.platform,
             agent_version: record.agent_version,
             xray_version: record.xray_version,
+            public_material_ready: record.public_material_ready,
+            onboarding_state: record.onboarding_state,
             capabilities: record.capabilities,
             provider_consent: ProviderConsentResponse {
                 policy_version: record.provider_consent.policy_version,

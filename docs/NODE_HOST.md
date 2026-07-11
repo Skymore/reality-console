@@ -195,34 +195,44 @@ deleted and the invitation remains consumed. Re-pairing requires a new invitatio
 ### 6.4 Headless Development Flow
 
 The current headless implementation exposes `bootstrap`, `init`, `join`, `configure-xray`,
-`sync-once`, `run`, `status`, and macOS preview `service install/status/remove` commands. `join`
-consumes the exact JSON invitation returned by Control Service, requires both provider-consent
-flags, reuses the installation's owner-only Ed25519/X25519 identities, and persists registration
-only after verifying the controller fingerprint and signed response. On Unix, the invitation file
-must be a regular non-symlink file inaccessible to group and other users. Repeating `join` with the
-same invitation and local identity safely recovers a lost success response without creating another node.
+`sync-once`, `run`, `status`, and macOS preview `service install/status/remove` commands. The
+diagnostic `join` path still consumes an owner-only raw invitation file. The friend-facing backend
+instead accepts a bounded `pn-node-v1` setup code or an HTTPS `/join/node#...` link directly in
+memory. It verifies that the link and encoded invitation name the same strict controller origin,
+uses the invitation-bound display name, and returns only a secret-free preview containing name,
+origin, fingerprint, and expiry.
 
-This CLI is a development and service integration surface, not the intended friend-facing UX. The
-desktop wrapper will receive the invitation in memory through a QR code or deep link and present
-the provider disclosures as explicit checkboxes. Registration creates a pending node; operator
-approval and activation remain separate control-plane steps. The operator sees a redacted node
-summary and explicitly approves it through Control Service. Heartbeat cannot approve it. Disabling
-the node immediately blocks control authentication; revoking it also atomically revokes all of its
-node credentials.
+This CLI is a development and service integration surface, not the intended friend-facing UX. A
+desktop backend passes its installer-owned runtime inputs to `BootstrapRequest::from_setup_code`
+and presents provider disclosures as explicit checkboxes. A manual invitation creates a pending
+node. A preconfigured invitation is explicit administrator pre-approval: v2 enrollment atomically
+creates and activates the node and publishes revision 1. Heartbeat still cannot approve a manual
+node, and neither enrollment mode bypasses external protocol verification.
 
 The backend exposes the friend-facing setup boundary as `BootstrapRequest` plus one `bootstrap`
-operation. The desktop path parses bounded invitation JSON in memory and never places the secret
-in a command-line argument. The signed installer injects its explicit bundled-Xray path and
+operation. The desktop path parses a bounded code/link in memory and never places the secret in a
+file or command-line argument. The signed installer injects its explicit bundled-Xray path and
 manifest SHA-256. Bootstrap first requires both consent decisions, initializes or reuses the
 stable local identity, verifies Xray entirely offline, and only then sends the single-use
 invitation. A damaged runtime therefore cannot consume the invitation. Network failure can be
-presented as one `Try again` action: rerunning bootstrap reuses the same identity, runtime pin, and
-invitation recovery semantics. The optional `accept_router_mapping` choice is persisted locally
-before enrollment; when selected, the signed enrollment advertises PCP, NAT-PMP, and UPnP support
-and binds the mapping consent. The file-based `bootstrap` subcommand exists only for installer and
-headless integration. The macOS preview user-service registration is implemented below. Native
-signed package installation, system-service registration, and the setup UI remain separate pending
-deliverables.
+presented as one `Try again` action: migration 12 retains the exact invitation-bound consent time
+and choices, local identity, runtime pin, and public REALITY material. Changing capabilities,
+consent, platform, or public material is not accepted as an idempotent enrollment retry. The
+optional router-mapping choice is persisted before enrollment; when selected, the signed request
+advertises PCP, NAT-PMP, and UPnP support.
+
+`bootstrap_and_install_user_service` composes this with background registration. The desktop status
+backend then uses `query_node_setup_status`, which derives only these conservative phases:
+`starting`, `waitingForApproval`, `waitingForConfiguration`, `applyingConfiguration`,
+`establishingReachability`, `waitingForVerification`, `ready`, `paused`, and `needsAttention`.
+Only a signature-verified controller endpoint status can produce `ready`; a loaded service, local
+Xray process, or TCP-only result cannot. Native signed package installation and the setup UI remain
+separate frontend/release deliverables.
+
+`NodeSetupSessionStore` is the renderer boundary. It ingests the bearer code/link in Rust, returns
+only a random process-local session ID plus the secret-free preview, and confirms setup by that ID
+using package-owned Xray/agent paths. A failed attempt retains the still-valid session for one-click
+retry; success, cancellation, expiry, or process exit destroys and zeroizes the in-memory value.
 
 `configure-xray` is an installer/service integration command, not friend-facing setup. It accepts
 only an explicit absolute binary path and installer-manifest SHA-256, rejects unsafe file metadata,

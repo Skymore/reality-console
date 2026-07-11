@@ -8,11 +8,20 @@ use crate::id::{
 };
 use crate::secret::Secret;
 use crate::validation::{ProtocolValidationError, ValidationCode};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Maximum lifetime accepted for a node invitation.
 pub const MAX_NODE_INVITATION_LIFETIME_SECONDS: u32 = 3_600;
+
+/// Prefix identifying an in-memory Node Host setup code.
+pub const NODE_SETUP_CODE_PREFIX: &str = "pn-node-v1.";
+
+const NODE_SETUP_CODE_SCHEMA_VERSION: u16 = 1;
+const MAX_NODE_SETUP_CODE_LENGTH: usize = 4_096;
+const INVITATION_SECRET_BYTES: usize = 32;
 
 /// Admin request to create a one-time node invitation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +31,10 @@ pub struct CreateNodeInvitationRequest {
     pub display_name: String,
     /// Requested validity period in seconds.
     pub expires_in_seconds: u32,
+    /// Optional complete first configuration. Presence authorizes automatic
+    /// activation after a matching Node Host enrollment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_configuration: Option<NodeInitialConfiguration>,
 }
 
 impl CreateNodeInvitationRequest {
@@ -40,13 +53,42 @@ impl CreateNodeInvitationRequest {
                 "invitation lifetime must be between 1 and 3600 seconds",
             ));
         }
+        if let Some(configuration) = &self.initial_configuration {
+            configuration.validate()?;
+        }
         Ok(())
+    }
+}
+
+/// Closed first desired-state configuration bound to a node invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeInitialConfiguration {
+    /// Minimum Node Host version allowed to apply the initial state.
+    pub min_agent_version: String,
+    /// Complete non-secret Xray configuration selected by the operator.
+    pub xray: DesiredXrayState,
+}
+
+impl NodeInitialConfiguration {
+    /// Validates the initial schema-version-2 Xray configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid version or Xray field.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        validate_short_text(
+            &self.min_agent_version,
+            64,
+            "initialConfiguration.minAgentVersion",
+        )?;
+        self.xray.validate(2)
     }
 }
 
 /// One-time node invitation returned only at creation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateNodeInvitationResponse {
     /// Stable invitation identity.
     pub invitation_id: NodeInvitationId,
@@ -60,6 +102,154 @@ pub struct CreateNodeInvitationResponse {
     pub controller_origin: String,
     /// Controller TLS or enrollment-key fingerprint.
     pub controller_fingerprint: Sha256Digest,
+}
+
+/// Decoded setup-code input safe for a Node Host desktop backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeSetupInvitation {
+    /// Operator-selected node name; the provider does not need to enter one.
+    pub display_name: String,
+    /// One-time enrollment material transported only in memory.
+    pub invitation: CreateNodeInvitationResponse,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NodeSetupCodePayload {
+    schema_version: u16,
+    display_name: String,
+    invitation: CreateNodeInvitationResponse,
+}
+
+/// Encodes a one-time invitation as a pasteable or QR-safe setup code.
+///
+/// The result contains the invitation secret and must be treated like a
+/// password until consumed or expired.
+///
+/// # Errors
+///
+/// Returns an error when the display name or invitation is invalid, or the
+/// encoded payload exceeds the protocol bound.
+pub fn encode_node_setup_code(
+    display_name: &str,
+    invitation: &CreateNodeInvitationResponse,
+) -> Result<Secret<String>, ProtocolValidationError> {
+    validate_display_name(display_name, "displayName")?;
+    validate_node_setup_invitation(invitation)?;
+    let payload = NodeSetupCodePayload {
+        schema_version: NODE_SETUP_CODE_SCHEMA_VERSION,
+        display_name: display_name.to_string(),
+        invitation: invitation.clone(),
+    };
+    let json = serde_json::to_vec(&payload).map_err(|_| {
+        ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode",
+            "node setup code could not be encoded",
+        )
+    })?;
+    let value = format!("{NODE_SETUP_CODE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
+    if value.len() > MAX_NODE_SETUP_CODE_LENGTH {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::OutOfRange,
+            "setupCode",
+            "node setup code exceeds the protocol bound",
+        ));
+    }
+    Ok(Secret::new(value))
+}
+
+/// Decodes a pasteable or QR-scanned Node Host setup code.
+///
+/// # Errors
+///
+/// Returns an error for malformed, non-canonical, unsupported, or oversized
+/// input. Expiry is enforced by the controller during enrollment.
+pub fn decode_node_setup_code(value: &str) -> Result<NodeSetupInvitation, ProtocolValidationError> {
+    if value.len() > MAX_NODE_SETUP_CODE_LENGTH {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::OutOfRange,
+            "setupCode",
+            "node setup code exceeds the protocol bound",
+        ));
+    }
+    let encoded = value.strip_prefix(NODE_SETUP_CODE_PREFIX).ok_or_else(|| {
+        ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode",
+            "node setup code has an unsupported prefix",
+        )
+    })?;
+    if encoded.is_empty() || encoded.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode",
+            "node setup code is malformed",
+        ));
+    }
+    let json = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| {
+        ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode",
+            "node setup code is malformed",
+        )
+    })?;
+    if URL_SAFE_NO_PAD.encode(&json) != encoded {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode",
+            "node setup code is not canonical",
+        ));
+    }
+    let payload: NodeSetupCodePayload = serde_json::from_slice(&json).map_err(|_| {
+        ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode",
+            "node setup code payload is invalid",
+        )
+    })?;
+    if payload.schema_version != NODE_SETUP_CODE_SCHEMA_VERSION {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::UnsupportedSchema,
+            "setupCode.schemaVersion",
+            "node setup code schema is not supported",
+        ));
+    }
+    validate_display_name(&payload.display_name, "setupCode.displayName")?;
+    validate_node_setup_invitation(&payload.invitation)?;
+    Ok(NodeSetupInvitation {
+        display_name: payload.display_name,
+        invitation: payload.invitation,
+    })
+}
+
+fn validate_node_setup_invitation(
+    invitation: &CreateNodeInvitationResponse,
+) -> Result<(), ProtocolValidationError> {
+    if invitation.purpose != PairingPurpose::NodeEnrollment {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::InconsistentState,
+            "setupCode.invitation.purpose",
+            "setup code is not intended for node enrollment",
+        ));
+    }
+    let secret = URL_SAFE_NO_PAD
+        .decode(invitation.invitation_secret.expose_secret())
+        .map_err(|_| {
+            ProtocolValidationError::new(
+                ValidationCode::InvalidFormat,
+                "setupCode.invitation.invitationSecret",
+                "invitation secret is malformed",
+            )
+        })?;
+    if secret.len() != INVITATION_SECRET_BYTES {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode.invitation.invitationSecret",
+            "invitation secret is malformed",
+        ));
+    }
+    Ok(())
 }
 
 /// Closed pairing purposes; credentials are never interchangeable.
@@ -110,6 +300,9 @@ pub struct EnrollNodeRequest {
     pub identity_public_key: Ed25519PublicKey,
     /// Locally generated X25519 recipient-encryption identity.
     pub encryption_public_key: X25519PublicKey,
+    /// Public node-local REALITY material generated after runtime verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_material: Option<NodePublicMaterial>,
     /// Fresh client nonce included in the enrollment transcript.
     pub nonce: Nonce,
     /// Signature over the complete enrollment transcript.
@@ -173,7 +366,38 @@ impl EnrollNodeRequest {
                 "router mapping capabilities require matching consent and direct TCP support",
             ));
         }
+        if let Some(material) = &self.public_material {
+            material.validate()?;
+        }
         self.provider_consent.validate()
+    }
+}
+
+/// Public data-plane identity generated and owned by one Node Host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodePublicMaterial {
+    /// Public REALITY X25519 key; the corresponding private key never leaves the node.
+    pub reality_public_key: X25519PublicKey,
+    /// Stable 8-byte REALITY short ID encoded as 16 lowercase hex characters.
+    pub reality_short_id: String,
+}
+
+impl NodePublicMaterial {
+    fn validate(&self) -> Result<(), ProtocolValidationError> {
+        let valid_short_id = self.reality_short_id.len() == 16
+            && self
+                .reality_short_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !valid_short_id {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InvalidFormat,
+                "publicMaterial.realityShortId",
+                "REALITY short ID must be 16 lowercase hexadecimal characters",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1213,16 +1437,17 @@ fn validate_short_text(
 #[cfg(test)]
 mod tests {
     use super::{
+        decode_node_setup_code, encode_node_setup_code, CreateNodeInvitationResponse,
         DesiredStateDocument, DesiredUser, DesiredXrayState, EndpointCandidate, EndpointMode,
         EndpointReadiness, EndpointSource, NodeEndpointStatus, NodeHeartbeat, NodeHeartbeatStatus,
-        NodeLifecycleState, NodeRuntimeState, RevisionProgress, RevisionResult,
-        RevisionResultState,
+        NodeLifecycleState, NodeRuntimeState, PairingPurpose, RevisionProgress, RevisionResult,
+        RevisionResultState, NODE_SETUP_CODE_PREFIX,
     };
     use crate::crypto::Sha256Digest;
     use crate::error::ErrorCode;
     use crate::id::{
-        ControllerInstanceId, CredentialId, EndpointId, NetworkId, NodeId, Revision,
-        SequenceNumber, SigningKeyId, Timestamp, UserId,
+        ControllerInstanceId, CredentialId, EndpointId, NetworkId, NodeId, NodeInvitationId,
+        Revision, SequenceNumber, SigningKeyId, Timestamp, UserId,
     };
     use crate::secret::Secret;
 
@@ -1257,6 +1482,31 @@ mod tests {
             error_code,
             rollback_revision,
         }
+    }
+
+    #[test]
+    fn node_setup_code_round_trips_and_redacts_the_invitation_secret() {
+        let invitation = CreateNodeInvitationResponse {
+            invitation_id: NodeInvitationId::new(),
+            purpose: PairingPurpose::NodeEnrollment,
+            expires_at: timestamp("2026-07-11T21:00:00Z"),
+            invitation_secret: Secret::new(
+                "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY".to_string(),
+            ),
+            controller_origin: "https://control.example.test".to_string(),
+            controller_fingerprint: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
+        };
+
+        let code = encode_node_setup_code("Friend host", &invitation).unwrap();
+        assert!(code.expose_secret().starts_with(NODE_SETUP_CODE_PREFIX));
+        assert!(!format!("{code:?}").contains(invitation.invitation_secret.expose_secret()));
+        let decoded = decode_node_setup_code(code.expose_secret()).unwrap();
+        assert_eq!(decoded.display_name, "Friend host");
+        assert_eq!(decoded.invitation, invitation);
+
+        let mut noncanonical = code.expose_secret().to_string();
+        noncanonical.push('=');
+        assert!(decode_node_setup_code(&noncanonical).is_err());
     }
 
     fn desired_document() -> DesiredStateDocument {

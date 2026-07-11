@@ -14,6 +14,7 @@ mod local_api_macos;
 mod mapping;
 mod router_protocol;
 mod service;
+mod setup_session;
 mod sync;
 #[cfg(test)]
 mod test_support;
@@ -48,7 +49,7 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 11;
+const CURRENT_SCHEMA_VERSION: i64 = 12;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
@@ -61,6 +62,7 @@ const MIGRATION_8_NAME: &str = "node_heartbeat_generation";
 const MIGRATION_9_NAME: &str = "node_router_mapping_state";
 const MIGRATION_10_NAME: &str = "node_router_mapping_supervision";
 const MIGRATION_11_NAME: &str = "verified_controller_status";
+const MIGRATION_12_NAME: &str = "provider_consent_receipt";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -399,20 +401,34 @@ const MIGRATION_11: &str = "
     END;
 ";
 
+const MIGRATION_12: &str = "
+    CREATE TABLE provider_consent_receipt (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        invitation_id TEXT NOT NULL CHECK (length(invitation_id) = 36),
+        policy_version TEXT NOT NULL CHECK (length(policy_version) BETWEEN 1 AND 64),
+        host_owner_consented INTEGER NOT NULL CHECK (host_owner_consented = 1),
+        exit_ip_disclosure_accepted INTEGER NOT NULL CHECK (exit_ip_disclosure_accepted = 1),
+        router_mapping_accepted INTEGER NOT NULL CHECK (router_mapping_accepted IN (0, 1)),
+        accepted_at INTEGER NOT NULL
+    ) STRICT;
+";
+
 pub use background::{
     install_user_service, remove_user_service, user_service_status, BackgroundServiceStatus,
     UserServiceInstallRequest, USER_SERVICE_LABEL,
 };
 pub use bootstrap::{
-    bootstrap, bootstrap_and_install_user_service, BootstrapRequest, BootstrapServiceOutcome,
+    bootstrap, bootstrap_and_install_user_service, inspect_setup_code, BootstrapRequest,
+    BootstrapServiceOutcome, NodeSetupPreview,
 };
 pub use enrollment::join;
 pub use local_api::{
-    query_local_service_status, LocalServiceError, LocalServiceErrorCode, LocalServicePhase,
-    LocalServiceStatus,
+    query_local_service_status, query_node_setup_status, LocalServiceError, LocalServiceErrorCode,
+    LocalServicePhase, LocalServiceStatus, NodeSetupPhase, NodeSetupStatus,
 };
 pub use mapping::{RouterMappingState, RouterMappingStatus};
 pub use service::{run, run_until, SyncLoopOptions};
+pub use setup_session::{NodeSetupInstallRequest, NodeSetupSession, NodeSetupSessionStore};
 pub use sync::sync_once;
 pub use xray::configure_xray;
 
@@ -610,6 +626,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 9, MIGRATION_9_NAME, MIGRATION_9)?;
     apply_migration(&transaction, 10, MIGRATION_10_NAME, MIGRATION_10)?;
     apply_migration(&transaction, 11, MIGRATION_11_NAME, MIGRATION_11)?;
+    apply_migration(&transaction, 12, MIGRATION_12_NAME, MIGRATION_12)?;
     transaction.commit()?;
     Ok(())
 }
@@ -679,6 +696,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (9, MIGRATION_9_NAME, MIGRATION_9),
         (10, MIGRATION_10_NAME, MIGRATION_10),
         (11, MIGRATION_11_NAME, MIGRATION_11),
+        (12, MIGRATION_12_NAME, MIGRATION_12),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");

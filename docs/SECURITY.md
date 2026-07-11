@@ -185,16 +185,22 @@ MUST NOT work for another.
 
 The controller creates a pairing record containing:
 
-- at least 256 bits from a CSPRNG, represented as a QR code or high-entropy link;
+- at least 256 unpredictable bits from a CSPRNG or domain-separated controller-key derivation,
+  represented as a QR code or high-entropy link;
 - purpose, intended account or role, permitted node set, creation time, and expiry;
 - the controller URL and controller TLS or enrollment-key fingerprint;
-- a server-side hash of the secret, never the plaintext secret;
+- a server-side hash of the secret, never the plaintext secret; an idempotent retry may rederive
+  the same secret only from the controller key plus request and idempotency-key digests;
 - `unused`, `claimed`, `completed`, `expired`, or `cancelled` state.
 
 Pairing records expire after ten minutes by default and MUST NOT exceed one hour. They are
 single-use, rate limited by source and record, excluded from URLs sent to third-party services,
 and redacted from logs, crash reports, clipboard history where the platform allows it, and UI
 screens after completion. The controller invalidates a record atomically on the first valid claim.
+The implemented node setup link places the bearer payload only after `#`; Control never receives it
+through a browser request or Referer. Base64url is encoding, not encryption. Desktop backends keep
+the value in Rust memory and ordinary previews, logs, status APIs, SQLite, service definitions,
+process arguments, crash reports, and renderer persistence must not contain it.
 
 ### Pairing Protocol
 
@@ -203,7 +209,8 @@ screens after completion. The controller invalidates a record atomically on the 
    encoded controller fingerprint. Private deployments MAY use a pinned private CA instead of
    public PKI, but MUST NOT offer a click-through for a mismatched fingerprint.
 3. It submits the pairing secret, purpose, public keys, software version, and a fresh nonce. It
-   proves possession by signing the complete request transcript.
+   proves possession by signing the complete request transcript. One-action node enrollment also
+   binds node-generated REALITY public material and a locally persisted provider-consent receipt.
 4. The controller atomically claims the unused record, validates scope and software policy, and
    displays the joining identity fingerprint and requested permissions to an administrator when
    approval is required.
@@ -217,6 +224,12 @@ screens after completion. The controller invalidates a record atomically on the 
 Replay, second claim, expired claim, purpose substitution, transcript modification, and unknown
 controller fingerprint MUST fail closed and create a redacted audit event. Pairing secrets MUST
 never become general API tokens.
+
+A node invitation carrying an initial desired configuration is explicit administrator
+pre-approval. Its successful v2 enrollment may activate and publish revision 1 in the same
+transaction, but cannot make the node shareable. Member publication still requires an applied
+revision and a current protocol-aware endpoint verification. Setup UI copy must distinguish
+`enrolled`, `background service loaded`, `configuration applied`, `TCP reachable`, and `ready`.
 
 For node replacement, the owner creates a new node identity and explicitly chooses whether it is
 a new node or a replacement. Replacement does not reuse the old node private key or certificate.
