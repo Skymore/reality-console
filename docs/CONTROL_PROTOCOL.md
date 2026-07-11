@@ -98,6 +98,20 @@ credential, and writes an audit event. Concurrent consumption has exactly one wi
 covers invitation purpose, controller origin, both public keys, nonce, software version, and
 capabilities so it cannot be replayed for a different identity.
 
+The enrollment proof uses a deterministic binary transcript. Every field is encoded as
+`u16be(labelLength) || labelUtf8 || u32be(valueLength) || valueBytes`. The request domain is
+`control/node-enrollment/request/v1`; fields are purpose, controller origin and fingerprint,
+invitation ID and expiry, both node public keys, nonce, agent version, platform, display name,
+sorted capabilities, and every provider-consent field. The response domain is
+`control/node-enrollment/response/v1` and binds the request-transcript SHA-256 digest, network,
+node and controller identities, issued credential, controller signing public key, and controller
+nonce. The shared protocol crate is the only implementation of this encoding.
+
+If the first success response is lost, repeating the exact signed enrollment with the same
+invitation and node key pair returns `200 OK` with the existing node and credential identity. A
+first successful enrollment returns `201 Created`. Reusing the invitation with a different key
+pair returns `409 Conflict`; retry recovery never creates a second node or credential.
+
 ### Authenticated node requests
 
 Every node request uses either mutually authenticated TLS or these end-to-end headers:

@@ -1,14 +1,20 @@
 use crate::auth::BootstrapTokenVerifier;
-use crate::db::{Database, NetworkRecord, SCHEMA_VERSION};
+use crate::db::{Database, DatabaseError, NetworkRecord, SCHEMA_VERSION};
 use crate::error::{ApiError, REQUEST_ID_HEADER};
 use crate::protocol::RequestId;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Extension, Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::{header, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use control_protocol::node::{
+    CreateNodeInvitationRequest, CreateNodeInvitationResponse, EnrollNodeRequest,
+    EnrollNodeResponse,
+};
+use http_body_util::BodyExt as _;
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -22,6 +28,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 pub struct AppState {
     database: Database,
     bootstrap_token: BootstrapTokenVerifier,
+    controller_origin: String,
     request_timeout: Duration,
 }
 
@@ -30,11 +37,13 @@ impl AppState {
     pub fn new(
         database: Database,
         bootstrap_token: BootstrapTokenVerifier,
+        controller_origin: String,
         request_timeout: Duration,
     ) -> Self {
         Self {
             database,
             bootstrap_token,
+            controller_origin,
             request_timeout,
         }
     }
@@ -43,17 +52,92 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/v1/admin/network", get(get_network))
+        .route("/v1/admin/node-invitations", post(create_node_invitation))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/nodes/enroll", post(enroll_node))
         .merge(admin_routes)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state.clone())
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn_with_state(state, enforce_limits))
         .layer(middleware::from_fn(request_context))
+}
+
+async fn create_node_invitation(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(axum::http::StatusCode, Json<CreateNodeInvitationResponse>), ApiError> {
+    let body: CreateNodeInvitationRequest = parse_bounded_json(request, request_id).await?;
+    body.validate()
+        .map_err(|_| ApiError::validation_failed(request_id))?;
+    let response = state
+        .database
+        .create_node_invitation(body, state.controller_origin)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok((axum::http::StatusCode::CREATED, Json(response)))
+}
+
+async fn enroll_node(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(axum::http::StatusCode, Json<EnrollNodeResponse>), ApiError> {
+    let body: EnrollNodeRequest = parse_bounded_json(request, request_id).await?;
+    body.validate()
+        .map_err(|_| ApiError::validation_failed(request_id))?;
+    let response = state
+        .database
+        .enroll_node(body)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    let status = if response.created {
+        axum::http::StatusCode::CREATED
+    } else {
+        axum::http::StatusCode::OK
+    };
+    Ok((status, Json(response.response)))
+}
+
+async fn parse_bounded_json<T>(request: Request, request_id: RequestId) -> Result<T, ApiError>
+where
+    T: DeserializeOwned,
+{
+    let mut body = request.into_body();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| ApiError::validation_failed(request_id))?;
+        if let Ok(data) = frame.into_data() {
+            let next_length = bytes
+                .len()
+                .checked_add(data.len())
+                .ok_or_else(|| ApiError::body_too_large(request_id))?;
+            if next_length > MAX_REQUEST_BODY_BYTES {
+                return Err(ApiError::body_too_large(request_id));
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ApiError::validation_failed(request_id))
+}
+
+fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
+    match error {
+        DatabaseError::Validation(_) => ApiError::validation_failed(request_id),
+        DatabaseError::InvitationInvalid => ApiError::invitation_invalid(request_id),
+        DatabaseError::InvitationExpired => ApiError::invitation_expired(request_id),
+        DatabaseError::InvitationConsumed => ApiError::invitation_consumed(request_id),
+        DatabaseError::InvitationCancelled => ApiError::invitation_cancelled(request_id),
+        DatabaseError::InvalidEnrollmentProof => ApiError::signature_invalid(request_id),
+        other => {
+            tracing::error!(request_id = %request_id, error = %other, "database request failed");
+            ApiError::internal(request_id)
+        }
+    }
 }
 
 #[derive(Serialize)]

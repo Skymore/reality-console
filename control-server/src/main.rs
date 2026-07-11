@@ -16,6 +16,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = AppState::new(
         database,
         config.bootstrap_token.clone(),
+        config.controller_origin,
         config.request_timeout,
     );
     let app = build_router(state);

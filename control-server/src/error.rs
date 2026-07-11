@@ -59,6 +59,72 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn validation_failed(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::ValidationFailed,
+            "The request body is invalid.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn invitation_invalid(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::InvitationInvalid,
+            "The invitation is invalid.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn invitation_expired(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::GONE,
+            ErrorCode::InvitationExpired,
+            "The invitation has expired.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn invitation_consumed(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::InvitationConsumed,
+            "The invitation was already consumed.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn invitation_cancelled(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::GONE,
+            ErrorCode::InvitationCancelled,
+            "The invitation was cancelled.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn signature_invalid(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::SignatureInvalid,
+            "The enrollment proof is invalid.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
     pub fn timeout(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::GATEWAY_TIMEOUT,

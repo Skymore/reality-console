@@ -8,16 +8,19 @@ Connect. The final public brand is intentionally not encoded into the protocol o
 
 - `src/` and `src-tauri/`: current macOS Control application and local-node management backend.
 - `client/`: independent macOS/Windows Connect application with a bundled Xray supervisor.
-- `control-server/`: lightweight Control Service; introduced by the current delivery plan.
-- `crates/`: shared domain and control-protocol crates; introduced by the current delivery plan.
+- `control-server/`: standalone lightweight Control Service with authoritative SQLite storage.
+- `node-host/`: headless Node Host core with local identity, state, and CLI foundations.
+- `crates/`: shared versioned protocol and domain types used by every runtime.
 - `docs/`: authoritative architecture, protocol, security, and component designs.
 
 ## Current Status
 
 The local Control application manages a native Xray installation, users, configuration validation,
 backups, diagnostics, quotas, and local telemetry. Connect can securely import a compatibility
-profile and supervise a pinned Xray sidecar. Account synchronization, Node Host enrollment,
-multi-node desired state, and relay fallback are under active implementation.
+profile and supervise a pinned Xray sidecar. Control Service now supports secure one-time node
+invitations and proof-of-possession enrollment. Node Host has durable owner-only identities and a
+headless `init`/`status` foundation. The Node Host enrollment client, heartbeat, multi-node desired
+state, account synchronization, and relay fallback remain under active implementation.
 
 ## Authoritative Documentation
 
@@ -51,6 +54,10 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 npm --prefix client run build
 cargo test --manifest-path client/src-tauri/Cargo.toml
+
+cargo test --manifest-path crates/control-protocol/Cargo.toml
+cargo test --manifest-path control-server/Cargo.toml
+cargo test --manifest-path node-host/Cargo.toml
 ```
 
 Each implementation phase must leave affected applications buildable, update its authoritative
