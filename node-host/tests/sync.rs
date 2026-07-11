@@ -6,17 +6,19 @@ use axum::routing::{get, post, put};
 use axum::Router;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use control_protocol::crypto::{Ed25519PublicKey, Ed25519Signature};
+use control_protocol::crypto::{ed25519_signing_key_id, Ed25519PublicKey, Ed25519Signature};
 use control_protocol::desired::desired_state_transcript;
 use control_protocol::error::ErrorCode;
 use control_protocol::id::{
     ControllerInstanceId, CredentialId, NetworkId, NodeId, NodeInvitationId, NodeKeyId, RequestId,
-    Revision, SigningKeyId, Timestamp, UserId,
+    Revision, SequenceNumber, SigningKeyId, Timestamp, UserId,
 };
 use control_protocol::node::{
-    DesiredStateDocument, DesiredUser, DesiredXrayState, NodeHeartbeat, NodeRuntimeState,
-    RevisionResult, RevisionResultState, SignedDesiredState,
+    DesiredStateDocument, DesiredUser, DesiredXrayState, EndpointReadiness, NodeEndpointStatus,
+    NodeHeartbeat, NodeHeartbeatStatus, NodeLifecycleState, NodeRuntimeState, RevisionResult,
+    RevisionResultState, SignedDesiredState, SignedNodeHeartbeatStatus,
 };
+use control_protocol::node_status::node_heartbeat_status_transcript;
 use control_protocol::request_auth::{
     verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
 };
@@ -141,6 +143,7 @@ struct MockState {
     mode: ResponseMode,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     desired: Arc<Mutex<Option<SignedDesiredState>>>,
+    heartbeat_status: Arc<Mutex<Option<SignedNodeHeartbeatStatus>>>,
     reject_revision_results: Arc<AtomicBool>,
 }
 
@@ -148,6 +151,7 @@ struct MockController {
     origin: String,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
     desired: Arc<Mutex<Option<SignedDesiredState>>>,
+    heartbeat_status: Arc<Mutex<Option<SignedNodeHeartbeatStatus>>>,
     reject_revision_results: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -160,11 +164,13 @@ impl MockController {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let desired = Arc::new(Mutex::new(None));
+        let heartbeat_status = Arc::new(Mutex::new(None));
         let reject_revision_results = Arc::new(AtomicBool::new(false));
         let state = MockState {
             mode,
             requests: Arc::clone(&requests),
             desired: Arc::clone(&desired),
+            heartbeat_status: Arc::clone(&heartbeat_status),
             reject_revision_results: Arc::clone(&reject_revision_results),
         };
         let router = Router::new()
@@ -184,6 +190,7 @@ impl MockController {
             origin,
             requests,
             desired,
+            heartbeat_status,
             reject_revision_results,
             task,
         }
@@ -199,6 +206,14 @@ impl MockController {
 
     fn set_desired(&self, desired: SignedDesiredState) {
         *self.desired.lock().unwrap() = Some(desired);
+    }
+
+    fn set_heartbeat_status(&self, status: SignedNodeHeartbeatStatus) {
+        *self.heartbeat_status.lock().unwrap() = Some(status);
+    }
+
+    fn clear_heartbeat_status(&self) {
+        *self.heartbeat_status.lock().unwrap() = None;
     }
 
     fn reject_revision_results(&self, reject: bool) {
@@ -232,8 +247,8 @@ async fn capture(
     });
 
     if path_and_query.ends_with("/heartbeat") {
-        return match state.mode {
-            ResponseMode::RejectHeartbeat => (
+        if matches!(state.mode, ResponseMode::RejectHeartbeat) {
+            return (
                 StatusCode::UNAUTHORIZED,
                 axum::Json(json!({
                     "error": {
@@ -245,9 +260,12 @@ async fn capture(
                     }
                 })),
             )
-                .into_response(),
-            _ => StatusCode::NO_CONTENT.into_response(),
-        };
+                .into_response();
+        }
+        return state.heartbeat_status.lock().unwrap().clone().map_or_else(
+            || StatusCode::NO_CONTENT.into_response(),
+            |status| (StatusCode::OK, axum::Json(status)).into_response(),
+        );
     }
 
     if path_and_query.ends_with("/result") {
@@ -362,6 +380,10 @@ fn signed_desired_for_schema(
         .try_into()
         .unwrap();
     let signing_key = SigningKey::from_bytes(&signing_seed);
+    let signing_public_key: Ed25519PublicKey = URL_SAFE_NO_PAD
+        .encode(signing_key.verifying_key().to_bytes())
+        .parse()
+        .unwrap();
     let (listen_port, public_port) = match schema_version {
         1 => (443, None),
         2 => (10_443, Some(443)),
@@ -386,7 +408,7 @@ fn signed_desired_for_schema(
             server_names: vec!["www.microsoft.com".to_string()],
             target: "www.microsoft.com:443".to_string(),
         },
-        signing_key_id: SigningKeyId::new(),
+        signing_key_id: ed25519_signing_key_id(&signing_public_key).unwrap(),
         controller_instance_id: registration.controller_instance,
     };
     let signature: Ed25519Signature = URL_SAFE_NO_PAD
@@ -403,6 +425,95 @@ fn signed_desired_for_schema(
     }
 }
 
+fn signed_controller_status(
+    data_dir: &std::path::Path,
+    registration: Registration,
+    heartbeat_generation: i64,
+) -> SignedNodeHeartbeatStatus {
+    let signing_seed: [u8; 32] = fs::read(data_dir.join("identity.ed25519.seed"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signing_key = SigningKey::from_bytes(&signing_seed);
+    let signing_public_key: Ed25519PublicKey = URL_SAFE_NO_PAD
+        .encode(signing_key.verifying_key().to_bytes())
+        .parse()
+        .unwrap();
+    let observed_at = Timestamp::from_datetime(OffsetDateTime::now_utc());
+    let document = NodeHeartbeatStatus {
+        schema_version: 1,
+        node_id: registration.node,
+        heartbeat_generation: SequenceNumber::new(heartbeat_generation).unwrap(),
+        observed_at,
+        lifecycle: NodeLifecycleState::Active,
+        endpoints: vec![NodeEndpointStatus {
+            endpoint_id: control_protocol::id::EndpointId::new(),
+            readiness: EndpointReadiness::TcpReachable,
+            last_checked_at: Some(observed_at),
+            error_code: None,
+        }],
+        signing_key_id: ed25519_signing_key_id(&signing_public_key).unwrap(),
+        controller_instance_id: registration.controller_instance,
+    };
+    let signature: Ed25519Signature = URL_SAFE_NO_PAD
+        .encode(
+            signing_key
+                .sign(&node_heartbeat_status_transcript(&document).unwrap())
+                .to_bytes(),
+        )
+        .parse()
+        .unwrap();
+    SignedNodeHeartbeatStatus {
+        document,
+        signature,
+    }
+}
+
+fn resign_controller_status(data_dir: &std::path::Path, status: &mut SignedNodeHeartbeatStatus) {
+    let signing_seed: [u8; 32] = fs::read(data_dir.join("identity.ed25519.seed"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signing_key = SigningKey::from_bytes(&signing_seed);
+    status.signature = URL_SAFE_NO_PAD
+        .encode(
+            signing_key
+                .sign(&node_heartbeat_status_transcript(&status.document).unwrap())
+                .to_bytes(),
+        )
+        .parse()
+        .unwrap();
+}
+
+async fn assert_rejected_controller_status<F>(mutate: F, resign: bool, expected_error: &str)
+where
+    F: FnOnce(&mut SignedNodeHeartbeatStatus),
+{
+    let controller = MockController::start(ResponseMode::NoDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let registration = install_registration(&data_dir, &controller.origin);
+    let mut response = signed_controller_status(&data_dir, registration, 1);
+    mutate(&mut response);
+    if resign {
+        resign_controller_status(&data_dir, &mut response);
+    }
+    controller.set_heartbeat_status(response);
+
+    let error = sync_once(&data_dir).await.unwrap_err();
+    assert!(format!("{error:#}").contains(expected_error));
+    let current = status(&data_dir).unwrap();
+    assert!(current.last_heartbeat_at.is_none());
+    assert!(current.controller_status.is_none());
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    let persisted: i64 = connection
+        .query_row("SELECT COUNT(*) FROM controller_status_state", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(persisted, 0);
+}
+
 #[tokio::test]
 async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     let controller = MockController::start(ResponseMode::NoDesiredState).await;
@@ -415,8 +526,9 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     assert_eq!(synced.enrollment_state, EnrollmentState::Enrolled);
     assert!(synced.last_heartbeat_at.is_some());
     assert!(synced.last_sync_at.is_some());
+    assert!(synced.controller_status.is_none());
     assert_eq!(synced.desired_revision_cursor, 0);
-    assert_eq!(synced.schema_version, 10);
+    assert_eq!(synced.schema_version, 11);
 
     let captured = controller.captured();
     assert_eq!(captured.len(), 2);
@@ -510,6 +622,100 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     }
     let identity_seed = fs::read(data_dir.join("identity.ed25519.seed")).unwrap();
     assert!(!contains_bytes(&database, &identity_seed));
+}
+
+#[tokio::test]
+async fn signed_controller_status_is_verified_persisted_and_retained_across_legacy_204() {
+    let controller = MockController::start(ResponseMode::NoDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let registration = install_registration(&data_dir, &controller.origin);
+    let response = signed_controller_status(&data_dir, registration, 1);
+    controller.set_heartbeat_status(response.clone());
+
+    let synced = sync_once(&data_dir).await.unwrap();
+    assert_eq!(synced.controller_status, Some(response.document.clone()));
+    assert!(synced.last_heartbeat_at.is_some());
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    let stored: (i64, String, String, String) = connection
+        .query_row(
+            "SELECT heartbeat_generation, node_id, controller_instance_id, signing_key_id
+             FROM controller_status_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(stored.0, 1);
+    assert_eq!(stored.1, registration.node.to_string());
+    assert_eq!(stored.2, registration.controller_instance.to_string());
+    assert_eq!(stored.3, response.document.signing_key_id.to_string());
+    drop(connection);
+
+    let reloaded = status(&data_dir).unwrap();
+    assert_eq!(reloaded.controller_status, Some(response.document.clone()));
+
+    controller.clear_heartbeat_status();
+    let legacy = sync_once(&data_dir).await.unwrap();
+    assert_eq!(legacy.controller_status, Some(response.document));
+}
+
+#[tokio::test]
+async fn controller_status_rejects_wrong_binding_key_identity_and_signature() {
+    assert_rejected_controller_status(
+        |status| {
+            status.document.heartbeat_generation = SequenceNumber::new(2).unwrap();
+        },
+        true,
+        "document failed validation",
+    )
+    .await;
+    assert_rejected_controller_status(
+        |status| status.document.node_id = NodeId::new(),
+        true,
+        "document failed validation",
+    )
+    .await;
+    assert_rejected_controller_status(
+        |status| status.document.controller_instance_id = ControllerInstanceId::new(),
+        true,
+        "document failed validation",
+    )
+    .await;
+    assert_rejected_controller_status(
+        |status| status.document.signing_key_id = SigningKeyId::new(),
+        true,
+        "signing key identity is invalid",
+    )
+    .await;
+    assert_rejected_controller_status(
+        |status| status.document.lifecycle = NodeLifecycleState::Pending,
+        false,
+        "signature is invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn tampered_persisted_controller_status_fails_closed() {
+    let controller = MockController::start(ResponseMode::NoDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let registration = install_registration(&data_dir, &controller.origin);
+    controller.set_heartbeat_status(signed_controller_status(&data_dir, registration, 1));
+    sync_once(&data_dir).await.unwrap();
+
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    connection
+        .execute(
+            "UPDATE controller_status_state SET envelope_json = '{}' WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let error = status(&data_dir).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("controller status artifact digest is invalid"));
 }
 
 fn verify_captured(

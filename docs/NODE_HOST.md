@@ -238,11 +238,15 @@ state. This sequence is independent from telemetry. It records heartbeat and com
 timestamps locally and uses a fresh nonce for every request. A heartbeat `200` carries only a
 controller-signed, generation-bound lifecycle and endpoint-readiness snapshot. The node accepts it
 only after closed-schema, identity, generation, controller-instance, signing-key, and signature
-verification; a legacy `204` leaves controller status unknown. A desired-state `200` is likewise
-accepted only after closed-schema identity, monotonicity, and pinned controller-signature
-verification. The immutable desired-state envelope and its digests are committed before a signed
-`received` result is sent; an interrupted result remains queued and is retried before the next
-heartbeat. When a pinned runtime is available, Node Host checks the
+verification. Schema 11 stores only the latest verified snapshot, its canonical envelope and
+transcript digests, and a nondecreasing heartbeat generation. The status and heartbeat
+acknowledgement are committed in one transaction and are reverified from the pinned enrollment key
+whenever local status is loaded. A legacy `204` creates no controller status; if an older verified
+snapshot exists it remains explicitly last-known through its observation time. A desired-state
+`200` is likewise accepted only after closed-schema identity, monotonicity, signing-key identity,
+and pinned controller-signature verification. The immutable desired-state envelope and its digests
+are committed before a signed `received` result is sent; an interrupted result remains queued and
+is retried before the next heartbeat. When a pinned runtime is available, Node Host checks the
 minimum agent version, renders typed deterministic Xray JSON with the managed inbound bound only to
 `127.0.0.1`, and runs the pinned binary's bounded offline config test. Success stores a 0600
 immutable candidate plus its config and historical binary digests before reporting `validated`.
@@ -279,12 +283,14 @@ While `run` owns the exclusive data-directory lock, the preview owner UI reads l
 the versioned `query_local_service_status` API instead of opening SQLite. Its Unix socket is inside
 the 0700 node data directory, has mode 0600, and authenticates both sides with macOS peer UID
 credentials. One connection carries one length-prefixed JSON `status` request; request and response
-sizes, connection concurrency, I/O time, and shutdown time are bounded. Unknown schemas, methods,
-fields, oversized frames, unsafe socket ownership, and symlinks fail closed. The response contains
-only the service instance ID, observation time, service/runtime phases, node ID, revision cursors,
-safe activation state, router-mapping status, and categorized error code. It never contains raw
-errors, paths, hashes, invitation data, credentials, generated Xray JSON, or private key material.
-`service live-status` exposes the same contract for diagnostics.
+sizes, connection concurrency, I/O time, and shutdown time are bounded. Local API schema 2 adds the
+latest locally verified controller lifecycle and redacted endpoint-readiness records. Unknown
+schemas, methods, fields, oversized frames, unsafe socket ownership, and symlinks fail closed. The
+response contains only the service instance ID, observation time, service/runtime phases, node ID,
+revision cursors, safe activation state, router-mapping status, controller observation metadata,
+endpoint IDs and readiness, and categorized error codes. It never contains endpoint addresses,
+ports, raw errors, paths, hashes, invitation data, credentials, generated Xray JSON, signatures, or
+private key material. `service live-status` exposes the same contract for diagnostics.
 
 Local IPC success proves that the service process is responsive; it does not prove controller
 approval or Internet reachability. Those remain Control-owned states and may be shown only from a

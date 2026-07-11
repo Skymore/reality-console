@@ -303,8 +303,10 @@ signed only by the compromised key.
   backend-to-Node-Host calls use OS IPC with restrictive filesystem or named-pipe ACLs and peer
   identity checks; the macOS preview uses a 0600 Unix socket inside the 0700 node data directory
   plus `getpeereid`. Frames, time, concurrency, schemas, and methods are bounded. The current agent
-  method is read-only status and returns no secret or raw error. The renderer remains untrusted
-  input and receives no secret it does not need to display.
+  method is read-only status and returns no secret or raw error. Controller lifecycle and endpoint
+  readiness appear there only after the agent has verified and persisted a signed heartbeat
+  response; the IPC shape contains no endpoint address, port, probe token, credential, or signature.
+  The renderer remains untrusted input and receives no secret it does not need to display.
 - Logs contain request IDs and stable internal IDs, not bearer tokens, private keys, full profile
   URIs, authorization headers, cookies, or plaintext configuration.
 
@@ -405,6 +407,13 @@ Desired-state revisions increase monotonically. Nodes report `received_revision`
 `validated_revision`, and `applied_revision`; the controller never reports success before the node
 confirms the expected revision and health check. Nodes reject stale revisions, unknown schema
 versions, invalid signatures, and revisions addressed to another node.
+
+Node self-status is a last-known signed observation, not a local inference or permanent health
+claim. The node verifies the exact heartbeat generation, node and controller identities,
+signing-key identity, closed schema, and signature before atomically acknowledging the heartbeat.
+It retains only the latest nondecreasing generation with canonical envelope and transcript digests,
+and repeats verification whenever local status is loaded. A legacy empty heartbeat response cannot
+create, upgrade, clear, or refresh controller-owned approval or reachability evidence.
 
 ## Update Supply Chain
 

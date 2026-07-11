@@ -6,6 +6,7 @@ mod background;
 #[cfg(target_os = "macos")]
 mod background_macos;
 mod bootstrap;
+mod controller_status;
 mod enrollment;
 mod local_api;
 #[cfg(target_os = "macos")]
@@ -23,7 +24,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use control_protocol::crypto::{Ed25519PublicKey, Ed25519Signature, X25519PublicKey};
 use control_protocol::id::{ControllerInstanceId, NodeId, NodeInvitationId, NodeKeyId, Timestamp};
-use control_protocol::node::{EnrollNodeResponse, NodeAuthenticationMode};
+use control_protocol::node::{EnrollNodeResponse, NodeAuthenticationMode, NodeHeartbeatStatus};
 use ed25519_dalek::{Signer as _, SigningKey};
 use fs2::FileExt;
 use rand_core::{OsRng, RngCore as _};
@@ -47,7 +48,7 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 10;
+const CURRENT_SCHEMA_VERSION: i64 = 11;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
@@ -59,6 +60,7 @@ const MIGRATION_7_NAME: &str = "node_xray_activation_state";
 const MIGRATION_8_NAME: &str = "node_heartbeat_generation";
 const MIGRATION_9_NAME: &str = "node_router_mapping_state";
 const MIGRATION_10_NAME: &str = "node_router_mapping_supervision";
+const MIGRATION_11_NAME: &str = "verified_controller_status";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -357,6 +359,46 @@ const MIGRATION_10: &str = "
     ADD COLUMN last_mapping_attempt_at INTEGER;
 ";
 
+const MIGRATION_11: &str = "
+    CREATE TABLE controller_status_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        heartbeat_generation INTEGER NOT NULL CHECK (heartbeat_generation > 0),
+        node_id TEXT NOT NULL CHECK (length(node_id) = 36),
+        controller_instance_id TEXT NOT NULL CHECK (length(controller_instance_id) = 36),
+        signing_key_id TEXT NOT NULL CHECK (length(signing_key_id) = 36),
+        observed_at TEXT NOT NULL CHECK (length(observed_at) BETWEEN 20 AND 64),
+        envelope_json TEXT NOT NULL CHECK (
+            json_valid(envelope_json) AND length(envelope_json) BETWEEN 2 AND 65536
+        ),
+        envelope_digest TEXT NOT NULL CHECK (
+            length(envelope_digest) = 71
+            AND substr(envelope_digest, 1, 7) = 'sha256:'
+            AND substr(envelope_digest, 8) NOT GLOB '*[^0-9a-f]*'
+        ),
+        transcript_digest TEXT NOT NULL CHECK (
+            length(transcript_digest) = 71
+            AND substr(transcript_digest, 1, 7) = 'sha256:'
+            AND substr(transcript_digest, 8) NOT GLOB '*[^0-9a-f]*'
+        ),
+        received_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TRIGGER controller_status_generation_no_regression
+    BEFORE UPDATE ON controller_status_state
+    WHEN NEW.singleton != OLD.singleton
+        OR NEW.heartbeat_generation < OLD.heartbeat_generation
+    BEGIN
+        SELECT RAISE(ABORT, 'controller status generation cannot regress');
+    END;
+
+    CREATE TRIGGER controller_status_state_no_delete
+    BEFORE DELETE ON controller_status_state
+    BEGIN
+        SELECT RAISE(ABORT, 'verified controller status is retained');
+    END;
+";
+
 pub use background::{
     install_user_service, remove_user_service, user_service_status, BackgroundServiceStatus,
     UserServiceInstallRequest, USER_SERVICE_LABEL,
@@ -412,6 +454,8 @@ pub struct HostStatus {
     pub credential_expires_at: Option<Timestamp>,
     /// Last heartbeat durably acknowledged by the controller.
     pub last_heartbeat_at: Option<Timestamp>,
+    /// Latest controller-signed lifecycle and endpoint-readiness snapshot.
+    pub controller_status: Option<NodeHeartbeatStatus>,
     /// Last complete heartbeat and desired-state synchronization cycle.
     pub last_sync_at: Option<Timestamp>,
     /// Highest desired-state revision durably accepted by this host.
@@ -565,6 +609,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 8, MIGRATION_8_NAME, MIGRATION_8)?;
     apply_migration(&transaction, 9, MIGRATION_9_NAME, MIGRATION_9)?;
     apply_migration(&transaction, 10, MIGRATION_10_NAME, MIGRATION_10)?;
+    apply_migration(&transaction, 11, MIGRATION_11_NAME, MIGRATION_11)?;
     transaction.commit()?;
     Ok(())
 }
@@ -633,6 +678,7 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (8, MIGRATION_8_NAME, MIGRATION_8),
         (9, MIGRATION_9_NAME, MIGRATION_9),
         (10, MIGRATION_10_NAME, MIGRATION_10),
+        (11, MIGRATION_11_NAME, MIGRATION_11),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");
@@ -709,6 +755,7 @@ fn build_status(
     )?;
     let registration = load_registration_status(connection)?;
     let sync_status = load_sync_status(connection)?;
+    let controller_status = controller_status::load_verified(connection)?;
     let activation_status = activation::load_activation_status(connection)?;
     let router_mapping = mapping::load_status(connection)?;
     let xray_status = xray::load_xray_runtime_status(connection, data_dir)?;
@@ -740,6 +787,7 @@ fn build_status(
         node_id: registration.as_ref().map(|value| value.0),
         credential_expires_at: registration.map(|value| value.1),
         last_heartbeat_at: sync_status.last_heartbeat_at,
+        controller_status,
         last_sync_at: sync_status.last_sync_at,
         desired_revision_cursor: sync_status.desired_revision_cursor,
         applied_revision: activation_status.applied_revision,

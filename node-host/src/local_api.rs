@@ -3,14 +3,14 @@ use anyhow::{Context as _, Result};
 #[cfg(target_os = "macos")]
 use control_protocol::id::RequestId;
 use control_protocol::id::{NodeId, Revision, Timestamp};
-use control_protocol::node::NodeRuntimeState;
+use control_protocol::node::{NodeHeartbeatStatus, NodeRuntimeState};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub(crate) const LOCAL_API_SCHEMA_VERSION: u16 = 1;
+pub(crate) const LOCAL_API_SCHEMA_VERSION: u16 = 2;
 #[cfg(target_os = "macos")]
 pub(crate) const LOCAL_API_REQUEST_MAX_BYTES: usize = 4 * 1024;
 #[cfg(target_os = "macos")]
@@ -136,6 +136,8 @@ pub struct LocalServiceStatus {
     pub runtime_state: NodeRuntimeState,
     /// Last heartbeat durably acknowledged by Control.
     pub last_heartbeat_at: Option<Timestamp>,
+    /// Latest locally verified controller lifecycle and endpoint readiness.
+    pub controller_status: Option<NodeHeartbeatStatus>,
     /// Last complete synchronization cycle.
     pub last_sync_at: Option<Timestamp>,
     /// Highest desired-state revision durably accepted locally.
@@ -170,6 +172,7 @@ impl LocalServiceStatus {
                 .context("enrolled Node Host status has no node identity")?,
             runtime_state,
             last_heartbeat_at: host.last_heartbeat_at,
+            controller_status: host.controller_status.clone(),
             last_sync_at: host.last_sync_at,
             desired_revision_cursor: host.desired_revision_cursor,
             applied_revision: host.applied_revision,
@@ -191,6 +194,15 @@ impl LocalServiceStatus {
         }
         if self.service_instance_id.is_nil() {
             anyhow::bail!("local service instance identity cannot be nil");
+        }
+        if let Some(controller_status) = &self.controller_status {
+            controller_status
+                .validate_for(
+                    self.node_id,
+                    controller_status.heartbeat_generation,
+                    controller_status.controller_instance_id,
+                )
+                .context("local service controller status is invalid")?;
         }
         if self
             .activation_phase
@@ -290,9 +302,9 @@ pub(crate) struct LocalApiResponse {
 
 /// Queries the live local Node Host service through its same-user IPC channel.
 ///
-/// This reports process and local data-plane state. Endpoint verification and
-/// controller approval remain authoritative at Control and are not inferred
-/// from this response.
+/// This reports process and local data-plane state plus the latest persisted
+/// controller status after local signature verification. Approval and endpoint
+/// verification are never inferred from local runtime state.
 ///
 /// # Errors
 ///

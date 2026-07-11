@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use control_protocol::crypto::{Nonce, Sha256Digest};
+use control_protocol::crypto::{ed25519_signing_key_id, Nonce, Sha256Digest};
 use control_protocol::desired::{desired_state_transcript, verify_desired_state_signature};
 use control_protocol::error::ErrorEnvelope;
 use control_protocol::id::{Revision, SequenceNumber, Timestamp};
@@ -101,7 +101,7 @@ where
     send_heartbeat(
         &client,
         &controller,
-        &connection,
+        &mut connection,
         &registration,
         &identity,
         sync_state.desired_revision_cursor,
@@ -197,7 +197,7 @@ async fn validate_and_report(
 async fn send_heartbeat(
     client: &reqwest::Client,
     controller: &Url,
-    connection: &Connection,
+    connection: &mut Connection,
     registration: &SyncRegistration,
     identity: &Identity,
     desired_revision_cursor: i64,
@@ -227,6 +227,7 @@ async fn send_heartbeat(
     .await
     .context("controller heartbeat request failed")?;
     let heartbeat_status = heartbeat_response.status();
+    let heartbeat_is_json = response_is_json(&heartbeat_response);
     let heartbeat_response_body = read_bounded_response(heartbeat_response).await?;
     if !heartbeat_status.is_success() {
         return Err(controller_error(
@@ -235,10 +236,20 @@ async fn send_heartbeat(
             &heartbeat_response_body,
         ));
     }
-    if !matches!(heartbeat_status, StatusCode::OK | StatusCode::NO_CONTENT) {
-        bail!("controller returned unexpected heartbeat success status {heartbeat_status}");
+    match heartbeat_status {
+        StatusCode::NO_CONTENT if heartbeat_response_body.is_empty() => {
+            persist_heartbeat_success(connection)
+        }
+        StatusCode::NO_CONTENT => bail!("controller returned a body with no heartbeat status"),
+        StatusCode::OK if heartbeat_is_json => crate::controller_status::persist_verified(
+            connection,
+            registration,
+            heartbeat_generation,
+            &heartbeat_response_body,
+        ),
+        StatusCode::OK => bail!("controller heartbeat-status response is not JSON"),
+        _ => bail!("controller returned unexpected heartbeat success status {heartbeat_status}"),
     }
-    persist_heartbeat_success(connection)
 }
 
 async fn fetch_and_process_desired(
@@ -406,6 +417,12 @@ fn persist_verified_desired_state(
             SUPPORTED_DESIRED_SCHEMAS,
         )
         .context("controller desired-state document failed validation")?;
+    if envelope.document.signing_key_id
+        != ed25519_signing_key_id(&registration.controller_signing_public_key)
+            .context("pinned controller signing public key is invalid")?
+    {
+        bail!("controller desired-state signing key identity is invalid");
+    }
     verify_desired_state_signature(
         &envelope.document,
         &envelope.signature,
@@ -529,6 +546,12 @@ fn verify_persisted_desired_state(
             SUPPORTED_DESIRED_SCHEMAS,
         )
         .context("stored desired-state document failed validation")?;
+    if envelope.document.signing_key_id
+        != ed25519_signing_key_id(&registration.controller_signing_public_key)
+            .context("pinned controller signing public key is invalid")?
+    {
+        bail!("stored desired-state signing key identity is invalid");
+    }
     verify_desired_state_signature(
         &envelope.document,
         &envelope.signature,

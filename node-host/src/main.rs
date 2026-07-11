@@ -283,6 +283,7 @@ fn print_local_service_status(status: &LocalServiceStatus) {
         Some(timestamp) => println!("last_sync_at: {timestamp}"),
         None => println!("last_sync_at: none"),
     }
+    print_controller_status(status.controller_status.as_ref());
     match status.applied_revision {
         Some(revision) => println!("applied_revision: {}", revision.get()),
         None => println!("applied_revision: none"),
@@ -351,6 +352,7 @@ fn print_status(status: &HostStatus) {
         Some(timestamp) => println!("last_sync_at: {timestamp}"),
         None => println!("last_sync_at: none"),
     }
+    print_controller_status(status.controller_status.as_ref());
     println!(
         "desired_revision_cursor: {}",
         status.desired_revision_cursor
@@ -388,4 +390,23 @@ fn print_status(status: &HostStatus) {
         "router_mapping: {} ({:?})",
         status.router_mapping.enabled, status.router_mapping.state
     );
+}
+
+fn print_controller_status(status: Option<&control_protocol::node::NodeHeartbeatStatus>) {
+    let Some(status) = status else {
+        println!("controller_status: unknown");
+        return;
+    };
+    println!("controller_lifecycle: {}", status.lifecycle.as_str());
+    println!(
+        "controller_status_generation: {}",
+        status.heartbeat_generation.get()
+    );
+    for endpoint in &status.endpoints {
+        println!(
+            "controller_endpoint: {} {}",
+            endpoint.endpoint_id,
+            endpoint.readiness.as_str()
+        );
+    }
 }

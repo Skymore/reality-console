@@ -287,21 +287,34 @@ mod tests {
     use super::*;
     use crate::local_api::{LocalServicePhase, LOCAL_API_SOCKET_FILE};
     use crate::{RouterMappingState, RouterMappingStatus};
-    use control_protocol::id::{NodeId, Timestamp};
-    use control_protocol::node::NodeRuntimeState;
+    use control_protocol::id::{
+        ControllerInstanceId, NodeId, SequenceNumber, SigningKeyId, Timestamp,
+    };
+    use control_protocol::node::{NodeHeartbeatStatus, NodeLifecycleState, NodeRuntimeState};
     use std::os::unix::fs::symlink;
     use time::OffsetDateTime;
     use uuid::Uuid;
 
     fn fixture_status() -> LocalServiceStatus {
+        let node_id = NodeId::new();
         LocalServiceStatus {
             schema_version: LOCAL_API_SCHEMA_VERSION,
             service_instance_id: Uuid::new_v4(),
             observed_at: Timestamp::from_datetime(OffsetDateTime::now_utc()),
             phase: LocalServicePhase::Idle,
-            node_id: NodeId::new(),
+            node_id,
             runtime_state: NodeRuntimeState::Idle,
             last_heartbeat_at: None,
+            controller_status: Some(NodeHeartbeatStatus {
+                schema_version: 1,
+                node_id,
+                heartbeat_generation: SequenceNumber::new(1).unwrap(),
+                observed_at: Timestamp::from_datetime(OffsetDateTime::now_utc()),
+                lifecycle: NodeLifecycleState::Pending,
+                endpoints: Vec::new(),
+                signing_key_id: SigningKeyId::new(),
+                controller_instance_id: ControllerInstanceId::new(),
+            }),
             last_sync_at: None,
             desired_revision_cursor: 0,
             applied_revision: None,
