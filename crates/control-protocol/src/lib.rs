@@ -5,6 +5,7 @@
 //! cryptographically verifying signed values before trusting them.
 
 pub mod account;
+pub mod account_crypto;
 pub mod crypto;
 pub mod desired;
 pub mod enrollment;

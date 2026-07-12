@@ -113,7 +113,7 @@ revoked, disabled-admin, or stale-credential-version sessions never authenticate
 | `network_id`, `user_id` | Composite primary key |
 | `display_name` | Non-empty mutable label, maximum 128 characters; never a key |
 | `status` | `active`, `disabled`, or `deleted` |
-| `password_verifier_ref` | Nullable opaque reference; password login is optional |
+| `password_verifier` | Nullable Argon2id PHC verifier; password login is optional |
 | `credential_version` | Positive integer invalidating all member sessions when incremented |
 | `created_at`, `updated_at`, `disabled_at`, `deleted_at` | Status timestamps must agree with status |
 
@@ -127,10 +127,11 @@ revoked, disabled-admin, or stale-credential-version sessions never authenticate
 | `status` | `active`, `revoked`, or `deleted` |
 | `created_at`, `last_seen_at`, `revoked_at`, `deleted_at` | Durable lifecycle timestamps |
 
-`device_activations` stores `(network_id, activation_id)`, `user_id`, keyed `secret_hash`,
-`expires_at`, nullable `consumed_at` and `consumed_by_device_id`, `created_by_admin_id`, and
-`created_at`. `UNIQUE(network_id, secret_hash)` and `CHECK(consumed_by_device_id IS NULL OR
-consumed_at IS NOT NULL)` apply.
+`device_activations` stores `(network_id, activation_id)`, `user_id`, a keyed secret verifier,
+idempotency/request digests, immutable setup-delivery trust metadata, expiry, and nullable
+consumption/device/session/request-response metadata. The raw secret and complete setup code are
+never stored. Exact creation and consumption retries reconstruct the same secret-bearing response
+from the controller identity; changed retries conflict.
 
 `password_reset_tokens` has the same one-time-token shape with `reset_id`, `user_id`, and nullable
 `consumed_at`. Reset consumption changes the password reference, increments `credential_version`,
@@ -144,15 +145,20 @@ transaction.
 | `network_id`, `session_id` | Composite primary key; `session_id` identifies a rotation family |
 | `user_id`, `device_id` | Required and mutually consistent member/device foreign keys |
 | `generation` | Non-negative rotation generation |
-| `current_token_hash` | Keyed verifier hash, unique within the network |
-| `previous_token_hash` | Nullable hash retained only for reuse detection |
+| `current_refresh_verifier` | Keyed verifier, unique within the network |
+| `previous_refresh_verifier` | Nullable verifier retained for reuse detection |
+| `current_access_verifier`, `access_expires_at` | Current short-lived member bearer verifier and deadline |
 | `credential_version` | User credential version at issue time |
 | `created_at`, `rotated_at`, `expires_at`, `revoked_at` | Session lifecycle |
 | `revoke_reason` | Stable code when revoked |
 
-Refresh rotation uses `BEGIN IMMEDIATE`: match the current hash, write the next hash and previous
-hash, increment `generation`, and commit before returning the new secret. Reuse of a previous hash
-revokes the family. The raw refresh credential is returned once and is never stored.
+Refresh rotation uses `BEGIN IMMEDIATE`: match the current verifier, write the replacement and
+previous verifier, increment `generation`, and commit before returning the new secret.
+`refresh_idempotency_records` scope request/key digests and deterministic response metadata to the
+session family plus source generation. `login_idempotency_records` provide the same crash recovery
+for password device enrollment. Raw access/refresh credentials are reconstructed from the
+controller identity and committed metadata, never stored. Reuse of a previous credential with a
+different idempotency key revokes the family.
 
 ### 3.3 Nodes and reachability
 
@@ -374,14 +380,16 @@ the revision journal as source of truth.
 
 ### 3.6 Profile bundles
 
-`profile_bundles` stores `(network_id, bundle_id)`, `user_id`, monotonically increasing
-`bundle_version` per user, `artifact_ref`, `artifact_digest`, `signature`, `etag`, `issued_at`,
-`refresh_after`, `offline_expires_at`, nullable `superseded_at`, and `authorization_revision`.
-`UNIQUE(network_id, user_id, bundle_version)` and `UNIQUE(network_id, etag)` apply.
+`profile_bundles` stores `(network_id, bundle_id)`, `user_id`, exact `device_id`, monotonically
+increasing generation per device, source/artifact digests, immutable encrypted artifact JSON,
+signature, ETag, issue/refresh/offline-expiry times, and nullable supersession time.
+`UNIQUE(network_id, device_id, generation)` and `UNIQUE(network_id, etag)` apply.
 
-Bundle generation intersects current user/assignment authorization with verified endpoints and the
-credential IDs present in each node's last applied target. It must never advertise desired-but-not-
-applied credentials. Signed bundle bytes are immutable; changed content creates a new `bundle_id`.
+Bundle generation intersects current user/assignment authorization with current protocol-verified
+endpoints and credential IDs present in each node's last applied target. Every node profile is HPKE
+encrypted to that device's X25519 key before the complete manifest/ciphertext set is signed. It must
+never advertise desired-but-not-applied credentials. Signed bytes are immutable; changed source
+state creates a new `bundle_id` and device generation.
 
 ### 3.7 Request idempotency
 
@@ -402,16 +410,15 @@ transaction. A matching retry returns the stored response; a reused key with a d
 hash returns `idempotency_key_conflict`. `in_progress` rows are not committed independently, so a
 crash cannot permanently strand a request.
 
-Idempotency records are retained for 24 hours by default and never less than the maximum supported
-client retry window. One-time enrollment and activation responses that contain a newly issued secret
-use an encrypted response artifact so a lost HTTP response can be replayed safely during that
-window.
+Idempotency records are retained for at least the supported retry window. Secret-bearing node/member
+creation, login, activation, and refresh responses store only digests, stable IDs, timestamps, and
+safe account snapshots; domain-separated controller-key derivation reconstructs the exact bearer
+response after loss without a plaintext response artifact.
 
 Migration 9 materializes this contract first for `POST /v1/admin/accounts`: it stores the canonical
 request hash and the complete secret-free `201` response JSON in the same transaction as the user
 and audit event. Concurrent or post-restart retries therefore return the same account identity and
-body. Secret-bearing activation responses still require the encrypted artifact path before their
-routes are enabled.
+body. Migration 12 extends the contract to setup delivery, login, and generation-scoped refresh.
 
 ### 3.8 Telemetry and audit
 
@@ -523,25 +530,23 @@ requires shedding optional connection metadata, Node Host replaces it with an or
 marker and preserves sequence continuity. If durable aggregate traffic cannot be queued, sharing is
 paused rather than silently losing quota/accounting data.
 
-## 5. Connect Local Schema Version 1
+## 5. Connect Local Persistence Version 1
 
-Connect stores no raw refresh token or VLESS/REALITY secret outside the OS credential store or the
-signed, owner-only bundle artifact.
+Connect does not share Control's SQLite database. Native Keychain/Credential Manager entries hold
+device private keys, two refresh slots with pending idempotency state, activation/login pending
+operations, and one versioned installed-account record containing public controller trust and the
+device binding. The renderer cannot enumerate or read these records.
 
-- `account_state`: singleton network/user/device IDs, account status, service URL, current session
-  generation, last refresh, and access-token expiry metadata.
-- `bundle_cache`: `(network_id, bundle_id)` primary key, version, artifact reference, digest,
-  signature, ETag, issue/refresh/offline-expiry times, verification time, and superseded time.
-- `node_health_history`: bounded samples keyed by `(bundle_id, node_id, sampled_at)` with result,
-  latency, and stable error code.
-- `selection_policy`: singleton mode (`manual`, `auto`, or `pinned_fallback`), selected node ID,
-  fallback order JSON, hysteresis threshold, and update time.
-- `proxy_recovery`: singleton operation generation, pre-change OS proxy snapshot reference, desired
-  local listener state, phase, process ID, and update time. Start, stop, crash recovery, and proxy
-  restoration advance this journal idempotently.
+Each device has an owner-only `account-bundles-v1/<network>/<user>/<device>` directory containing
+immutable signed HPKE bundle artifacts plus one atomic `active.json` pointer. Writes sync the file
+and parent directory; recovery verifies digest, signature, device/network/controller binding,
+generation, version, and time before decrypting. The current and one prior complete generation are
+retained. An invalid, expired, interrupted, or rollback candidate never replaces the last valid
+bundle. Offline use is allowed only through `offline_expires_at`.
 
-Bundle bytes are verified before `bundle_cache` commit. An invalid or expired candidate never
-replaces the last valid bundle. Offline use is allowed only through `offline_expires_at`.
+Selection health is bounded process state rebuilt by backend-owned probes after restart. System
+proxy and durable proxy-recovery records are intentionally deferred to Stage 5; manual loopback
+proxy mode is the current implemented path.
 
 ## 6. Deletion and Referential Rules
 

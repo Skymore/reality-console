@@ -459,33 +459,57 @@ is authorization intent; `provisioningState` independently reports `pending`, `a
 
 ### Activate device
 
+`POST /v1/admin/accounts/{userId}/device-activations` requires administrator authentication and a
+bounded `Idempotency-Key`. Its `201` response contains only `displayName`, `expiresAt`, `setupCode`,
+and `setupLink`. The `pn-member-v1` code binds the account/network/activation IDs, strict Control
+origin, controller instance, bundle-signing public key, expiry, and one-time secret. The HTTPS link
+uses `/join/connect#setup-code`, so the bearer fragment is not sent in an HTTP request. Raw
+activation fields are not returned as parallel JSON properties, and the secret is never stored in
+plaintext.
+
 `POST /v1/device-activations/consume`
 
-Consumes a one-time activation secret and returns account metadata, device ID, short-lived access
-token, and a refresh credential. The refresh credential is shown once.
+Consumes a one-time activation secret plus a device-generated Ed25519/X25519 identity and signed
+proof. It returns account metadata, device ID, short-lived access token, and rotating refresh
+credential. An exact retry with the same device request reconstructs the same response after a lost
+HTTP response; changed device material after consumption is rejected.
 
 ### Login
 
-`POST /v1/sessions` accepts account credentials when password login is enabled. Rate limiting and
-generic authentication failures prevent account enumeration.
+`POST /v1/sessions` accepts account credentials when password login is enabled and requires an
+`Idempotency-Key`. The key and canonical request identify one crash-recoverable device enrollment;
+an exact concurrent or post-restart retry returns byte-identical credentials without storing raw
+tokens. Reusing the key for changed credentials or device proof is an idempotency conflict. Generic
+authentication failures prevent account enumeration.
 
 ### Refresh
 
-`POST /v1/sessions/refresh` rotates the refresh credential. Reuse of an invalidated rotated token
-revokes the session family.
+`POST /v1/sessions/refresh` also requires an `Idempotency-Key`. The replay scope is the refresh
+family and source generation. The same key and current request reconstruct the same replacement
+credentials after response loss; using the prior token with a different key is reuse and revokes
+the complete session family. Connect persists the pending key beside the source refresh generation
+before network I/O and clears it only after the replacement is durable in the OS credential store.
 
 ### Fetch profile bundle
 
 `GET /v1/me/profile-bundle`
 
-Supports `If-None-Match`. The response includes bundle ID, issue/refresh/offline-expiry times,
-account status, node profiles, selection hints, and a signature. It never includes node management
-credentials or REALITY private keys.
+Supports `If-None-Match`. Each immutable response is signed by the pinned controller identity and
+encrypts every node profile to the exact device X25519 key using HPKE base mode with X25519,
+HKDF-SHA256, and ChaCha20-Poly1305. It includes bundle/generation identity,
+issue/refresh/offline-expiry times, complete account state, selection hints, and the complete
+permitted node set. A node is included only when the exact assignment credential appears in its
+last applied snapshot and its endpoint has current controller-owned protocol verification. Desired,
+TCP-only, stale, disabled, or removed candidates never enter a bundle. Node management credentials
+and REALITY private keys are never present.
 
 ### Logout
 
 `DELETE /v1/me/devices/{deviceId}/session` revokes the current device session. Admin revocation and
-member logout are separate audit actions.
+member logout are separate audit actions. `POST /v1/admin/devices/{deviceId}/revoke` additionally
+rotates the account's credentials on every enabled node and publishes replacement revisions, so a
+lost device's cached profile converges to data-plane invalidity. Password/session reset applies the
+same cross-node rotation fence.
 
 ## 7. Telemetry Protocol
 
@@ -531,6 +555,11 @@ strict v2 enrollment with node public REALITY material, invitation-bound consent
 pre-approved initial revision publication, and conservative onboarding progress. A real
 Control-to-Node Host integration test covers creation through initial revision validation.
 
-Member activation and sessions, encrypted signed profile bundles, telemetry aggregation,
-protocol-aware endpoint verification, and relay remain later slices. Even an `applied` assignment
-must not enter a Connect bundle until its endpoint is controller-verified.
+Control migration 12 implements idempotent member setup delivery, activation/password device
+sessions, refresh-family replay/reuse handling, member authentication, device revoke/reset, and
+signed per-device HPKE bundles. Connect implements process-local setup handles, native credential
+storage, an authenticated two-generation offline cache, bounded node probes, selection policy, the
+existing Xray supervisor path, automatic six-hour sync, and offline registry reconstruction. The
+production protocol-aware endpoint canary, relay, telemetry aggregation, system-proxy recovery,
+and signed packages remain later work. An `applied` assignment still cannot enter a Connect bundle
+until that endpoint is controller-verified.

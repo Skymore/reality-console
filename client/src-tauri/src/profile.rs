@@ -1,4 +1,5 @@
-use crate::core::invite::{parse_invitation, RealityProfile};
+use crate::core::connection::ConnectionProfile;
+use crate::core::invite::parse_invitation;
 use crate::error::ClientError;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -192,7 +193,7 @@ impl ProfileRepository {
         self.write_index(&index)
     }
 
-    pub fn load_connection(&self, profile_id: &str) -> Result<RealityProfile, ClientError> {
+    pub fn load_connection(&self, profile_id: &str) -> Result<ConnectionProfile, ClientError> {
         let index = self.read_index()?;
         if !index
             .profiles
@@ -247,7 +248,7 @@ impl ProfileRepository {
 }
 
 impl ProfileRecord {
-    fn from_profile(id: String, name: String, profile: &RealityProfile) -> Self {
+    fn from_profile(id: String, name: String, profile: &ConnectionProfile) -> Self {
         Self {
             id,
             name,

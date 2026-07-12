@@ -49,7 +49,7 @@ protocol verified remain distinct states.
 
 ## Stage 4: Member Account And Connect Experience
 
-Status: pending.
+Status: complete.
 
 Deliverables:
 

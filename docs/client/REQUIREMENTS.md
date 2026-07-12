@@ -162,6 +162,9 @@ installer, and recovery design.
 - Persist replacement credentials before retiring rotated credentials. A crash during rotation must
   leave the new credential recoverable and must never restore a server-invalidated predecessor or
   write plaintext secrets.
+- Explicit logout always stops the app-managed runtime and removes local credentials and bundle
+  caches. If Control is unavailable, local cleanup still succeeds and Connect reports that remote
+  session revocation could not be confirmed instead of retaining local access.
 - Never log activation secrets, passwords, access or refresh tokens, imported URIs, member UUIDs,
   REALITY secrets, complete bundle payloads, or generated configurations.
 - TLS certificate validation is mandatory. Development trust overrides are explicit, local-only,

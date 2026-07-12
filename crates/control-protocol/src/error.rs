@@ -25,6 +25,12 @@ pub enum ErrorCode {
     InvitationConsumed,
     /// A one-time invitation was cancelled.
     InvitationCancelled,
+    /// A one-time member-device activation is invalid.
+    ActivationInvalid,
+    /// A one-time member-device activation has expired.
+    ActivationExpired,
+    /// A one-time member-device activation was already consumed by another request.
+    ActivationConsumed,
     /// An account is disabled or deleted.
     AccountDisabled,
     /// A member device has been revoked.
@@ -92,6 +98,9 @@ impl ErrorCode {
             Self::InvitationExpired => "invitation_expired",
             Self::InvitationConsumed => "invitation_consumed",
             Self::InvitationCancelled => "invitation_cancelled",
+            Self::ActivationInvalid => "activation_invalid",
+            Self::ActivationExpired => "activation_expired",
+            Self::ActivationConsumed => "activation_consumed",
             Self::AccountDisabled => "account_disabled",
             Self::DeviceRevoked => "device_revoked",
             Self::NodeRevoked => "node_revoked",
@@ -130,6 +139,9 @@ impl ErrorCode {
             "invitation_expired" => Self::InvitationExpired,
             "invitation_consumed" => Self::InvitationConsumed,
             "invitation_cancelled" => Self::InvitationCancelled,
+            "activation_invalid" => Self::ActivationInvalid,
+            "activation_expired" => Self::ActivationExpired,
+            "activation_consumed" => Self::ActivationConsumed,
             "account_disabled" => Self::AccountDisabled,
             "device_revoked" => Self::DeviceRevoked,
             "node_revoked" => Self::NodeRevoked,

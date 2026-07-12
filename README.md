@@ -56,11 +56,22 @@ multi-node assignments, authoritative full-snapshot compilation, per-node creden
 terminal account deletion, and node disable/revoke cleanup. Account creation is durably idempotent
 across concurrent retries and restarts. Exact applied revision snapshots drive
 `pending`/`applied`/`removalPending`/`removed` evidence, and administrator APIs never return member
-UUIDs or signed artifacts. Migration 11 adds idempotent preconfigured node delivery, automatic initial
-revision publication, stored public REALITY material, and evidence-based onboarding state. The
-VLESS + REALITY canary required for client publication remains under
-implementation, along with member activation/sessions and signed bundles, signed system-service
-installers, relay reachability, and the friend-facing setup UI/package.
+UUIDs or signed artifacts. Migration 11 adds idempotent preconfigured node delivery, automatic
+initial revision publication, stored public REALITY material, and evidence-based onboarding state.
+Migration 12 adds one-action member setup links, device proof-of-possession, password/session reset,
+crash-safe idempotent login and refresh rotation, independently revocable devices, and per-device
+HPKE-encrypted signed multi-node bundles. Bundle publication intersects exact applied member
+credentials with current controller-owned protocol verification. Administrative device revocation
+rotates the member's credentials across every enabled node instead of merely revoking sessions.
+
+Connect now has an account-first Rust backend: setup secrets remain behind a process-local handle;
+device keys, pending operations, rotating refresh credentials, and installed controller trust live
+in the native credential store; signed bundles use a crash-safe two-generation cache; and manual,
+automatic, and pinned-fallback selection share the existing Xray supervisor. A real
+Control-to-Connect test covers setup-link activation, bundle verification/cache, and offline
+registry reconstruction. Automatic bundle refresh and bounded backend-owned node probes never
+start Xray when the member left it disconnected. The production VLESS + REALITY endpoint canary,
+system-proxy recovery, signed installers, and relay reachability remain Stage 5 work.
 
 The optional probe-worker contract is implemented and dry-run deployable. Control Service can now
 invoke it in explicit `remote-http` mode. Node Host also has a macOS private-preview user

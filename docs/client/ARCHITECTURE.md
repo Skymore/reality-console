@@ -57,8 +57,11 @@ filesystem primitives, process primitives, or arbitrary probe targets.
 
 Owns activation, optional password login, access-token memory, refresh rotation, logout, and current
 device identity. It serializes refreshes so concurrent API calls cannot rotate the same credential
-twice. It stores the refresh credential under an account/device-scoped key in the OS credential
-store and commits a replacement before deleting the prior value.
+twice. Activation and login persist device keys, nonce, and operation identity before network I/O.
+Refresh persists a generation-scoped idempotency key beside the source credential. Exact retries
+therefore reproduce the same signed request and server response after a process or network failure.
+It stores the refresh credential under an account/device-scoped key in the OS credential store and
+commits a replacement before deleting the prior value.
 
 Session restoration and bundle availability are separate states: Control Service failure may make
 online authentication unavailable while an unexpired verified cache still permits data-plane use.
@@ -217,7 +220,7 @@ reason.
 | Signed secret-bearing bundle | `bundle_repository` | Authenticated encrypted app-data file |
 | Bundle encryption key | `bundle_repository` | Keychain / Credential Manager |
 | Imported URI | `compatibility_profile` | Keychain / Credential Manager |
-| Account/device display metadata | application service | Non-secret atomic app-data index |
+| Installed account binding and controller trust | application service | Versioned native credential-store record |
 | Node labels, selection policy, health history | `selection` | Non-secret atomic app-data files |
 | Runtime Xray config | `XraySupervisor` | Ephemeral owner-only runtime file |
 | Prior system proxy state | `system_proxy` | Durable non-secret recovery record with owner-only access |
@@ -264,6 +267,12 @@ activation secrets, and compatibility URIs are write-only command inputs and nev
 
 No startup error may skip proxy recovery. Corrupt cache or missing credentials produces a
 recoverable signed-out/cache-unavailable state and does not trigger destructive regeneration.
+
+The implemented registry performs this account/cache restoration lazily before every public
+account operation. It runs bounded backend-owned TCP probes only for signed bundle endpoints,
+refreshes bundles approximately every six hours, and maintains connected health every 30 seconds.
+Neither background path starts Xray when the member left it disconnected. Durable system-proxy
+recovery remains a Stage 5 boundary.
 
 ## 9. Packaging
 

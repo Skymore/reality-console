@@ -1,16 +1,29 @@
+pub mod bundle;
+pub mod connect_service;
+pub mod control_api;
 mod core;
 mod error;
+mod member_setup;
 mod process;
 mod profile;
+mod runtime;
+pub mod selection;
+pub mod session;
 mod state;
+pub mod vault;
 
 use core::config::{build_xray_config, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
 use core::invite::{parse_invitation, InvitationPreview};
 use error::ClientError;
+use member_setup::{MemberSetupSession, SetupSessionStore};
 use process::XraySupervisor;
 use profile::{ProfileRepository, StoredProfile};
+use runtime::ConnectRuntimeRegistry;
+use selection::SelectionMode;
+use session::DeviceMetadata;
 use state::{ClientState, ProxyMode};
 use tauri::{AppHandle, Manager, State};
+use uuid::Uuid;
 
 async fn run_blocking<T, F>(task: F) -> Result<T, ClientError>
 where
@@ -112,17 +125,110 @@ async fn client_preview_profile(
     .await
 }
 
+#[tauri::command]
+fn connect_begin_setup(
+    input: String,
+    setups: State<'_, SetupSessionStore>,
+) -> Result<MemberSetupSession, ClientError> {
+    setups.begin(&input)
+}
+
+#[tauri::command]
+async fn connect_cancel_setup(
+    session_id: Uuid,
+    setups: State<'_, SetupSessionStore>,
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<bool, ClientError> {
+    runtime.cancel_setup(&setups, session_id).await
+}
+
+#[tauri::command]
+async fn connect_confirm_setup(
+    session_id: Uuid,
+    device_name: String,
+    setups: State<'_, SetupSessionStore>,
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<connect_service::ConnectSnapshot, ClientError> {
+    runtime
+        .confirm_setup(
+            &setups,
+            session_id,
+            DeviceMetadata {
+                display_name: device_name,
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            },
+        )
+        .await
+}
+
+#[tauri::command]
+async fn connect_get_snapshot(
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<Option<connect_service::ConnectSnapshot>, ClientError> {
+    runtime.snapshot().await
+}
+
+#[tauri::command]
+async fn connect_refresh_bundle(
+    app: AppHandle,
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<connect_service::ConnectSnapshot, ClientError> {
+    runtime.refresh_bundle(&app).await
+}
+
+#[tauri::command]
+async fn connect_probe_nodes(
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<connect_service::ConnectSnapshot, ClientError> {
+    runtime.probe_nodes().await
+}
+
+#[tauri::command]
+async fn connect_set_selection(
+    selection: SelectionMode,
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<connect_service::ConnectSnapshot, ClientError> {
+    runtime.set_selection(selection).await
+}
+
+#[tauri::command]
+async fn connect_start(
+    mode: ProxyMode,
+    app: AppHandle,
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<connect_service::ConnectSnapshot, ClientError> {
+    runtime.connect(&app, mode).await
+}
+
+#[tauri::command]
+async fn connect_stop(
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<connect_service::ConnectSnapshot, ClientError> {
+    runtime.stop().await
+}
+
+#[tauri::command]
+async fn connect_logout(
+    runtime: State<'_, ConnectRuntimeRegistry>,
+) -> Result<connect_service::ConnectSnapshot, ClientError> {
+    runtime.logout().await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
-            let profiles = ProfileRepository::native(app_data_dir)
+            let profiles = ProfileRepository::native(app_data_dir.clone())
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(profiles);
-            let supervisor = XraySupervisor::new(app.path().app_data_dir()?)
+            let supervisor = XraySupervisor::new(app_data_dir.clone())
                 .map_err(|error| std::io::Error::other(error.message))?;
-            app.manage(supervisor);
+            app.manage(supervisor.clone());
+            app.manage(SetupSessionStore::new());
+            app.manage(ConnectRuntimeRegistry::new(app_data_dir, supervisor));
+            tauri::async_runtime::spawn(runtime::run_background_maintenance(app.handle().clone()));
             Ok(())
         })
         .plugin(tauri_plugin_shell::init())
@@ -135,7 +241,17 @@ pub fn run() {
             client_import_profile,
             client_rename_profile,
             client_delete_profile,
-            client_preview_profile
+            client_preview_profile,
+            connect_begin_setup,
+            connect_cancel_setup,
+            connect_confirm_setup,
+            connect_get_snapshot,
+            connect_refresh_bundle,
+            connect_probe_nodes,
+            connect_set_selection,
+            connect_start,
+            connect_stop,
+            connect_logout
         ])
         .build(tauri::generate_context!())
         .expect("error while building Reality Client");

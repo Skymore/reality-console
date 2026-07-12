@@ -2,9 +2,12 @@
 
 Status: authoritative phased delivery for the account-first Connect client.
 
-Each phase ends with focused tests and a runnable client. Work extends the application in `client/`,
-preserves compatibility import until migration is complete, and leaves the separate Control app
-buildable. Account-first UI does not ship against mock-only contracts as a production feature.
+These phases are engineering checkpoints inside the larger product stages. They do not require one
+Git commit each: Stage 4 ships the complete account/session/bundle/selection backend as one reviewed
+commit, and Stage 5 groups proxy recovery, packaging, and release evidence. Work extends the
+application in `client/`, preserves compatibility import until migration is complete, and leaves
+the separate Control app buildable. Account-first UI does not ship against mock-only contracts as a
+production feature.
 
 ## Phase 0: Baseline and Contract Lock
 
@@ -22,8 +25,6 @@ Exit criteria:
 - the current compatibility connection flow passes on macOS without behavior regressions;
 - backend contract fixtures parse independently of renderer code;
 - no production code path requires invitation-only assumptions in shared DTO names.
-
-Commit: `test(client): lock connect runtime baseline`
 
 ## Phase 1: Secure Account and Device Sessions
 
@@ -43,8 +44,6 @@ Exit criteria:
 - a clean macOS and Windows test installation can activate and restore a device session;
 - refresh and activation secrets never enter renderer state, files, logs, or crash fixtures;
 - independent device revocation prevents further authenticated refresh.
-
-Commit: `feat(client): add secure account device sessions`
 
 ## Phase 2: Signed Bundle Verification and Offline Cache
 
@@ -69,8 +68,6 @@ Exit criteria:
   connection and stops an app-managed active session;
 - ordinary app-data inspection reveals no plaintext node credential or bearer token.
 
-Commit: `feat(client): verify and cache signed profile bundles`
-
 ## Phase 3: Account-First UI and Manual Multi-Node Connection
 
 Deliverables:
@@ -92,8 +89,6 @@ Exit criteria:
 - switching nodes, stopping, and restarting never creates duplicate Xray processes or stale runtime
   configuration.
 
-Commit: `feat(client): connect account bundles through xray supervisor`
-
 ## Phase 4: Automatic Selection and Pinned Fallback
 
 Deliverables:
@@ -114,8 +109,6 @@ Exit criteria:
 - pinned fallback follows only the configured order, and a relay failure does not mark healthy
   direct nodes unavailable.
 
-Commit: `feat(client): add automatic and fallback node selection`
-
 ## Phase 5: System Proxy and Lifecycle Recovery
 
 Deliverables:
@@ -135,8 +128,6 @@ Exit criteria:
 - system proxy is never changed before ports and candidate configuration are ready;
 - startup recovery executes before any automatic reconnect.
 
-Commit: `feat(client): add recoverable system proxy lifecycle`
-
 ## Phase 6: Compatibility Import Containment
 
 Deliverables:
@@ -155,8 +146,6 @@ Exit criteria:
 - existing supported invitations still import and connect through the same supervisor;
 - primary onboarding contains no invitation-only/no-account language;
 - compatibility data neither joins nor overrides a signed account bundle.
-
-Commit: `refactor(client): contain compatibility uri import`
 
 ## Phase 7: macOS and Windows Packaging
 
@@ -178,8 +167,6 @@ Exit criteria:
   and cannot enable development trust from normal settings;
 - install, upgrade, launch, activation, login, compatibility import, and uninstall checks pass.
 
-Commit: `chore(client): package signed macos and windows releases`
-
 ## Phase 8: Release Acceptance and Failure Matrix
 
 Deliverables:
@@ -200,8 +187,6 @@ Exit criteria:
 - the failure matrix proves control-plane outage does not stop valid cached data-plane use;
 - release evidence records package signatures, notarization, Xray version/checksum, test platform,
   Control Service version, and bundle schema version.
-
-Commit: `chore(client): validate account-first connect release`
 
 ## Engineering Gates for Every Phase
 

@@ -8,8 +8,19 @@ use crate::id::{
 use crate::node::EndpointMode;
 use crate::secret::Secret;
 use crate::validation::{ProtocolValidationError, ValidationCode};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use url::{Host, Url};
+
+/// Prefix identifying a version-1 member activation setup code.
+pub const MEMBER_SETUP_CODE_PREFIX: &str = "pn-member-v1.";
+
+const MEMBER_SETUP_CODE_SCHEMA_VERSION: u16 = 1;
+const MAX_MEMBER_SETUP_CODE_LENGTH: usize = 4_096;
+const ACTIVATION_SECRET_VERSION: &str = "rcd1";
+const ACTIVATION_SECRET_BYTES: usize = 32;
 
 /// Stable account lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +54,293 @@ pub struct CreateAccountRequest {
     pub display_name: String,
 }
 
+/// Administrator request to create a one-time activation for an existing account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateDeviceActivationRequest {
+    /// Requested lifetime in seconds. The service enforces a short upper bound.
+    #[serde(default = "default_activation_lifetime_seconds")]
+    pub expires_in_seconds: u32,
+}
+
+const fn default_activation_lifetime_seconds() -> u32 {
+    15 * 60
+}
+
+impl Default for CreateDeviceActivationRequest {
+    fn default() -> Self {
+        Self {
+            expires_in_seconds: default_activation_lifetime_seconds(),
+        }
+    }
+}
+
+impl CreateDeviceActivationRequest {
+    /// Validates the activation retry window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the requested lifetime is between one minute and one hour.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if !(60..=3_600).contains(&self.expires_in_seconds) {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "expiresInSeconds",
+                "activation lifetime must be between 60 and 3600 seconds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One-time activation material shown only in the idempotent creation response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateDeviceActivationResponse {
+    /// Stable activation identity pinned into the device proof.
+    pub activation_id: DeviceActivationId,
+    /// Account receiving the device.
+    pub user_id: UserId,
+    /// High-entropy bearer value. The controller stores only its verifier.
+    pub activation_secret: Secret<String>,
+    /// Hard consumption deadline.
+    pub expires_at: Timestamp,
+}
+
+/// Complete trust and one-time activation input decoded by a Connect client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberSetupActivation {
+    /// Account name shown before the device is activated.
+    pub display_name: String,
+    /// Private network receiving the device.
+    pub network_id: NetworkId,
+    /// Account receiving the device.
+    pub user_id: UserId,
+    /// Stable activation identity pinned into the device proof.
+    pub activation_id: DeviceActivationId,
+    /// Hard consumption deadline.
+    pub expires_at: Timestamp,
+    /// High-entropy single-use activation secret.
+    pub activation_secret: Secret<String>,
+    /// Strict controller origin used for API calls and proof binding.
+    pub controller_origin: String,
+    /// Controller instance expected in signed artifacts.
+    pub controller_instance_id: ControllerInstanceId,
+    /// Public key used to verify signed profile bundles.
+    pub bundle_signing_public_key: Ed25519PublicKey,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MemberSetupCodePayload {
+    schema_version: u16,
+    display_name: String,
+    network_id: NetworkId,
+    user_id: UserId,
+    activation_id: DeviceActivationId,
+    expires_at: Timestamp,
+    activation_secret: Secret<String>,
+    controller_origin: String,
+    controller_instance_id: ControllerInstanceId,
+    bundle_signing_public_key: Ed25519PublicKey,
+}
+
+/// Encodes complete member activation material as a pasteable or QR-safe setup code.
+///
+/// The result contains a one-time secret and must be treated like a password until
+/// it is consumed or expires.
+///
+/// # Errors
+///
+/// Returns an error when a payload field is invalid or the encoded value exceeds
+/// the protocol length bound.
+pub fn encode_member_setup_code(
+    activation: &MemberSetupActivation,
+) -> Result<Secret<String>, ProtocolValidationError> {
+    validate_member_setup_activation(activation)?;
+    let payload = MemberSetupCodePayload {
+        schema_version: MEMBER_SETUP_CODE_SCHEMA_VERSION,
+        display_name: activation.display_name.clone(),
+        network_id: activation.network_id,
+        user_id: activation.user_id,
+        activation_id: activation.activation_id,
+        expires_at: activation.expires_at,
+        activation_secret: activation.activation_secret.clone(),
+        controller_origin: activation.controller_origin.clone(),
+        controller_instance_id: activation.controller_instance_id,
+        bundle_signing_public_key: activation.bundle_signing_public_key.clone(),
+    };
+    let json = serde_json::to_vec(&payload).map_err(|_| {
+        ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode",
+            "member setup code could not be encoded",
+        )
+    })?;
+    let value = format!("{MEMBER_SETUP_CODE_PREFIX}{}", URL_SAFE_NO_PAD.encode(json));
+    if value.len() > MAX_MEMBER_SETUP_CODE_LENGTH {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::OutOfRange,
+            "setupCode",
+            "member setup code exceeds the protocol bound",
+        ));
+    }
+    Ok(Secret::new(value))
+}
+
+/// Decodes and validates a version-1 member activation setup code.
+///
+/// # Errors
+///
+/// Returns an error for malformed, non-canonical, unsupported, oversized, or
+/// internally inconsistent input. Expiry is enforced by the controller when the
+/// activation is consumed.
+pub fn decode_member_setup_code(
+    value: &str,
+) -> Result<MemberSetupActivation, ProtocolValidationError> {
+    if value.len() > MAX_MEMBER_SETUP_CODE_LENGTH {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::OutOfRange,
+            "setupCode",
+            "member setup code exceeds the protocol bound",
+        ));
+    }
+    let encoded = value
+        .strip_prefix(MEMBER_SETUP_CODE_PREFIX)
+        .ok_or_else(|| {
+            ProtocolValidationError::new(
+                ValidationCode::UnsupportedSchema,
+                "setupCode",
+                "member setup code has an unsupported version",
+            )
+        })?;
+    if encoded.is_empty() || encoded.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(invalid_member_setup_code());
+    }
+    let json = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid_member_setup_code())?;
+    if URL_SAFE_NO_PAD.encode(&json) != encoded {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::InvalidFormat,
+            "setupCode",
+            "member setup code is not canonical",
+        ));
+    }
+    let payload: MemberSetupCodePayload =
+        serde_json::from_slice(&json).map_err(|_| invalid_member_setup_code())?;
+    if payload.schema_version != MEMBER_SETUP_CODE_SCHEMA_VERSION {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::UnsupportedSchema,
+            "setupCode.schemaVersion",
+            "member setup code schema is not supported",
+        ));
+    }
+    let activation = MemberSetupActivation {
+        display_name: payload.display_name,
+        network_id: payload.network_id,
+        user_id: payload.user_id,
+        activation_id: payload.activation_id,
+        expires_at: payload.expires_at,
+        activation_secret: payload.activation_secret,
+        controller_origin: payload.controller_origin,
+        controller_instance_id: payload.controller_instance_id,
+        bundle_signing_public_key: payload.bundle_signing_public_key,
+    };
+    validate_member_setup_activation(&activation)?;
+    Ok(activation)
+}
+
+fn invalid_member_setup_code() -> ProtocolValidationError {
+    ProtocolValidationError::new(
+        ValidationCode::InvalidFormat,
+        "setupCode",
+        "member setup code is malformed",
+    )
+}
+
+fn validate_member_setup_activation(
+    activation: &MemberSetupActivation,
+) -> Result<(), ProtocolValidationError> {
+    validate_text(&activation.display_name, 128, "setupCode.displayName")?;
+    validate_controller_origin(&activation.controller_origin)?;
+    validate_activation_secret(
+        activation.activation_secret.expose_secret(),
+        activation.activation_id,
+    )
+}
+
+fn validate_controller_origin(value: &str) -> Result<(), ProtocolValidationError> {
+    let parsed = Url::parse(value).map_err(|_| invalid_controller_origin())?;
+    let loopback_http = parsed.scheme() == "http"
+        && match parsed.host() {
+            Some(Host::Ipv4(address)) => address.is_loopback(),
+            Some(Host::Ipv6(address)) => address.is_loopback(),
+            Some(Host::Domain(domain)) => domain == "localhost",
+            None => false,
+        };
+    if (!loopback_http && parsed.scheme() != "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.origin().ascii_serialization() != value
+    {
+        return Err(invalid_controller_origin());
+    }
+    Ok(())
+}
+
+fn invalid_controller_origin() -> ProtocolValidationError {
+    ProtocolValidationError::new(
+        ValidationCode::InvalidFormat,
+        "setupCode.controllerOrigin",
+        "controller origin must be a canonical HTTPS origin or loopback HTTP origin",
+    )
+}
+
+fn validate_activation_secret(
+    value: &str,
+    activation_id: DeviceActivationId,
+) -> Result<(), ProtocolValidationError> {
+    let mut parts = value.split('.');
+    let version = parts.next();
+    let secret_activation_id = parts.next();
+    let encoded = parts.next();
+    if version != Some(ACTIVATION_SECRET_VERSION) || parts.next().is_some() {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::UnsupportedSchema,
+            "setupCode.activationSecret",
+            "activation secret version is not supported",
+        ));
+    }
+    if secret_activation_id.and_then(|item| item.parse().ok()) != Some(activation_id) {
+        return Err(ProtocolValidationError::new(
+            ValidationCode::IdentityMismatch,
+            "setupCode.activationSecret",
+            "activation secret identity does not match the setup code",
+        ));
+    }
+    let encoded = encoded.ok_or_else(invalid_activation_secret)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid_activation_secret())?;
+    if bytes.len() != ACTIVATION_SECRET_BYTES || URL_SAFE_NO_PAD.encode(bytes) != encoded {
+        return Err(invalid_activation_secret());
+    }
+    Ok(())
+}
+
+fn invalid_activation_secret() -> ProtocolValidationError {
+    ProtocolValidationError::new(
+        ValidationCode::InvalidFormat,
+        "setupCode.activationSecret",
+        "activation secret is malformed",
+    )
+}
+
 impl CreateAccountRequest {
     /// Validates bounded account metadata.
     ///
@@ -61,6 +359,42 @@ impl CreateAccountRequest {
 pub struct SetAccountStatusRequest {
     /// Requested account status; deleting is terminal at Control.
     pub status: AccountStatus,
+}
+
+/// Administrator request to set or replace the optional account password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetAccountPasswordRequest {
+    /// New write-only password. Reset revokes every existing session family.
+    pub new_password: Secret<String>,
+}
+
+impl SetAccountPasswordRequest {
+    /// Validates the password transport bound before expensive hashing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the password contains 12 to 1024 bytes.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        let length = self.new_password.expose_secret().len();
+        if !(12..=1024).contains(&length) {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "newPassword",
+                "password must contain 12 to 1024 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Safe result of an administrative account-session reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetAccountSessionsResponse {
+    pub user_id: UserId,
+    pub revoked_sessions: u32,
+    pub revoked_devices: u32,
 }
 
 /// Lifecycle of one logical account-to-node assignment.
@@ -314,6 +648,24 @@ pub struct RefreshSessionRequest {
     pub refresh_credential: Secret<String>,
 }
 
+impl RefreshSessionRequest {
+    /// Validates that a refresh credential was supplied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty credential.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.refresh_credential.expose_secret().is_empty() {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::MissingField,
+                "refreshCredential",
+                "refresh credential is required",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Response containing a rotated credential pair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -454,7 +806,7 @@ pub struct EncryptedProfilePayload {
     pub algorithm: ProfileEncryptionAlgorithm,
     /// Sender ephemeral X25519 public key.
     pub ephemeral_public_key: X25519PublicKey,
-    /// Algorithm nonce encoded as unpadded base64url.
+    /// Unique envelope nonce encoded as unpadded base64url. HPKE derives its AEAD nonce internally.
     pub nonce: Nonce,
     /// Authenticated ciphertext, deliberately redacted from diagnostics.
     pub ciphertext: Secret<String>,
@@ -527,6 +879,17 @@ impl SignedProfileBundle {
             ));
         }
         let mut manifest_nodes = HashSet::with_capacity(manifest.profiles.len());
+        if manifest
+            .profiles
+            .windows(2)
+            .any(|items| items[0].node_id >= items[1].node_id)
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "manifest.profiles",
+                "manifest profiles must use canonical ascending node order",
+            ));
+        }
         for profile in &manifest.profiles {
             if !manifest_nodes.insert(profile.node_id) {
                 return Err(ProtocolValidationError::new(
@@ -541,6 +904,17 @@ impl SignedProfileBundle {
             }
         }
         let mut payload_nodes = HashSet::with_capacity(self.encrypted_profiles.len());
+        if self
+            .encrypted_profiles
+            .windows(2)
+            .any(|items| items[0].node_id >= items[1].node_id)
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "encryptedProfiles",
+                "encrypted profiles must use canonical ascending node order",
+            ));
+        }
         for profile in &self.encrypted_profiles {
             if profile.ciphertext.expose_secret().is_empty() {
                 return Err(ProtocolValidationError::new(
@@ -755,12 +1129,34 @@ fn validate_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateAccountRequest, CreateSessionRequest, DeviceEnrollment, ReplaceAccountNodesRequest,
+        decode_member_setup_code, encode_member_setup_code, CreateAccountRequest,
+        CreateSessionRequest, DeviceEnrollment, MemberSetupActivation, ReplaceAccountNodesRequest,
+        MEMBER_SETUP_CODE_PREFIX,
     };
     use crate::crypto::{Ed25519PublicKey, Ed25519Signature, Nonce, X25519PublicKey};
+    use crate::id::{ControllerInstanceId, DeviceActivationId, NetworkId, Timestamp, UserId};
     use crate::secret::Secret;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
+    use std::str::FromStr as _;
+
+    fn member_setup_activation() -> MemberSetupActivation {
+        let activation_id = DeviceActivationId::new();
+        MemberSetupActivation {
+            display_name: "Activation member".to_string(),
+            network_id: NetworkId::new(),
+            user_id: UserId::new(),
+            activation_id,
+            expires_at: Timestamp::from_str("2026-07-11T21:00:00Z").unwrap(),
+            activation_secret: Secret::new(format!(
+                "rcd1.{activation_id}.{}",
+                URL_SAFE_NO_PAD.encode([9_u8; 32])
+            )),
+            controller_origin: "https://control.example.test".to_string(),
+            controller_instance_id: ControllerInstanceId::new(),
+            bundle_signing_public_key: URL_SAFE_NO_PAD.encode([7_u8; 32]).parse().unwrap(),
+        }
+    }
 
     fn enrollment() -> DeviceEnrollment {
         DeviceEnrollment {
@@ -830,5 +1226,52 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn member_setup_code_round_trips_canonically_and_redacts_secrets() {
+        let activation = member_setup_activation();
+        let code = encode_member_setup_code(&activation).unwrap();
+
+        assert!(code.expose_secret().starts_with(MEMBER_SETUP_CODE_PREFIX));
+        assert!(!code.expose_secret().contains('='));
+        assert!(!format!("{code:?}").contains(activation.activation_secret.expose_secret()));
+        assert!(!format!("{activation:?}").contains(activation.activation_secret.expose_secret()));
+        assert_eq!(
+            decode_member_setup_code(code.expose_secret()).unwrap(),
+            activation
+        );
+
+        let mut padded = code.expose_secret().clone();
+        padded.push('=');
+        assert!(decode_member_setup_code(&padded).is_err());
+        assert!(decode_member_setup_code(&code.expose_secret().replacen(
+            MEMBER_SETUP_CODE_PREFIX,
+            "pn-member-v2.",
+            1,
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn member_setup_code_rejects_noncanonical_origins_and_invalid_secrets() {
+        let mut activation = member_setup_activation();
+        activation.controller_origin = "https://control.example.test/".to_string();
+        assert!(encode_member_setup_code(&activation).is_err());
+
+        activation = member_setup_activation();
+        activation.activation_secret = Secret::new(format!(
+            "rcd2.{}.{}",
+            activation.activation_id,
+            URL_SAFE_NO_PAD.encode([9_u8; 32])
+        ));
+        assert!(encode_member_setup_code(&activation).is_err());
+
+        activation.activation_secret = Secret::new(format!(
+            "rcd1.{}.{}",
+            activation.activation_id,
+            URL_SAFE_NO_PAD.encode([9_u8; 31])
+        ));
+        assert!(encode_member_setup_code(&activation).is_err());
     }
 }

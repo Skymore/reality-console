@@ -3,7 +3,13 @@ use axum::http::{header, Request, StatusCode};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use control_protocol::account::{
-    AccountNodeAssignmentStatus, AccountNodeProvisioningState, AccountStatus, AccountSummary,
+    decode_member_setup_code, AccountNodeAssignmentStatus, AccountNodeProvisioningState,
+    AccountStatus, AccountSummary, ConsumeDeviceActivationRequest, CreateDeviceActivationRequest,
+    CreateDeviceSessionResponse, CreateSessionRequest, DeviceEnrollment, MemberSetupActivation,
+    RefreshSessionRequest, RefreshSessionResponse, SetAccountPasswordRequest, SignedProfileBundle,
+};
+use control_protocol::account_crypto::{
+    device_activation_proof_transcript, device_login_proof_transcript,
 };
 use control_protocol::crypto::{
     Ed25519PublicKey, Ed25519Signature, Nonce, Sha256Digest, X25519PublicKey,
@@ -14,8 +20,8 @@ use control_protocol::enrollment::{
 };
 use control_protocol::error::ErrorCode;
 use control_protocol::id::{
-    ControllerInstanceId, EndpointId, NodeId, NodeKeyId, Revision, SequenceNumber, Timestamp,
-    UserId,
+    ControllerInstanceId, DeviceId, EndpointId, NodeId, NodeKeyId, Revision, SequenceNumber,
+    Timestamp, UserId,
 };
 use control_protocol::idempotency::IDEMPOTENCY_KEY_HEADER;
 use control_protocol::node::{
@@ -27,6 +33,7 @@ use control_protocol::node::{
 };
 use control_protocol::node_status::verify_node_heartbeat_status_signature;
 use control_protocol::request_auth::NodeRequestSigningInput;
+use control_protocol::secret::Secret;
 use control_server::probe::{
     TcpProbeCompletion, TcpProbeErrorCode, TcpProbeLoopOptions, TcpProbeResult,
 };
@@ -782,8 +789,10 @@ async fn post_heartbeat(
 async fn accepted_heartbeat_status(
     response: axum::response::Response,
 ) -> SignedNodeHeartbeatStatus {
-    assert_eq!(response.status(), StatusCode::OK);
-    serde_json::from_value(json(response).await).unwrap()
+    let status = response.status();
+    let body = json(response).await;
+    assert_eq!(status, StatusCode::OK, "unexpected heartbeat body: {body}");
+    serde_json::from_value(body).unwrap()
 }
 
 fn assert_heartbeat_status_authentic(
@@ -3948,5 +3957,902 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (11, 11, 1, 1, 1));
+    assert_eq!(durable, (12, 12, 1, 1, 1));
+}
+
+fn unsigned_device(signing_key: &SigningKey, marker: u8) -> DeviceEnrollment {
+    DeviceEnrollment {
+        display_name: format!("Connect device {marker}"),
+        client_version: "0.1.0".to_string(),
+        platform: "macos-arm64".to_string(),
+        identity_public_key: URL_SAFE_NO_PAD
+            .encode(signing_key.verifying_key().to_bytes())
+            .parse()
+            .unwrap(),
+        encryption_public_key: URL_SAFE_NO_PAD.encode([marker; 32]).parse().unwrap(),
+        nonce: URL_SAFE_NO_PAD.encode([marker; 32]).parse().unwrap(),
+        proof: URL_SAFE_NO_PAD.encode([0_u8; 64]).parse().unwrap(),
+    }
+}
+
+fn signed_login_request(user_id: UserId, password: &str, marker: u8) -> CreateSessionRequest {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut device = unsigned_device(&signing_key, marker);
+    let account = user_id.to_string();
+    let transcript =
+        device_login_proof_transcript(&account, "https://control.test", &device).unwrap();
+    device.proof = URL_SAFE_NO_PAD
+        .encode(signing_key.sign(&transcript).to_bytes())
+        .parse()
+        .unwrap();
+    CreateSessionRequest {
+        account,
+        password: Secret::new(password.to_string()),
+        device,
+    }
+}
+
+async fn set_password(app: &TestApp, user_id: UserId, password: &str) {
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::put(format!("/v1/admin/accounts/{user_id}/password"))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&SetAccountPasswordRequest {
+                        new_password: Secret::new(password.to_string()),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+async fn create_device_activation_for(
+    app: &TestApp,
+    user_id: UserId,
+    key: &str,
+) -> (MemberSetupActivation, Vec<u8>) {
+    let request = CreateDeviceActivationRequest::default();
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/admin/accounts/{user_id}/device-activations"))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, key)
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let activation = decode_member_setup_code(body["setupCode"].as_str().unwrap()).unwrap();
+    (activation, bytes)
+}
+
+fn signed_activation_request(
+    activation: &MemberSetupActivation,
+    signing_key: &SigningKey,
+    marker: u8,
+) -> ConsumeDeviceActivationRequest {
+    let mut device = unsigned_device(signing_key, marker);
+    let transcript = device_activation_proof_transcript(
+        activation.activation_id,
+        activation.expires_at,
+        "https://control.test",
+        &device,
+    )
+    .unwrap();
+    device.proof = URL_SAFE_NO_PAD
+        .encode(signing_key.sign(&transcript).to_bytes())
+        .parse()
+        .unwrap();
+    ConsumeDeviceActivationRequest {
+        activation_secret: activation.activation_secret.clone(),
+        device,
+    }
+}
+
+async fn post_public_json<T: serde::Serialize>(
+    app: &TestApp,
+    path: &str,
+    request: &T,
+) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn post_public_json_with_key<T: serde::Serialize>(
+    app: &TestApp,
+    path: &str,
+    request: &T,
+    idempotency_key: &str,
+) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key)
+                .body(Body::from(serde_json::to_vec(request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn consume_activation_ok(
+    app: &TestApp,
+    request: &ConsumeDeviceActivationRequest,
+) -> (CreateDeviceSessionResponse, Vec<u8>) {
+    let response = post_public_json(app, "/v1/device-activations/consume", request).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    (serde_json::from_slice(&bytes).unwrap(), bytes)
+}
+
+#[tokio::test]
+async fn device_activation_exactly_replays_without_storing_raw_secrets() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Activation member").await;
+    let key = Uuid::new_v4().to_string();
+    let (activation, first_creation) =
+        create_device_activation_for(&app, account.account.user_id, &key).await;
+    let app = app.restart();
+    let (replayed, second_creation) =
+        create_device_activation_for(&app, account.account.user_id, &key).await;
+    assert_eq!(first_creation, second_creation);
+    assert_eq!(activation, replayed);
+
+    let delivery: Value = serde_json::from_slice(&first_creation).unwrap();
+    let fields = delivery.as_object().unwrap();
+    assert_eq!(fields.len(), 4);
+    assert_eq!(delivery["displayName"], "Activation member");
+    assert_eq!(delivery["expiresAt"], activation.expires_at.to_string());
+    assert!(delivery["setupCode"]
+        .as_str()
+        .unwrap()
+        .starts_with("pn-member-v1."));
+    let setup_link = url::Url::parse(delivery["setupLink"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        setup_link.origin().ascii_serialization(),
+        "https://control.test"
+    );
+    assert_eq!(setup_link.path(), "/join/connect");
+    assert_eq!(setup_link.fragment(), delivery["setupCode"].as_str());
+    for raw_field in [
+        "activationId",
+        "userId",
+        "networkId",
+        "activationSecret",
+        "controllerOrigin",
+        "controllerInstanceId",
+        "bundleSigningPublicKey",
+    ] {
+        assert!(fields.get(raw_field).is_none());
+    }
+    let raw_delivery = String::from_utf8(first_creation.clone()).unwrap();
+    assert!(!raw_delivery.contains(activation.activation_secret.expose_secret()));
+    assert!(!raw_delivery.contains(&activation.activation_id.to_string()));
+    assert!(!raw_delivery.contains(&activation.user_id.to_string()));
+    assert_eq!(activation.display_name, "Activation member");
+    assert_eq!(activation.controller_origin, "https://control.test");
+    assert_eq!(
+        activation.bundle_signing_public_key,
+        app.controller_public_key
+    );
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let request = signed_activation_request(&activation, &signing_key, 21);
+    let (session, first_consume) = consume_activation_ok(&app, &request).await;
+    let (replayed_session, second_consume) = consume_activation_ok(&app, &request).await;
+    assert_eq!(first_consume, second_consume);
+    assert_eq!(session, replayed_session);
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let activation_verifier: Vec<u8> = connection
+        .query_row(
+            "SELECT secret_verifier FROM device_activations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let refresh_verifier: Vec<u8> = connection
+        .query_row(
+            "SELECT current_refresh_verifier FROM refresh_sessions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(activation_verifier.len(), 32);
+    assert_eq!(refresh_verifier.len(), 32);
+    let database_bytes = std::fs::read(app.database_path()).unwrap();
+    assert!(!database_bytes
+        .windows(activation.activation_secret.expose_secret().len())
+        .any(|window| window == activation.activation_secret.expose_secret().as_bytes()));
+    assert!(!database_bytes
+        .windows(session.credentials.refresh_credential.expose_secret().len())
+        .any(|window| window
+            == session
+                .credentials
+                .refresh_credential
+                .expose_secret()
+                .as_bytes()));
+}
+
+#[tokio::test]
+async fn login_and_refresh_require_idempotency_keys() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Key-required member").await;
+    let password = "key required password";
+    set_password(&app, account.account.user_id, password).await;
+    let login = signed_login_request(account.account.user_id, password, 26);
+    let missing_login_key = post_public_json(&app, "/v1/sessions", &login).await;
+    assert_eq!(missing_login_key.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json(missing_login_key).await["error"]["code"],
+        "validation_failed"
+    );
+    let missing_refresh_key = post_public_json(
+        &app,
+        "/v1/sessions/refresh",
+        &RefreshSessionRequest {
+            refresh_credential: Secret::new(format!("rcr1.{}.unused", Uuid::new_v4())),
+        },
+    )
+    .await;
+    assert_eq!(missing_refresh_key.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json(missing_refresh_key).await["error"]["code"],
+        "validation_failed"
+    );
+}
+
+#[tokio::test]
+async fn password_login_replays_after_restart_and_concurrent_exact_retries_converge() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Idempotent login member").await;
+    let password = "idempotent login password";
+    set_password(&app, account.account.user_id, password).await;
+    let login = signed_login_request(account.account.user_id, password, 27);
+    let key = Uuid::new_v4().to_string();
+    let first = post_public_json_with_key(&app, "/v1/sessions", &login, &key).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_bytes = first.into_body().collect().await.unwrap().to_bytes();
+    let first_session: CreateDeviceSessionResponse = serde_json::from_slice(&first_bytes).unwrap();
+
+    let app = app.restart();
+    let replay = post_public_json_with_key(&app, "/v1/sessions", &login, &key).await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        replay.into_body().collect().await.unwrap().to_bytes(),
+        first_bytes
+    );
+
+    let conflict_login = signed_login_request(account.account.user_id, password, 28);
+    let conflict = post_public_json_with_key(&app, "/v1/sessions", &conflict_login, &key).await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(conflict).await["error"]["code"],
+        "idempotency_key_conflict"
+    );
+
+    let concurrent_login = signed_login_request(account.account.user_id, password, 29);
+    let concurrent_key = Uuid::new_v4().to_string();
+    let body = serde_json::to_vec(&concurrent_login).unwrap();
+    let first_request = Request::post("/v1/sessions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(IDEMPOTENCY_KEY_HEADER, &concurrent_key)
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let second_request = Request::post("/v1/sessions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(IDEMPOTENCY_KEY_HEADER, &concurrent_key)
+        .body(Body::from(body))
+        .unwrap();
+    let (first_retry, second_retry) = tokio::join!(
+        app.router.clone().oneshot(first_request),
+        app.router.clone().oneshot(second_request),
+    );
+    let first_retry = first_retry.unwrap();
+    let second_retry = second_retry.unwrap();
+    assert_eq!(first_retry.status(), StatusCode::CREATED);
+    assert_eq!(second_retry.status(), StatusCode::CREATED);
+    assert_eq!(
+        first_retry.into_body().collect().await.unwrap().to_bytes(),
+        second_retry.into_body().collect().await.unwrap().to_bytes()
+    );
+
+    let database_bytes = std::fs::read(app.database_path()).unwrap();
+    assert!(!database_bytes
+        .windows(
+            first_session
+                .credentials
+                .refresh_credential
+                .expose_secret()
+                .len()
+        )
+        .any(|window| {
+            window
+                == first_session
+                    .credentials
+                    .refresh_credential
+                    .expose_secret()
+                    .as_bytes()
+        }));
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM devices),
+                (SELECT COUNT(*) FROM refresh_sessions),
+                (SELECT COUNT(*) FROM login_idempotency_records)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (2, 2, 2));
+}
+
+#[tokio::test]
+async fn refresh_reuse_revokes_family_and_bundle_etag_is_device_authenticated() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Refresh member").await;
+    let (activation, _) =
+        create_device_activation_for(&app, account.account.user_id, &Uuid::new_v4().to_string())
+            .await;
+    let request = signed_activation_request(&activation, &SigningKey::generate(&mut OsRng), 22);
+    let (session, _) = consume_activation_ok(&app, &request).await;
+    let old_refresh = session.credentials.refresh_credential.clone();
+    let refresh = RefreshSessionRequest {
+        refresh_credential: old_refresh.clone(),
+    };
+    let refresh_key = Uuid::new_v4().to_string();
+    let response =
+        post_public_json_with_key(&app, "/v1/sessions/refresh", &refresh, &refresh_key).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let first_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let rotated: RefreshSessionResponse = serde_json::from_slice(&first_bytes).unwrap();
+    let app = app.restart();
+    let replay =
+        post_public_json_with_key(&app, "/v1/sessions/refresh", &refresh, &refresh_key).await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay.into_body().collect().await.unwrap().to_bytes(),
+        first_bytes
+    );
+
+    assert_empty_bundle_etag(&app, &rotated.credentials.access_token).await;
+
+    let second_refresh = RefreshSessionRequest {
+        refresh_credential: rotated.credentials.refresh_credential.clone(),
+    };
+    let second_body = serde_json::to_vec(&second_refresh).unwrap();
+    let first_request = Request::post("/v1/sessions/refresh")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(IDEMPOTENCY_KEY_HEADER, &refresh_key)
+        .body(Body::from(second_body.clone()))
+        .unwrap();
+    let second_request = Request::post("/v1/sessions/refresh")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(IDEMPOTENCY_KEY_HEADER, &refresh_key)
+        .body(Body::from(second_body))
+        .unwrap();
+    let (first_retry, second_retry) = tokio::join!(
+        app.router.clone().oneshot(first_request),
+        app.router.clone().oneshot(second_request),
+    );
+    let first_retry = first_retry.unwrap();
+    let second_retry = second_retry.unwrap();
+    assert_eq!(first_retry.status(), StatusCode::OK);
+    assert_eq!(second_retry.status(), StatusCode::OK);
+    let first_retry_bytes = first_retry.into_body().collect().await.unwrap().to_bytes();
+    let second_retry_bytes = second_retry.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(first_retry_bytes, second_retry_bytes);
+    let newest: RefreshSessionResponse = serde_json::from_slice(&first_retry_bytes).unwrap();
+
+    let reuse = post_public_json_with_key(
+        &app,
+        "/v1/sessions/refresh",
+        &second_refresh,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(reuse.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json(reuse).await["error"]["code"],
+        "refresh_credential_reuse"
+    );
+    let rejected = post_public_json_with_key(
+        &app,
+        "/v1/sessions/refresh",
+        &RefreshSessionRequest {
+            refresh_credential: newest.credentials.refresh_credential,
+        },
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+async fn assert_empty_bundle_etag(app: &TestApp, access_token: &Secret<String>) {
+    let bundle_response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/v1/me/profile-bundle")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", access_token.expose_secret()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bundle_response.status(), StatusCode::OK);
+    let etag = bundle_response.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bundle: SignedProfileBundle = serde_json::from_value(json(bundle_response).await).unwrap();
+    assert!(bundle.manifest.profiles.is_empty());
+    let not_modified = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/v1/me/profile-bundle")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", access_token.expose_secret()),
+                )
+                .header(header::IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(not_modified.headers()[header::ETAG], etag);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn password_login_reset_logout_and_admin_device_revoke_are_closed() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Password member").await;
+    let password = "correct horse battery staple";
+    let set = app
+        .router
+        .clone()
+        .oneshot(
+            Request::put(format!(
+                "/v1/admin/accounts/{}/password",
+                account.account.user_id
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&SetAccountPasswordRequest {
+                    new_password: Secret::new(password.to_string()),
+                })
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(set.status(), StatusCode::NO_CONTENT);
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut device = unsigned_device(&signing_key, 23);
+    let account_id = account.account.user_id.to_string();
+    let transcript =
+        device_login_proof_transcript(&account_id, "https://control.test", &device).unwrap();
+    device.proof = URL_SAFE_NO_PAD
+        .encode(signing_key.sign(&transcript).to_bytes())
+        .parse()
+        .unwrap();
+    let login = CreateSessionRequest {
+        account: account_id,
+        password: Secret::new(password.to_string()),
+        device,
+    };
+    let response =
+        post_public_json_with_key(&app, "/v1/sessions", &login, &Uuid::new_v4().to_string()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let session: CreateDeviceSessionResponse =
+        serde_json::from_value(json(response).await).unwrap();
+
+    let logout = app
+        .router
+        .clone()
+        .oneshot(
+            Request::delete(format!("/v1/me/devices/{}/session", session.device_id))
+                .header(
+                    header::AUTHORIZATION,
+                    format!(
+                        "Bearer {}",
+                        session.credentials.access_token.expose_secret()
+                    ),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    let logged_out_refresh = post_public_json_with_key(
+        &app,
+        "/v1/sessions/refresh",
+        &RefreshSessionRequest {
+            refresh_credential: session.credentials.refresh_credential,
+        },
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(logged_out_refresh.status(), StatusCode::UNAUTHORIZED);
+
+    let second_key = SigningKey::generate(&mut OsRng);
+    let mut second_device = unsigned_device(&second_key, 24);
+    let transcript =
+        device_login_proof_transcript(&login.account, "https://control.test", &second_device)
+            .unwrap();
+    second_device.proof = URL_SAFE_NO_PAD
+        .encode(second_key.sign(&transcript).to_bytes())
+        .parse()
+        .unwrap();
+    let second_login = CreateSessionRequest {
+        account: login.account,
+        password: Secret::new(password.to_string()),
+        device: second_device,
+    };
+    let response = post_public_json_with_key(
+        &app,
+        "/v1/sessions",
+        &second_login,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let session: CreateDeviceSessionResponse =
+        serde_json::from_value(json(response).await).unwrap();
+
+    let revoke = app
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/admin/devices/{}/revoke", session.device_id))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), StatusCode::NO_CONTENT);
+    let rejected = post_public_json_with_key(
+        &app,
+        "/v1/sessions/refresh",
+        &RefreshSessionRequest {
+            refresh_credential: session.credentials.refresh_credential,
+        },
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+    let reset = app
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/v1/admin/accounts/{}/session-reset",
+                account.account.user_id
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+    let reset_body = json(reset).await;
+    assert_eq!(reset_body["userId"], account.account.user_id.to_string());
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let audit_events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events
+             WHERE event_type IN ('device.revoked', 'account.sessions-reset')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_events, 2);
+}
+
+fn mark_current_endpoint_protocol_verified(app: &TestApp, node_id: NodeId, latency_ms: i64) {
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let candidate: (String, String, String, i64, i64, i64) = connection
+        .query_row(
+            "SELECT network_id, endpoint_id, address, port, applied_revision,
+                    last_report_generation
+             FROM node_endpoint_candidates
+             WHERE node_id = ?1 AND withdrawn_at IS NULL",
+            [node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    connection
+        .execute(
+            "INSERT INTO endpoint_probe_attempts(
+                network_id, probe_id, node_id, endpoint_id, phase, status, runner_id,
+                claim_token_sha256, candidate_generation, address, port, applied_revision,
+                started_at, claim_expires_at, completed_at, resolved_address, latency_ms,
+                result_code
+             ) VALUES (?1, ?2, ?3, ?4, 'protocol', 'succeeded', ?5, ?6, ?7, ?8,
+                       ?9, ?10, ?11, ?12, ?11, '203.0.113.10', ?13,
+                       'direct_protocol_connected')",
+            rusqlite::params![
+                candidate.0,
+                Uuid::new_v4().to_string(),
+                node_id.to_string(),
+                candidate.1,
+                Uuid::new_v4().to_string(),
+                vec![3_u8; 32],
+                candidate.5,
+                candidate.2,
+                candidate.3,
+                candidate.4,
+                now,
+                now + 30,
+                latency_ms,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE node_endpoint_verifications
+             SET status = 'verified', probe_attempts = probe_attempts + 1,
+                 last_probe_at = ?1, last_success_at = ?1, latency_ms = ?2,
+                 error_code = NULL, verification_expires_at = ?3, updated_at = ?1
+             WHERE node_id = ?4 AND endpoint_id = ?5",
+            rusqlite::params![
+                now,
+                latency_ms,
+                now + 3_600,
+                node_id.to_string(),
+                candidate.1
+            ],
+        )
+        .unwrap();
+}
+
+async fn fetch_member_bundle(
+    app: &TestApp,
+    access_token: &Secret<String>,
+) -> (SignedProfileBundle, String) {
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/v1/me/profile-bundle")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", access_token.expose_secret()),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response.headers()[header::ETAG]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bundle = serde_json::from_value(json(response).await).unwrap();
+    (bundle, etag)
+}
+
+#[tokio::test]
+async fn bundle_requires_exact_applied_credential_and_current_protocol_endpoint_per_node() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Bundle member").await;
+    let first = enroll_signed_node(&app).await;
+    let second = enroll_signed_node(&app).await;
+    let first_baseline = approve_configured_node(&app, &first).await;
+    let second_baseline = approve_configured_node(&app, &second).await;
+    let assigned = replace_account_nodes(
+        &app,
+        account.account.user_id,
+        &[first.node_id, second.node_id],
+    )
+    .await;
+    assert_eq!(assigned.status(), StatusCode::OK);
+    let first_desired = fetch_desired_ok(&app, &first, first_baseline.document.revision, 230).await;
+    let second_desired =
+        fetch_desired_ok(&app, &second, second_baseline.document.revision, 231).await;
+    report_applied_revision(
+        &app,
+        &first,
+        first_desired.document.revision,
+        61,
+        [232, 233, 234],
+    )
+    .await;
+    report_applied_revision(
+        &app,
+        &second,
+        second_desired.document.revision,
+        62,
+        [235, 236, 237],
+    )
+    .await;
+    for (index, (node, desired)) in [(&first, &first_desired), (&second, &second_desired)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut current = heartbeat();
+        current.heartbeat_generation =
+            SequenceNumber::new(10 + i64::try_from(index).unwrap()).unwrap();
+        current.revisions = RevisionProgress {
+            desired_revision: Some(desired.document.revision),
+            received_revision: Some(desired.document.revision),
+            validated_revision: Some(desired.document.revision),
+            applied_revision: Some(desired.document.revision),
+        };
+        current.endpoints = vec![endpoint_candidate(
+            desired.document.revision,
+            EndpointMode::Direct,
+            EndpointSource::Manual,
+            &format!("bundle-{index}.example.test"),
+            443,
+        )];
+        assert_eq!(
+            post_heartbeat(&app, node, &current, 240 + u8::try_from(index).unwrap())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    mark_current_endpoint_protocol_verified(&app, first.node_id, 10);
+
+    let (activation, _) =
+        create_device_activation_for(&app, account.account.user_id, &Uuid::new_v4().to_string())
+            .await;
+    let activation_request =
+        signed_activation_request(&activation, &SigningKey::generate(&mut OsRng), 25);
+    let (session, _) = consume_activation_ok(&app, &activation_request).await;
+    let (partial, partial_etag) =
+        fetch_member_bundle(&app, &session.credentials.access_token).await;
+    assert_eq!(partial.manifest.profiles.len(), 1);
+    assert_eq!(partial.manifest.profiles[0].node_id, first.node_id);
+
+    mark_current_endpoint_protocol_verified(&app, second.node_id, 20);
+    let (complete, complete_etag) =
+        fetch_member_bundle(&app, &session.credentials.access_token).await;
+    assert_eq!(complete.manifest.profiles.len(), 2);
+    assert_ne!(partial_etag, complete_etag);
+    assert!(complete
+        .manifest
+        .profiles
+        .windows(2)
+        .all(|items| items[0].node_id < items[1].node_id));
+    let admin_json = serde_json::to_string(&only_account(&app).await).unwrap();
+    for desired in [&first_desired, &second_desired] {
+        assert!(!admin_json.contains(desired.document.users[0].vless_uuid.expose_secret()));
+    }
+    assert_device_revoke_rotates_assigned_credentials(
+        &app,
+        session.device_id,
+        &[first.node_id, second.node_id],
+    )
+    .await;
+}
+
+async fn assert_device_revoke_rotates_assigned_credentials(
+    app: &TestApp,
+    device_id: DeviceId,
+    node_ids: &[NodeId],
+) {
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let previous_revision: i64 = connection
+        .query_row("SELECT last_revision FROM networks", [], |row| row.get(0))
+        .unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT credential_id FROM user_node_credentials
+             WHERE node_id = ?1 AND status = 'active'",
+        )
+        .unwrap();
+    let previous_credentials = node_ids
+        .iter()
+        .map(|node_id| {
+            statement
+                .query_row([node_id.to_string()], |row| row.get::<_, String>(0))
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    drop(statement);
+    drop(connection);
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/admin/devices/{device_id}/revoke"))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let current_revision: i64 = connection
+        .query_row("SELECT last_revision FROM networks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        current_revision,
+        previous_revision + i64::try_from(node_ids.len()).unwrap()
+    );
+    for (node_id, previous_credential) in node_ids.iter().zip(previous_credentials) {
+        let old_status: String = connection
+            .query_row(
+                "SELECT status FROM user_node_credentials WHERE credential_id = ?1",
+                [previous_credential],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_status, "revoked");
+        let replacement_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM user_node_credentials
+                 WHERE node_id = ?1 AND status = 'pending'",
+                [node_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replacement_count, 1);
+    }
 }

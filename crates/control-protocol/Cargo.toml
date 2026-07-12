@@ -9,11 +9,14 @@ license = "MIT"
 [dependencies]
 base64 = "0.22"
 ed25519-dalek = "2"
+hpke = "0.13"
+rand_core = { version = "0.9", features = ["os_rng"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]

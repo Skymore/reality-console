@@ -1,9 +1,11 @@
+use crate::core::connection::{
+    validate_reality_key, validate_server_name, validate_short_id, ConnectionProfile,
+    ConnectionSource,
+};
 use crate::error::ClientError;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use percent_encoding::percent_decode_str;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::fmt;
 use url::Url;
 use uuid::Uuid;
 
@@ -33,38 +35,6 @@ const SINGLE_VALUE_PARAMETERS: &[&str] = &[
     "spx",
 ];
 
-#[derive(Clone)]
-pub struct RealityProfile {
-    pub name: String,
-    pub server_address: String,
-    pub server_port: u16,
-    pub user_id: Uuid,
-    pub flow: String,
-    pub server_name: String,
-    pub fingerprint: String,
-    pub reality_password: String,
-    pub short_id: String,
-    pub spider_x: String,
-}
-
-impl fmt::Debug for RealityProfile {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RealityProfile")
-            .field("name", &self.name)
-            .field("server_address", &self.server_address)
-            .field("server_port", &self.server_port)
-            .field("user_id", &"[redacted]")
-            .field("flow", &self.flow)
-            .field("server_name", &self.server_name)
-            .field("fingerprint", &self.fingerprint)
-            .field("reality_password", &"[redacted]")
-            .field("short_id", &"[redacted]")
-            .field("spider_x", &"[redacted]")
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InvitationPreview {
@@ -78,8 +48,8 @@ pub struct InvitationPreview {
     pub fingerprint: String,
 }
 
-impl From<&RealityProfile> for InvitationPreview {
-    fn from(profile: &RealityProfile) -> Self {
+impl From<&ConnectionProfile> for InvitationPreview {
+    fn from(profile: &ConnectionProfile) -> Self {
         Self {
             name: profile.name.clone(),
             server_address: profile.server_address.clone(),
@@ -93,7 +63,7 @@ impl From<&RealityProfile> for InvitationPreview {
     }
 }
 
-pub fn parse_invitation(invitation: &str) -> Result<RealityProfile, ClientError> {
+pub fn parse_invitation(invitation: &str) -> Result<ConnectionProfile, ClientError> {
     let invitation = invitation.trim();
     let url = Url::parse(invitation).map_err(|_| {
         invalid(
@@ -204,7 +174,13 @@ pub fn parse_invitation(invitation: &str) -> Result<RealityProfile, ClientError>
     }
 
     let server_name = require_value(&parameters, "sni", "serverName")?;
-    validate_server_name(server_name)?;
+    validate_server_name(server_name).map_err(|_| {
+        invalid(
+            "invitation_invalid_server_name",
+            "serverName",
+            "The REALITY server name is invalid.",
+        )
+    })?;
 
     let fingerprint = require_value(&parameters, "fp", "fingerprint")?;
     if !SUPPORTED_FINGERPRINTS.contains(&fingerprint) {
@@ -216,10 +192,22 @@ pub fn parse_invitation(invitation: &str) -> Result<RealityProfile, ClientError>
     }
 
     let reality_password = require_value(&parameters, "pbk", "realityPassword")?;
-    validate_reality_password(reality_password)?;
+    validate_reality_key(reality_password).map_err(|_| {
+        invalid(
+            "invitation_invalid_reality_password",
+            "realityPassword",
+            "The REALITY password/public key must decode to 32 bytes.",
+        )
+    })?;
 
     let short_id = parameters.get("sid").cloned().unwrap_or_default();
-    validate_short_id(&short_id)?;
+    validate_short_id(&short_id).map_err(|_| {
+        invalid(
+            "invitation_invalid_short_id",
+            "shortId",
+            "The REALITY short ID must be an even-length hexadecimal value up to 16 characters.",
+        )
+    })?;
 
     let spider_x = parameters
         .get("spx")
@@ -233,7 +221,8 @@ pub fn parse_invitation(invitation: &str) -> Result<RealityProfile, ClientError>
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| server_address.clone());
 
-    Ok(RealityProfile {
+    Ok(ConnectionProfile {
+        source: ConnectionSource::CompatibilityImport,
         name,
         server_address,
         server_port,
@@ -281,54 +270,6 @@ fn require_value<'a>(
                 format!("The invitation is missing {key}."),
             )
         })
-}
-
-fn validate_server_name(value: &str) -> Result<(), ClientError> {
-    if value.len() > 253
-        || value.chars().any(char::is_whitespace)
-        || value.contains('/')
-        || value.contains(':')
-    {
-        return Err(invalid(
-            "invitation_invalid_server_name",
-            "serverName",
-            "The REALITY server name is invalid.",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_reality_password(value: &str) -> Result<(), ClientError> {
-    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
-        invalid(
-            "invitation_invalid_reality_password",
-            "realityPassword",
-            "The REALITY password/public key is not valid base64url.",
-        )
-    })?;
-
-    if bytes.len() != 32 {
-        return Err(invalid(
-            "invitation_invalid_reality_password",
-            "realityPassword",
-            "The REALITY password/public key must decode to 32 bytes.",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_short_id(value: &str) -> Result<(), ClientError> {
-    if value.len() > 16
-        || !value.len().is_multiple_of(2)
-        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(invalid(
-            "invitation_invalid_short_id",
-            "shortId",
-            "The REALITY short ID must be an even-length hexadecimal value up to 16 characters.",
-        ));
-    }
-    Ok(())
 }
 
 fn invalid(code: &str, field: &str, message: impl Into<String>) -> ClientError {

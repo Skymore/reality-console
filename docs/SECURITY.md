@@ -238,20 +238,27 @@ a new node or a replacement. Replacement does not reuse the old node private key
 
 ### Session Tokens
 
-Human and device APIs use opaque, CSPRNG-generated bearer tokens only after asymmetric enrollment.
+Human and device APIs use opaque, cryptographically generated bearer tokens only after asymmetric enrollment.
 The database stores a keyed hash of each token, its scope, subject, audience, creation time,
 expiry, token-family ID, and revocation state. Tokens are never stored plaintext server-side.
 
 - Access tokens expire after at most 15 minutes.
 - Refresh tokens expire after at most 30 days, are bound to an enrolled device, and rotate on
   every use.
+- Native login and refresh writes require bounded idempotency keys. Connect persists a pending key
+  before network I/O; Control scopes it to the canonical login request or refresh family/source
+  generation and deterministically reconstructs the same response after loss without storing raw
+  tokens.
 - Reuse of an already rotated refresh token revokes the entire token family and raises an alert.
 - Tokens have an exact audience and narrow scopes; admin, node, device, relay, and update tokens
   are not interchangeable.
 - Browser-facing tokens use `Secure`, `HttpOnly`, and `SameSite=Strict` cookies with CSRF
   protection. Native clients store tokens only in the OS credential store, never web storage.
-- Logout revokes the current refresh-token family. Credential removal and account disablement
-  revoke all applicable families immediately.
+- Logout revokes the current refresh-token family. Account disable/delete blocks refresh
+  immediately and publishes cross-node removals. Administrative device revoke and password/session
+  reset also rotate every enabled per-node member credential so the lost device's cached bundle
+  converges to data-plane invalidity; Control reports pending convergence rather than claiming an
+  offline node changed immediately.
 
 ### Node Credentials
 
@@ -347,6 +354,12 @@ decryption or use, require their own `device_id`, enforce expiry and minimum cli
 persist the highest accepted generation. A lower or duplicate generation with different content
 is rejected as a rollback or equivocation attempt. Clock-skew handling is bounded and cannot turn
 an expired bundle into an indefinitely valid one.
+
+Member setup uses a canonical `pn-member-v1` bearer or `/join/connect#...` link. It binds the strict
+Control origin, network/account/activation IDs, controller instance and bundle signing key, and
+expires within one hour. The fragment is not sent in the HTTP request. Connect keeps the decoded
+secret behind a random process-local setup handle, persists pending device keys and nonce before
+consumption, and removes them only after device keys, refresh state, and installed trust are durable.
 
 QR codes and links carry only the short-lived enrollment material. They MUST NOT contain reusable
 VLESS UUIDs, REALITY private keys, administrator tokens, or long-lived plaintext bundles. Exporting

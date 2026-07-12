@@ -1,7 +1,7 @@
 use crate::auth::BootstrapTokenVerifier;
 use crate::db::{
-    AuthenticatedNode, Database, DatabaseError, NetworkRecord, NodeLifecycleAction,
-    NodeSummaryRecord, SCHEMA_VERSION,
+    AuthenticatedMember, AuthenticatedNode, Database, DatabaseError, NetworkRecord,
+    NodeLifecycleAction, NodeSummaryRecord, SCHEMA_VERSION,
 };
 use crate::desired::DesiredStateConfigurationDraft;
 use crate::error::{ApiError, REQUEST_ID_HEADER};
@@ -11,12 +11,16 @@ use axum::extract::{Extension, Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use control_protocol::account::{
-    AccountSummary, CreateAccountRequest, ReplaceAccountNodesRequest, SetAccountStatusRequest,
+    encode_member_setup_code, AccountSummary, ConsumeDeviceActivationRequest, CreateAccountRequest,
+    CreateDeviceActivationRequest, CreateDeviceSessionResponse, CreateSessionRequest,
+    RefreshSessionRequest, RefreshSessionResponse, ReplaceAccountNodesRequest,
+    ResetAccountSessionsResponse, SetAccountPasswordRequest, SetAccountStatusRequest,
+    SignedProfileBundle,
 };
-use control_protocol::id::{NodeId, Revision, Timestamp, UserId};
+use control_protocol::id::{DeviceId, NodeId, Revision, Timestamp, UserId};
 use control_protocol::idempotency::{IdempotencyKey, IDEMPOTENCY_KEY_HEADER};
 use control_protocol::node::{
     encode_node_setup_code, CreateNodeInvitationRequest, EnrollNodeRequest, EnrollNodeResponse,
@@ -74,6 +78,22 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/admin/accounts/{user_id}/status",
             put(set_account_status),
         )
+        .route(
+            "/v1/admin/accounts/{user_id}/device-activations",
+            post(create_device_activation),
+        )
+        .route(
+            "/v1/admin/accounts/{user_id}/password",
+            put(set_account_password),
+        )
+        .route(
+            "/v1/admin/accounts/{user_id}/session-reset",
+            post(reset_account_sessions),
+        )
+        .route(
+            "/v1/admin/devices/{device_id}/revoke",
+            post(revoke_member_device),
+        )
         .route("/v1/admin/node-invitations", post(create_node_invitation))
         .route("/v1/admin/nodes/{node_id}/approve", post(approve_node))
         .route("/v1/admin/nodes/{node_id}/disable", post(disable_node))
@@ -98,11 +118,25 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             authenticate_node,
         ));
+    let member_routes = Router::new()
+        .route("/v1/me/profile-bundle", get(get_profile_bundle))
+        .route("/v1/me/devices/{device_id}/session", delete(logout_member))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_member,
+        ));
 
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/nodes/enroll", post(enroll_node_v1))
         .route("/v2/nodes/enroll", post(enroll_node_v2))
+        .route(
+            "/v1/device-activations/consume",
+            post(consume_device_activation),
+        )
+        .route("/v1/sessions", post(create_member_session))
+        .route("/v1/sessions/refresh", post(refresh_member_session))
+        .merge(member_routes)
         .merge(authenticated_node_routes)
         .merge(admin_routes)
         .fallback(not_found)
@@ -167,6 +201,31 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &'static str) -> Result<&'a s
         return Err(());
     }
     value.to_str().map_err(|_| ())
+}
+
+async fn authenticate_member(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request_id(&request);
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let Some(token) = token else {
+        return ApiError::authentication_failed(request_id).into_response();
+    };
+    match state.database.authenticate_member(token).await {
+        Ok(member) => {
+            request.extensions_mut().insert(member);
+            next.run(request).await
+        }
+        Err(error) => database_api_error(error, request_id).into_response(),
+    }
 }
 
 async fn node_heartbeat(
@@ -362,10 +421,17 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::InvitationExpired => ApiError::invitation_expired(request_id),
         DatabaseError::InvitationConsumed => ApiError::invitation_consumed(request_id),
         DatabaseError::InvitationCancelled => ApiError::invitation_cancelled(request_id),
+        DatabaseError::ActivationInvalid => ApiError::activation_invalid(request_id),
+        DatabaseError::ActivationExpired => ApiError::activation_expired(request_id),
+        DatabaseError::ActivationConsumed => ApiError::activation_consumed(request_id),
         DatabaseError::InvalidEnrollmentProof | DatabaseError::InvalidNodeRequestSignature => {
             ApiError::signature_invalid(request_id)
         }
-        DatabaseError::NodeAuthenticationFailed => ApiError::authentication_failed(request_id),
+        DatabaseError::NodeAuthenticationFailed | DatabaseError::MemberAuthenticationFailed => {
+            ApiError::authentication_failed(request_id)
+        }
+        DatabaseError::AccountAuthenticationBlocked => ApiError::account_disabled(request_id),
+        DatabaseError::RefreshCredentialReused => ApiError::refresh_reuse(request_id),
         DatabaseError::NodeRevoked => ApiError::node_revoked(request_id),
         DatabaseError::NodeRequestClockSkew => ApiError::clock_skew(request_id),
         DatabaseError::NodeRequestNonceReplayed => ApiError::nonce_replayed(request_id),
@@ -379,10 +445,11 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         | DatabaseError::DesiredStatePublicationConflict { .. } => {
             ApiError::state_conflict(request_id)
         }
-        DatabaseError::NodeNotFound | DatabaseError::RevisionTargetNotFound => {
-            ApiError::not_found(request_id)
-        }
-        DatabaseError::AccountNotFound => ApiError::not_found(request_id),
+        DatabaseError::NodeNotFound
+        | DatabaseError::RevisionTargetNotFound
+        | DatabaseError::AccountNotFound
+        | DatabaseError::DeviceNotFound => ApiError::not_found(request_id),
+        DatabaseError::InvalidDeviceProof => ApiError::signature_invalid(request_id),
         DatabaseError::IdempotencyKeyConflict => ApiError::idempotency_key_conflict(request_id),
         DatabaseError::RevisionResultConflict => ApiError::invalid_state_transition(request_id),
         DatabaseError::NodeLifecycleConflict { .. }
@@ -454,6 +521,15 @@ struct AccountListResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeInvitationDeliveryResponse {
+    display_name: String,
+    expires_at: Timestamp,
+    setup_code: Secret<String>,
+    setup_link: Secret<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceActivationDeliveryResponse {
     display_name: String,
     expires_at: Timestamp,
     setup_code: Secret<String>,
@@ -661,6 +737,185 @@ async fn set_account_status(
     Ok(Json(account))
 }
 
+async fn create_device_activation(
+    State(state): State<AppState>,
+    Path(path_user_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(StatusCode, Json<DeviceActivationDeliveryResponse>), ApiError> {
+    let user_id = parse_user_id(&path_user_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
+    let request: CreateDeviceActivationRequest = parse_bounded_json(request, request_id).await?;
+    let activation = state
+        .database
+        .create_device_activation(
+            user_id,
+            request,
+            state.controller_origin.clone(),
+            idempotency_key,
+        )
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    let setup_code = encode_member_setup_code(&activation.activation).map_err(|error| {
+        tracing::error!(request_id = %request_id, error = %error, "failed to encode member setup code");
+        ApiError::internal(request_id)
+    })?;
+    let setup_link = Secret::new(format!(
+        "{}/join/connect#{}",
+        activation.activation.controller_origin,
+        setup_code.expose_secret()
+    ));
+    Ok((
+        StatusCode::CREATED,
+        Json(DeviceActivationDeliveryResponse {
+            display_name: activation.activation.display_name,
+            expires_at: activation.activation.expires_at,
+            setup_code,
+            setup_link,
+        }),
+    ))
+}
+
+async fn set_account_password(
+    State(state): State<AppState>,
+    Path(path_user_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<StatusCode, ApiError> {
+    let user_id = parse_user_id(&path_user_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    let request: SetAccountPasswordRequest = parse_bounded_json(request, request_id).await?;
+    state
+        .database
+        .set_account_password(user_id, request)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reset_account_sessions(
+    State(state): State<AppState>,
+    Path(path_user_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<ResetAccountSessionsResponse>, ApiError> {
+    let user_id = parse_user_id(&path_user_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    state
+        .database
+        .reset_account_sessions(user_id)
+        .await
+        .map(Json)
+        .map_err(|error| database_api_error(error, request_id))
+}
+
+async fn revoke_member_device(
+    State(state): State<AppState>,
+    Path(path_device_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<StatusCode, ApiError> {
+    let device_id =
+        parse_device_id(&path_device_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    state
+        .database
+        .revoke_member_device(device_id)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn consume_device_activation(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(StatusCode, Json<CreateDeviceSessionResponse>), ApiError> {
+    let request: ConsumeDeviceActivationRequest = parse_bounded_json(request, request_id).await?;
+    let response = state
+        .database
+        .consume_device_activation(request, state.controller_origin.clone())
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn create_member_session(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(StatusCode, Json<CreateDeviceSessionResponse>), ApiError> {
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
+    let request: CreateSessionRequest = parse_bounded_json(request, request_id).await?;
+    let response = state
+        .database
+        .create_member_session(request, state.controller_origin.clone(), idempotency_key)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn refresh_member_session(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<Json<RefreshSessionResponse>, ApiError> {
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
+    let request: RefreshSessionRequest = parse_bounded_json(request, request_id).await?;
+    state
+        .database
+        .refresh_member_session(request, idempotency_key)
+        .await
+        .map(Json)
+        .map_err(|error| database_api_error(error, request_id))
+}
+
+async fn get_profile_bundle(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(member): Extension<AuthenticatedMember>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let stored = state
+        .database
+        .member_profile_bundle(member)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|candidate| candidate.trim() == stored.etag)
+        })
+    {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&stored.etag).map_err(|_| ApiError::internal(request_id))?,
+        );
+        return Ok(response);
+    }
+    let mut response = Json::<SignedProfileBundle>(stored.bundle).into_response();
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&stored.etag).map_err(|_| ApiError::internal(request_id))?,
+    );
+    Ok(response)
+}
+
+async fn logout_member(
+    State(state): State<AppState>,
+    Path(path_device_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(member): Extension<AuthenticatedMember>,
+) -> Result<StatusCode, ApiError> {
+    let device_id =
+        parse_device_id(&path_device_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    state
+        .database
+        .logout_member(member, device_id)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn publish_desired_state(
     State(state): State<AppState>,
     Path(path_node_id): Path<String>,
@@ -767,6 +1022,14 @@ fn parse_user_id(value: &str) -> Option<UserId> {
         return None;
     }
     value.parse().ok()
+}
+
+fn parse_device_id(value: &str) -> Option<DeviceId> {
+    if value.len() != CANONICAL_UUID_LENGTH {
+        return None;
+    }
+    let parsed = DeviceId::from_str(value).ok()?;
+    (parsed.to_string() == value).then_some(parsed)
 }
 
 fn parse_idempotency_key(

@@ -8,12 +8,24 @@ use crate::identity::{set_owner_only, ControllerIdentity, IdentityError};
 use crate::probe::{
     ProbeSchedule, TcpProbeCompletion, TcpProbeJob, TcpProbeLoopOptions, TcpProbeResult,
 };
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use control_protocol::account::{
     AccountMetadata, AccountNodeAssignment, AccountNodeAssignmentStatus,
-    AccountNodeProvisioningState, AccountStatus, AccountSummary, CreateAccountRequest,
-    ReplaceAccountNodesRequest,
+    AccountNodeProvisioningState, AccountStatus, AccountSummary, ConsumeDeviceActivationRequest,
+    CreateAccountRequest, CreateDeviceActivationRequest, CreateDeviceSessionResponse,
+    CreateSessionRequest, DeviceEnrollment, EncryptedProfilePayload, MemberSetupActivation,
+    NodeProfile, ProfileBundleManifest, ProfileDescriptor, ProfileEndpoint,
+    RealityConnectionParameters, RefreshSessionRequest, RefreshSessionResponse,
+    ReplaceAccountNodesRequest, ResetAccountSessionsResponse, SelectionHints, SessionCredentials,
+    SetAccountPasswordRequest, SignedProfileBundle,
+};
+use control_protocol::account_crypto::{
+    device_activation_proof_transcript, device_login_proof_transcript, encrypt_profile,
+    encrypted_profile_digest, profile_bundle_signature_transcript, verify_device_activation_proof,
+    AccountCryptoError,
 };
 use control_protocol::crypto::{Ed25519PublicKey, Sha256Digest};
 use control_protocol::enrollment::{
@@ -21,8 +33,9 @@ use control_protocol::enrollment::{
     EnrollmentCryptoError, EnrollmentInvitation,
 };
 use control_protocol::id::{
-    AssignmentId, ControllerInstanceId, CredentialId, EndpointId, NetworkId, NodeId,
-    NodeInvitationId, NodeKeyId, Revision, SequenceNumber, SigningKeyId, Timestamp, UserId,
+    AssignmentId, BundleGeneration, BundleId, ControllerInstanceId, CredentialId,
+    DeviceActivationId, DeviceId, EndpointId, NetworkId, NodeId, NodeInvitationId, NodeKeyId,
+    Revision, SequenceNumber, SessionId, SigningKeyId, Timestamp, UserId,
 };
 use control_protocol::idempotency::IdempotencyKey;
 use control_protocol::node::{
@@ -53,7 +66,7 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
@@ -63,6 +76,15 @@ const CREATE_ACCOUNT_ROUTE_ID: &str = "v1.admin.accounts.create";
 const NODE_INVITATION_SECRET_DOMAIN: &[u8] = b"private-network/node-invitation-secret/v1\0";
 const HTTP_CREATED_STATUS: i64 = 201;
 const NODE_REQUEST_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+const ACTIVATION_SECRET_DOMAIN: &[u8] = b"private-network/device-activation-secret/v1\0";
+const ACCESS_TOKEN_DOMAIN: &[u8] = b"private-network/member-access-token/v1\0";
+const REFRESH_TOKEN_DOMAIN: &[u8] = b"private-network/member-refresh-token/v1\0";
+const LOGIN_REQUEST_DOMAIN: &[u8] = b"private-network/member-login-request/v1\0";
+const REFRESH_REQUEST_DOMAIN: &[u8] = b"private-network/member-refresh-request/v1\0";
+const ACCESS_TOKEN_LIFETIME_SECONDS: i64 = 15 * 60;
+const REFRESH_TOKEN_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
+const BUNDLE_REFRESH_SECONDS: i64 = 6 * 60 * 60;
+const BUNDLE_OFFLINE_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 const MIGRATION_1_SQL: &str = r"
 CREATE TABLE networks (
@@ -861,6 +883,178 @@ CREATE UNIQUE INDEX nodes_reality_public_key_unique
     ON nodes(reality_public_key) WHERE reality_public_key IS NOT NULL;
 ";
 
+const MIGRATION_12_SQL: &str = r"
+ALTER TABLE users ADD COLUMN password_verifier TEXT
+    CHECK(password_verifier IS NULL OR length(password_verifier) BETWEEN 40 AND 512);
+ALTER TABLE users ADD COLUMN password_updated_at INTEGER;
+
+CREATE TABLE device_activations (
+    network_id TEXT NOT NULL,
+    activation_id TEXT NOT NULL CHECK(length(activation_id) = 36),
+    user_id TEXT NOT NULL,
+    account_display_name TEXT NOT NULL CHECK(length(account_display_name) BETWEEN 1 AND 128),
+    controller_origin TEXT NOT NULL CHECK(length(controller_origin) BETWEEN 1 AND 2048),
+    controller_instance_id TEXT NOT NULL CHECK(length(controller_instance_id) = 36),
+    bundle_signing_public_key TEXT NOT NULL CHECK(length(bundle_signing_public_key) = 43),
+    secret_verifier BLOB NOT NULL CHECK(length(secret_verifier) = 32),
+    idempotency_key_sha256 BLOB NOT NULL CHECK(length(idempotency_key_sha256) = 32),
+    request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    consumed_by_device_id TEXT,
+    consume_request_sha256 BLOB CHECK(
+        consume_request_sha256 IS NULL OR length(consume_request_sha256) = 32
+    ),
+    issued_session_id TEXT,
+    response_account_json TEXT CHECK(
+        response_account_json IS NULL OR (json_valid(response_account_json)
+            AND length(response_account_json) BETWEEN 2 AND 2048)
+    ),
+    created_by_admin_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, activation_id),
+    UNIQUE(network_id, secret_verifier),
+    UNIQUE(network_id, user_id, idempotency_key_sha256),
+    CHECK(expires_at > created_at),
+    CHECK(
+        (consumed_at IS NULL AND consumed_by_device_id IS NULL
+            AND consume_request_sha256 IS NULL AND issued_session_id IS NULL
+            AND response_account_json IS NULL)
+        OR (consumed_at IS NOT NULL AND consumed_by_device_id IS NOT NULL
+            AND consume_request_sha256 IS NOT NULL AND issued_session_id IS NOT NULL
+            AND response_account_json IS NOT NULL)
+    ),
+    FOREIGN KEY(network_id, user_id) REFERENCES users(network_id, user_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE devices (
+    network_id TEXT NOT NULL,
+    device_id TEXT NOT NULL CHECK(length(device_id) = 36),
+    user_id TEXT NOT NULL,
+    display_name TEXT NOT NULL CHECK(length(display_name) BETWEEN 1 AND 128),
+    platform TEXT NOT NULL CHECK(length(platform) BETWEEN 1 AND 64),
+    client_version TEXT NOT NULL CHECK(length(client_version) BETWEEN 1 AND 64),
+    identity_public_key TEXT NOT NULL CHECK(length(identity_public_key) = 43),
+    encryption_public_key TEXT NOT NULL CHECK(length(encryption_public_key) = 43),
+    status TEXT NOT NULL CHECK(status IN ('active', 'revoked', 'deleted')),
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    deleted_at INTEGER,
+    PRIMARY KEY(network_id, device_id),
+    UNIQUE(network_id, identity_public_key),
+    UNIQUE(network_id, encryption_public_key),
+    UNIQUE(network_id, device_id, user_id),
+    CHECK(last_seen_at >= created_at),
+    CHECK(
+        (status = 'active' AND revoked_at IS NULL AND deleted_at IS NULL)
+        OR (status = 'revoked' AND revoked_at IS NOT NULL AND deleted_at IS NULL)
+        OR (status = 'deleted' AND deleted_at IS NOT NULL)
+    ),
+    FOREIGN KEY(network_id, user_id) REFERENCES users(network_id, user_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE refresh_sessions (
+    network_id TEXT NOT NULL,
+    session_id TEXT NOT NULL CHECK(length(session_id) = 36),
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    current_refresh_verifier BLOB NOT NULL CHECK(length(current_refresh_verifier) = 32),
+    previous_refresh_verifier BLOB CHECK(
+        previous_refresh_verifier IS NULL OR length(previous_refresh_verifier) = 32
+    ),
+    current_access_verifier BLOB NOT NULL CHECK(length(current_access_verifier) = 32),
+    access_expires_at INTEGER NOT NULL,
+    credential_version INTEGER NOT NULL CHECK(credential_version > 0),
+    created_at INTEGER NOT NULL,
+    rotated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    revoked_at INTEGER,
+    revoke_reason TEXT CHECK(revoke_reason IS NULL OR length(revoke_reason) BETWEEN 1 AND 64),
+    PRIMARY KEY(network_id, session_id),
+    UNIQUE(network_id, current_refresh_verifier),
+    UNIQUE(network_id, current_access_verifier),
+    CHECK(access_expires_at > rotated_at AND expires_at > access_expires_at),
+    CHECK((revoked_at IS NULL AND revoke_reason IS NULL)
+        OR (revoked_at IS NOT NULL AND revoke_reason IS NOT NULL)),
+    FOREIGN KEY(network_id, device_id, user_id)
+        REFERENCES devices(network_id, device_id, user_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE login_idempotency_records (
+    network_id TEXT NOT NULL,
+    idempotency_key_sha256 BLOB NOT NULL CHECK(length(idempotency_key_sha256) = 32),
+    request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    response_account_json TEXT NOT NULL CHECK(
+        json_valid(response_account_json) AND length(response_account_json) BETWEEN 2 AND 2048
+    ),
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, idempotency_key_sha256),
+    CHECK(expires_at > created_at),
+    FOREIGN KEY(network_id, device_id, user_id)
+        REFERENCES devices(network_id, device_id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY(network_id, session_id)
+        REFERENCES refresh_sessions(network_id, session_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE refresh_idempotency_records (
+    network_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    source_generation INTEGER NOT NULL CHECK(source_generation >= 0),
+    idempotency_key_sha256 BLOB NOT NULL CHECK(length(idempotency_key_sha256) = 32),
+    request_sha256 BLOB NOT NULL CHECK(length(request_sha256) = 32),
+    response_account_json TEXT NOT NULL CHECK(
+        json_valid(response_account_json) AND length(response_account_json) BETWEEN 2 AND 2048
+    ),
+    issued_at INTEGER NOT NULL,
+    access_expires_at INTEGER NOT NULL,
+    refresh_expires_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, session_id, source_generation, idempotency_key_sha256),
+    CHECK(issued_at < access_expires_at AND access_expires_at < refresh_expires_at),
+    FOREIGN KEY(network_id, session_id)
+        REFERENCES refresh_sessions(network_id, session_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE profile_bundles (
+    network_id TEXT NOT NULL,
+    bundle_id TEXT NOT NULL CHECK(length(bundle_id) = 36),
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    source_sha256 BLOB NOT NULL CHECK(length(source_sha256) = 32),
+    artifact_json TEXT NOT NULL CHECK(json_valid(artifact_json) AND length(artifact_json) <= 1048576),
+    artifact_sha256 BLOB NOT NULL CHECK(length(artifact_sha256) = 32),
+    signature TEXT NOT NULL CHECK(length(signature) = 86),
+    etag TEXT NOT NULL CHECK(length(etag) BETWEEN 10 AND 96),
+    issued_at INTEGER NOT NULL,
+    refresh_after INTEGER NOT NULL,
+    offline_expires_at INTEGER NOT NULL,
+    superseded_at INTEGER,
+    PRIMARY KEY(network_id, bundle_id),
+    UNIQUE(network_id, device_id, generation),
+    UNIQUE(network_id, etag),
+    CHECK(issued_at < refresh_after AND refresh_after < offline_expires_at),
+    FOREIGN KEY(network_id, device_id, user_id)
+        REFERENCES devices(network_id, device_id, user_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX device_activations_expiry ON device_activations(network_id, expires_at)
+    WHERE consumed_at IS NULL;
+CREATE INDEX refresh_sessions_refresh_lookup
+    ON refresh_sessions(network_id, current_refresh_verifier, previous_refresh_verifier);
+CREATE INDEX login_idempotency_expiry
+    ON login_idempotency_records(network_id, expires_at);
+CREATE INDEX refresh_idempotency_expiry
+    ON refresh_idempotency_records(network_id, refresh_expires_at);
+CREATE INDEX profile_bundles_current_device
+    ON profile_bundles(network_id, device_id, generation DESC) WHERE superseded_at IS NULL;
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -923,6 +1117,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "one_action_node_bootstrap",
         sql: MIGRATION_11_SQL,
     },
+    Migration {
+        version: 12,
+        name: "member_devices_sessions_and_bundles",
+        sql: MIGRATION_12_SQL,
+    },
 ];
 
 #[derive(Clone)]
@@ -947,6 +1146,12 @@ pub struct NetworkRecord {
     pub updated_at: i64,
 }
 
+/// Complete activation delivery material used internally to build a setup code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceActivationDelivery {
+    pub activation: MemberSetupActivation,
+}
+
 /// Enrollment response plus whether this request created the durable node.
 pub struct NodeEnrollmentResult {
     pub response: EnrollNodeResponse,
@@ -962,6 +1167,20 @@ pub(crate) struct DesiredStateReconcileResult {
 pub struct AuthenticatedNode {
     pub node_id: NodeId,
     pub key_id: NodeKeyId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedMember {
+    pub network_id: NetworkId,
+    pub user_id: UserId,
+    pub device_id: DeviceId,
+    pub session_id: SessionId,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredProfileBundle {
+    pub bundle: SignedProfileBundle,
+    pub etag: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1106,6 +1325,224 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
             create_account(&mut guard.connection, &request, &idempotency_key)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Creates or exactly replays one short-lived device activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid lifecycle, idempotency conflict, clock, or storage failure.
+    pub async fn create_device_activation(
+        &self,
+        user_id: UserId,
+        request: CreateDeviceActivationRequest,
+        controller_origin: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<DeviceActivationDelivery, DatabaseError> {
+        request.validate()?;
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            create_device_activation(
+                &mut guard.connection,
+                &identity,
+                user_id,
+                &request,
+                &controller_origin,
+                &idempotency_key,
+            )
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Sets or resets the optional Argon2id account password and revokes sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid password, account lifecycle, hashing, or storage failure.
+    pub async fn set_account_password(
+        &self,
+        user_id: UserId,
+        request: SetAccountPasswordRequest,
+    ) -> Result<(), DatabaseError> {
+        request.validate()?;
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            set_account_password(&mut guard.connection, &identity, user_id, &request)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Revokes all devices and sessions so the account must be activated again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the account is unavailable or the transaction cannot commit.
+    pub async fn reset_account_sessions(
+        &self,
+        user_id: UserId,
+    ) -> Result<ResetAccountSessionsResponse, DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            reset_account_sessions(&mut guard.connection, &identity, user_id)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Consumes or exactly replays one activation-bound device session response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid, expired, consumed, or incorrectly signed activation.
+    pub async fn consume_device_activation(
+        &self,
+        request: ConsumeDeviceActivationRequest,
+        controller_origin: String,
+    ) -> Result<CreateDeviceSessionResponse, DatabaseError> {
+        request.validate()?;
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            consume_device_activation(
+                &mut guard.connection,
+                &identity,
+                &controller_origin,
+                &request,
+            )
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Authenticates the optional password and enrolls a proof-bound device.
+    ///
+    /// # Errors
+    ///
+    /// Returns a generic authentication error or a proof, clock, or storage error.
+    pub async fn create_member_session(
+        &self,
+        request: CreateSessionRequest,
+        controller_origin: String,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<CreateDeviceSessionResponse, DatabaseError> {
+        request.validate()?;
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            create_member_session(
+                &mut guard.connection,
+                &identity,
+                &controller_origin,
+                &request,
+                &idempotency_key,
+            )
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Rotates one refresh family and issues a replacement short access token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authentication error, or a reuse error after durably revoking the family.
+    pub async fn refresh_member_session(
+        &self,
+        request: RefreshSessionRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<RefreshSessionResponse, DatabaseError> {
+        request.validate()?;
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            refresh_member_session(&mut guard.connection, &identity, &request, &idempotency_key)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Authenticates a short-lived member bearer token against all lifecycle gates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authentication error for any failed token, account, device, or session gate.
+    pub async fn authenticate_member(
+        &self,
+        access_token: String,
+    ) -> Result<AuthenticatedMember, DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            authenticate_member(&mut guard.connection, &identity, &access_token)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Revokes the authenticated device's refresh family and current access token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authentication error for a different device or a durable storage error.
+    pub async fn logout_member(
+        &self,
+        member: AuthenticatedMember,
+        path_device_id: DeviceId,
+    ) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            revoke_member_session(&mut guard.connection, member, path_device_id, "logout")
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Administratively revokes a device and all of its session families.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device is unknown or the transaction cannot commit.
+    pub async fn revoke_member_device(&self, device_id: DeviceId) -> Result<(), DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            revoke_member_device(&mut guard.connection, &identity, device_id)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Loads or atomically publishes the current signed and device-encrypted bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for failed authorization, evidence, cryptography, or durable storage.
+    pub async fn member_profile_bundle(
+        &self,
+        member: AuthenticatedMember,
+    ) -> Result<StoredProfileBundle, DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            member_profile_bundle(&mut guard.connection, &identity, member)
         })
         .await
         .map_err(DatabaseError::Worker)?
@@ -4110,6 +4547,1706 @@ fn derive_node_onboarding_state(
     Ok(state.to_string())
 }
 
+#[allow(clippy::too_many_lines)]
+fn create_device_activation(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    user_id: UserId,
+    request: &CreateDeviceActivationRequest,
+    controller_origin: &str,
+    idempotency_key: &IdempotencyKey,
+) -> Result<DeviceActivationDelivery, DatabaseError> {
+    let now = unix_timestamp()?;
+    let expires_at = now
+        .checked_add(i64::from(request.expires_in_seconds))
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let key_digest: [u8; 32] = Sha256::digest(idempotency_key.as_str().as_bytes()).into();
+    let request_digest: [u8; 32] = Sha256::digest(serde_json::to_vec(request)?).into();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    if let Some(stored) = transaction
+        .query_row(
+            "SELECT activation_id, request_sha256, expires_at, secret_verifier,
+                    account_display_name, controller_origin, controller_instance_id,
+                    bundle_signing_public_key
+             FROM device_activations
+             WHERE network_id = ?1 AND user_id = ?2 AND idempotency_key_sha256 = ?3",
+            params![
+                network.network_id,
+                user_id.to_string(),
+                key_digest.as_slice()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        if stored.1.as_slice() != request_digest {
+            return Err(DatabaseError::IdempotencyKeyConflict);
+        }
+        let activation_id = stored
+            .0
+            .parse::<DeviceActivationId>()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        let secret = derive_activation_secret(
+            identity,
+            &network.network_id,
+            user_id,
+            activation_id,
+            &key_digest,
+            &request_digest,
+        )?;
+        if credential_verifier(identity, ACTIVATION_SECRET_DOMAIN, secret.as_bytes())?.as_slice()
+            != stored.3
+        {
+            return Err(DatabaseError::StoredProtocolValue);
+        }
+        transaction.commit()?;
+        return build_device_activation_delivery(
+            &network.network_id,
+            user_id,
+            activation_id,
+            stored.2,
+            secret,
+            stored.4,
+            stored.5,
+            &stored.6,
+            &stored.7,
+        );
+    }
+
+    let (account_display_name, account_status) = transaction
+        .query_row(
+            "SELECT display_name, status FROM users WHERE network_id = ?1 AND user_id = ?2",
+            params![network.network_id, user_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or(DatabaseError::AccountNotFound)?;
+    if account_status != "active" {
+        return Err(DatabaseError::AccountAuthenticationBlocked);
+    }
+
+    let activation_id = DeviceActivationId::new();
+    let secret = derive_activation_secret(
+        identity,
+        &network.network_id,
+        user_id,
+        activation_id,
+        &key_digest,
+        &request_digest,
+    )?;
+    let verifier = credential_verifier(identity, ACTIVATION_SECRET_DOMAIN, secret.as_bytes())?;
+    let controller_instance_id = network.controller_epoch.clone();
+    let bundle_signing_public_key = identity.public_key().as_str().to_string();
+    transaction.execute(
+        "INSERT INTO device_activations(
+            network_id, activation_id, user_id, account_display_name, controller_origin,
+            controller_instance_id, bundle_signing_public_key, secret_verifier,
+            idempotency_key_sha256, request_sha256, expires_at, created_by_admin_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            network.network_id,
+            activation_id.to_string(),
+            user_id.to_string(),
+            account_display_name,
+            controller_origin,
+            controller_instance_id,
+            bundle_signing_public_key,
+            verifier.as_slice(),
+            key_digest.as_slice(),
+            request_digest.as_slice(),
+            expires_at,
+            BOOTSTRAP_ADMIN_PRINCIPAL,
+            now,
+        ],
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "admin",
+        None,
+        "device-activation.created",
+        "device-activation",
+        Some(&activation_id.to_string()),
+        "success",
+        &serde_json::json!({"userId": user_id, "expiresAt": timestamp(expires_at)?}),
+        now,
+    )?;
+    transaction.commit()?;
+    build_device_activation_delivery(
+        &network.network_id,
+        user_id,
+        activation_id,
+        expires_at,
+        secret,
+        account_display_name,
+        controller_origin.to_string(),
+        &controller_instance_id,
+        &bundle_signing_public_key,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_device_activation_delivery(
+    network_id: &str,
+    user_id: UserId,
+    activation_id: DeviceActivationId,
+    expires_at: i64,
+    activation_secret: String,
+    display_name: String,
+    controller_origin: String,
+    controller_instance_id: &str,
+    bundle_signing_public_key: &str,
+) -> Result<DeviceActivationDelivery, DatabaseError> {
+    Ok(DeviceActivationDelivery {
+        activation: MemberSetupActivation {
+            display_name,
+            network_id: network_id
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            user_id,
+            activation_id,
+            expires_at: timestamp(expires_at)?,
+            activation_secret: Secret::new(activation_secret),
+            controller_origin,
+            controller_instance_id: controller_instance_id
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            bundle_signing_public_key: bundle_signing_public_key
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        },
+    })
+}
+
+fn derive_activation_secret(
+    identity: &ControllerIdentity,
+    network_id: &str,
+    user_id: UserId,
+    activation_id: DeviceActivationId,
+    key_digest: &[u8; 32],
+    request_digest: &[u8; 32],
+) -> Result<String, DatabaseError> {
+    let mut context = Vec::new();
+    context.extend_from_slice(network_id.as_bytes());
+    context.extend_from_slice(user_id.to_string().as_bytes());
+    context.extend_from_slice(activation_id.to_string().as_bytes());
+    context.extend_from_slice(key_digest);
+    context.extend_from_slice(request_digest);
+    Ok(format!(
+        "rcd1.{activation_id}.{}",
+        derive_secret(identity, ACTIVATION_SECRET_DOMAIN, &context)?
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+fn consume_device_activation(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    controller_origin: &str,
+    request: &ConsumeDeviceActivationRequest,
+) -> Result<CreateDeviceSessionResponse, DatabaseError> {
+    let raw_secret = request.activation_secret.expose_secret();
+    let activation_id = parse_prefixed_id::<DeviceActivationId>(raw_secret, "rcd1")?;
+    let verifier = credential_verifier(identity, ACTIVATION_SECRET_DOMAIN, raw_secret.as_bytes())?;
+    let request_digest: [u8; 32] = Sha256::digest(serde_json::to_vec(request)?).into();
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let activation = transaction
+        .query_row(
+            "SELECT user_id, secret_verifier, expires_at, consumed_at,
+                    consumed_by_device_id, consume_request_sha256, issued_session_id,
+                    response_account_json
+             FROM device_activations WHERE network_id = ?1 AND activation_id = ?2",
+            params![network.network_id, activation_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ActivationInvalid)?;
+    if !bool::from(activation.1.as_slice().ct_eq(verifier.as_slice())) {
+        return Err(DatabaseError::ActivationInvalid);
+    }
+    if activation.2 < now && activation.3.is_none() {
+        return Err(DatabaseError::ActivationExpired);
+    }
+    let user_id = activation
+        .0
+        .parse::<UserId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let transcript = device_activation_proof_transcript(
+        activation_id,
+        timestamp(activation.2)?,
+        controller_origin,
+        &request.device,
+    )?;
+    verify_device_activation_proof(&request.device, &transcript)
+        .map_err(|_| DatabaseError::InvalidDeviceProof)?;
+
+    if activation.3.is_some() {
+        if activation.5.as_deref() != Some(request_digest.as_slice()) {
+            return Err(DatabaseError::ActivationConsumed);
+        }
+        let device_id = activation
+            .4
+            .ok_or(DatabaseError::StoredProtocolValue)?
+            .parse::<DeviceId>()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        let session_id = activation
+            .6
+            .ok_or(DatabaseError::StoredProtocolValue)?
+            .parse::<SessionId>()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        let account = serde_json::from_str(
+            activation
+                .7
+                .as_deref()
+                .ok_or(DatabaseError::StoredProtocolValue)?,
+        )?;
+        let response = replay_initial_session(
+            &transaction,
+            identity,
+            &network.network_id,
+            user_id,
+            device_id,
+            session_id,
+            Some(activation_id),
+            &request_digest,
+            account,
+        )?;
+        transaction.commit()?;
+        return Ok(response);
+    }
+    if load_account_status(&transaction, &network.network_id, user_id)? != "active" {
+        return Err(DatabaseError::AccountAuthenticationBlocked);
+    }
+    let device_id = DeviceId::new();
+    let session_id = SessionId::new();
+    insert_device(
+        &transaction,
+        &network.network_id,
+        user_id,
+        device_id,
+        &request.device,
+        now,
+    )?;
+    let response = issue_initial_session(
+        &transaction,
+        identity,
+        &network.network_id,
+        user_id,
+        device_id,
+        session_id,
+        Some(activation_id),
+        &request_digest,
+        now,
+    )?;
+    let response_account_json = serde_json::to_string(&response.account)?;
+    transaction.execute(
+        "UPDATE device_activations
+         SET consumed_at = ?1, consumed_by_device_id = ?2,
+             consume_request_sha256 = ?3, issued_session_id = ?4,
+             response_account_json = ?5
+         WHERE network_id = ?6 AND activation_id = ?7 AND consumed_at IS NULL",
+        params![
+            now,
+            device_id.to_string(),
+            request_digest.as_slice(),
+            session_id.to_string(),
+            response_account_json,
+            network.network_id,
+            activation_id.to_string(),
+        ],
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "device",
+        Some(&device_id.to_string()),
+        "device-activation.consumed",
+        "account",
+        Some(&user_id.to_string()),
+        "success",
+        &serde_json::json!({"activationId": activation_id, "sessionId": session_id}),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(response)
+}
+
+fn set_account_password(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    user_id: UserId,
+    request: &SetAccountPasswordRequest,
+) -> Result<(), DatabaseError> {
+    let salt = SaltString::generate(&mut OsRng);
+    let verifier = Argon2::default()
+        .hash_password(request.new_password.expose_secret().as_bytes(), &salt)
+        .map_err(|_| DatabaseError::PasswordHash)?
+        .to_string();
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut network = load_network(&transaction)?;
+    if load_account_status(&transaction, &network.network_id, user_id)? == "deleted" {
+        return Err(DatabaseError::AccountAuthenticationBlocked);
+    }
+    transaction.execute(
+        "UPDATE users SET password_verifier = ?1, password_updated_at = ?2,
+             credential_version = credential_version + 1, updated_at = ?2
+         WHERE network_id = ?3 AND user_id = ?4",
+        params![verifier, now, network.network_id, user_id.to_string()],
+    )?;
+    revoke_user_sessions(
+        &transaction,
+        &network.network_id,
+        user_id,
+        now,
+        "password-reset",
+    )?;
+    let affected_nodes =
+        rotate_account_credentials(&transaction, &network.network_id, user_id, now)?;
+    let revisions = publish_account_revisions(
+        &transaction,
+        identity,
+        &mut network,
+        &affected_nodes,
+        "account-password-reset",
+        now,
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "admin",
+        None,
+        "account.password-reset",
+        "account",
+        Some(&user_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "publishedRevisions": revision_audit_details(&revisions),
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn reset_account_sessions(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    user_id: UserId,
+) -> Result<ResetAccountSessionsResponse, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut network = load_network(&transaction)?;
+    if load_account_status(&transaction, &network.network_id, user_id)? == "deleted" {
+        return Err(DatabaseError::AccountAuthenticationBlocked);
+    }
+    transaction.execute(
+        "UPDATE users SET credential_version = credential_version + 1, updated_at = ?1
+         WHERE network_id = ?2 AND user_id = ?3",
+        params![now, network.network_id, user_id.to_string()],
+    )?;
+    let revoked_sessions = revoke_user_sessions(
+        &transaction,
+        &network.network_id,
+        user_id,
+        now,
+        "account-session-reset",
+    )?;
+    let revoked_devices = transaction.execute(
+        "UPDATE devices SET status = 'revoked', revoked_at = ?1
+         WHERE network_id = ?2 AND user_id = ?3 AND status = 'active'",
+        params![now, network.network_id, user_id.to_string()],
+    )?;
+    let affected_nodes =
+        rotate_account_credentials(&transaction, &network.network_id, user_id, now)?;
+    let revisions = publish_account_revisions(
+        &transaction,
+        identity,
+        &mut network,
+        &affected_nodes,
+        "account-session-reset",
+        now,
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "admin",
+        None,
+        "account.sessions-reset",
+        "account",
+        Some(&user_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "revokedDevices": revoked_devices,
+            "revokedSessions": revoked_sessions,
+            "publishedRevisions": revision_audit_details(&revisions),
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(ResetAccountSessionsResponse {
+        user_id,
+        revoked_sessions: u32::try_from(revoked_sessions)
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        revoked_devices: u32::try_from(revoked_devices)
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+    })
+}
+
+fn create_member_session(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    controller_origin: &str,
+    request: &CreateSessionRequest,
+    idempotency_key: &IdempotencyKey,
+) -> Result<CreateDeviceSessionResponse, DatabaseError> {
+    let user_id = request
+        .account
+        .parse::<UserId>()
+        .map_err(|_| DatabaseError::MemberAuthenticationFailed)?;
+    let key_digest: [u8; 32] = Sha256::digest(idempotency_key.as_str().as_bytes()).into();
+    let request_digest = canonical_request_digest(LOGIN_REQUEST_DOMAIN, request)?;
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    if let Some(response) = replay_member_login(
+        &transaction,
+        identity,
+        &network.network_id,
+        &key_digest,
+        &request_digest,
+    )? {
+        transaction.commit()?;
+        return Ok(response);
+    }
+    let stored = transaction
+        .query_row(
+            "SELECT password_verifier, status FROM users
+             WHERE network_id = ?1 AND user_id = ?2",
+            params![network.network_id, user_id.to_string()],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+        .ok_or(DatabaseError::MemberAuthenticationFailed)?;
+    if stored.1 != "active" {
+        return Err(DatabaseError::MemberAuthenticationFailed);
+    }
+    let verifier = stored.0.ok_or(DatabaseError::MemberAuthenticationFailed)?;
+    let parsed = PasswordHash::new(&verifier).map_err(|_| DatabaseError::StoredProtocolValue)?;
+    Argon2::default()
+        .verify_password(request.password.expose_secret().as_bytes(), &parsed)
+        .map_err(|_| DatabaseError::MemberAuthenticationFailed)?;
+    let transcript =
+        device_login_proof_transcript(&request.account, controller_origin, &request.device)?;
+    verify_device_activation_proof(&request.device, &transcript)
+        .map_err(|_| DatabaseError::InvalidDeviceProof)?;
+
+    let device_id = DeviceId::new();
+    let session_id = SessionId::new();
+    insert_device(
+        &transaction,
+        &network.network_id,
+        user_id,
+        device_id,
+        &request.device,
+        now,
+    )?;
+    let response = issue_initial_session(
+        &transaction,
+        identity,
+        &network.network_id,
+        user_id,
+        device_id,
+        session_id,
+        None,
+        &request_digest,
+        now,
+    )?;
+    transaction.execute(
+        "INSERT INTO login_idempotency_records(
+            network_id, idempotency_key_sha256, request_sha256, user_id,
+            device_id, session_id, response_account_json, created_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            network.network_id,
+            key_digest.as_slice(),
+            request_digest.as_slice(),
+            user_id.to_string(),
+            device_id.to_string(),
+            session_id.to_string(),
+            serde_json::to_string(&response.account)?,
+            now,
+            now.checked_add(REFRESH_TOKEN_LIFETIME_SECONDS)
+                .ok_or(DatabaseError::TimestampOverflow)?,
+        ],
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "device",
+        Some(&device_id.to_string()),
+        "session.password-created",
+        "account",
+        Some(&user_id.to_string()),
+        "success",
+        &serde_json::json!({"sessionId": session_id}),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(response)
+}
+
+fn replay_member_login(
+    transaction: &rusqlite::Transaction<'_>,
+    identity: &ControllerIdentity,
+    network_id: &str,
+    key_digest: &[u8; 32],
+    request_digest: &[u8; 32],
+) -> Result<Option<CreateDeviceSessionResponse>, DatabaseError> {
+    let replay = transaction
+        .query_row(
+            "SELECT request_sha256, user_id, device_id, session_id, response_account_json
+             FROM login_idempotency_records
+             WHERE network_id = ?1 AND idempotency_key_sha256 = ?2",
+            params![network_id, key_digest.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(replay) = replay else {
+        return Ok(None);
+    };
+    if replay.0.as_slice() != request_digest {
+        return Err(DatabaseError::IdempotencyKeyConflict);
+    }
+    let user_id = replay
+        .1
+        .parse::<UserId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let device_id = replay
+        .2
+        .parse::<DeviceId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let session_id = replay
+        .3
+        .parse::<SessionId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let account = serde_json::from_str(&replay.4)?;
+    replay_initial_session(
+        transaction,
+        identity,
+        network_id,
+        user_id,
+        device_id,
+        session_id,
+        None,
+        request_digest,
+        account,
+    )
+    .map(Some)
+}
+
+fn insert_device(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+    device_id: DeviceId,
+    enrollment: &DeviceEnrollment,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    connection.execute(
+        "INSERT INTO devices(
+            network_id, device_id, user_id, display_name, platform, client_version,
+            identity_public_key, encryption_public_key, status, created_at, last_seen_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9)",
+        params![
+            network_id,
+            device_id.to_string(),
+            user_id.to_string(),
+            enrollment.display_name,
+            enrollment.platform,
+            enrollment.client_version,
+            enrollment.identity_public_key.as_str(),
+            enrollment.encryption_public_key.as_str(),
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issue_initial_session(
+    connection: &Connection,
+    identity: &ControllerIdentity,
+    network_id: &str,
+    user_id: UserId,
+    device_id: DeviceId,
+    session_id: SessionId,
+    activation_id: Option<DeviceActivationId>,
+    request_digest: &[u8; 32],
+    now: i64,
+) -> Result<CreateDeviceSessionResponse, DatabaseError> {
+    let access_expires_at = now
+        .checked_add(ACCESS_TOKEN_LIFETIME_SECONDS)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let refresh_expires_at = now
+        .checked_add(REFRESH_TOKEN_LIFETIME_SECONDS)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let credentials = derive_initial_credentials(
+        identity,
+        network_id,
+        session_id,
+        device_id,
+        activation_id,
+        request_digest,
+        now,
+        access_expires_at,
+        refresh_expires_at,
+    )?;
+    let access_verifier = credential_verifier(
+        identity,
+        ACCESS_TOKEN_DOMAIN,
+        credentials.access_token.expose_secret().as_bytes(),
+    )?;
+    let refresh_verifier = credential_verifier(
+        identity,
+        REFRESH_TOKEN_DOMAIN,
+        credentials.refresh_credential.expose_secret().as_bytes(),
+    )?;
+    let credential_version: i64 = connection.query_row(
+        "SELECT credential_version FROM users WHERE network_id = ?1 AND user_id = ?2",
+        params![network_id, user_id.to_string()],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        "INSERT INTO refresh_sessions(
+            network_id, session_id, user_id, device_id, generation,
+            current_refresh_verifier, current_access_verifier, access_expires_at,
+            credential_version, created_at, rotated_at, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
+        params![
+            network_id,
+            session_id.to_string(),
+            user_id.to_string(),
+            device_id.to_string(),
+            refresh_verifier.as_slice(),
+            access_verifier.as_slice(),
+            access_expires_at,
+            credential_version,
+            now,
+            refresh_expires_at,
+        ],
+    )?;
+    Ok(CreateDeviceSessionResponse {
+        activation_id,
+        account: load_account_metadata(connection, network_id, user_id)?,
+        device_id,
+        credentials,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replay_initial_session(
+    connection: &Connection,
+    identity: &ControllerIdentity,
+    network_id: &str,
+    user_id: UserId,
+    device_id: DeviceId,
+    session_id: SessionId,
+    activation_id: Option<DeviceActivationId>,
+    request_digest: &[u8; 32],
+    account: AccountMetadata,
+) -> Result<CreateDeviceSessionResponse, DatabaseError> {
+    let stored = connection.query_row(
+        "SELECT created_at, expires_at FROM refresh_sessions
+         WHERE network_id = ?1 AND session_id = ?2 AND user_id = ?3 AND device_id = ?4",
+        params![
+            network_id,
+            session_id.to_string(),
+            user_id.to_string(),
+            device_id.to_string(),
+        ],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    Ok(CreateDeviceSessionResponse {
+        activation_id,
+        account,
+        device_id,
+        credentials: derive_initial_credentials(
+            identity,
+            network_id,
+            session_id,
+            device_id,
+            activation_id,
+            request_digest,
+            stored.0,
+            stored
+                .0
+                .checked_add(ACCESS_TOKEN_LIFETIME_SECONDS)
+                .ok_or(DatabaseError::TimestampOverflow)?,
+            stored.1,
+        )?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_initial_credentials(
+    identity: &ControllerIdentity,
+    network_id: &str,
+    session_id: SessionId,
+    device_id: DeviceId,
+    activation_id: Option<DeviceActivationId>,
+    request_digest: &[u8; 32],
+    issued_at: i64,
+    access_expires_at: i64,
+    refresh_expires_at: i64,
+) -> Result<SessionCredentials, DatabaseError> {
+    let mut context = Vec::new();
+    context.extend_from_slice(network_id.as_bytes());
+    context.extend_from_slice(session_id.to_string().as_bytes());
+    context.extend_from_slice(device_id.to_string().as_bytes());
+    if let Some(activation_id) = activation_id {
+        context.extend_from_slice(activation_id.to_string().as_bytes());
+    }
+    context.extend_from_slice(request_digest);
+    context.extend_from_slice(&issued_at.to_be_bytes());
+    Ok(SessionCredentials {
+        session_id,
+        access_token: Secret::new(format!(
+            "rca1.{session_id}.{}",
+            derive_secret(identity, ACCESS_TOKEN_DOMAIN, &context)?
+        )),
+        access_expires_at: timestamp(access_expires_at)?,
+        refresh_credential: Secret::new(format!(
+            "rcr1.{session_id}.{}",
+            derive_secret(identity, REFRESH_TOKEN_DOMAIN, &context)?
+        )),
+        refresh_expires_at: timestamp(refresh_expires_at)?,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn refresh_member_session(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    request: &RefreshSessionRequest,
+    idempotency_key: &IdempotencyKey,
+) -> Result<RefreshSessionResponse, DatabaseError> {
+    let raw = request.refresh_credential.expose_secret();
+    let session_id = parse_prefixed_id::<SessionId>(raw, "rcr1")?;
+    let verifier = credential_verifier(identity, REFRESH_TOKEN_DOMAIN, raw.as_bytes())?;
+    let key_digest: [u8; 32] = Sha256::digest(idempotency_key.as_str().as_bytes()).into();
+    let request_digest = canonical_request_digest(REFRESH_REQUEST_DOMAIN, request)?;
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let stored = transaction
+        .query_row(
+            "SELECT session.user_id, session.device_id, session.generation,
+                    session.current_refresh_verifier, session.previous_refresh_verifier,
+                    session.expires_at, session.revoked_at, session.credential_version,
+                    user.credential_version, user.status, device.status
+             FROM refresh_sessions AS session
+             JOIN users AS user ON user.network_id = session.network_id
+                AND user.user_id = session.user_id
+             JOIN devices AS device ON device.network_id = session.network_id
+                AND device.device_id = session.device_id AND device.user_id = session.user_id
+             WHERE session.network_id = ?1 AND session.session_id = ?2",
+            params![network.network_id, session_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::MemberAuthenticationFailed)?;
+    let current_matches = bool::from(stored.3.as_slice().ct_eq(verifier.as_slice()));
+    let previous_matches = stored
+        .4
+        .as_deref()
+        .is_some_and(|previous| bool::from(previous.ct_eq(verifier.as_slice())));
+    let source_generation = if current_matches {
+        stored.2
+    } else if previous_matches && stored.2 > 0 {
+        stored.2 - 1
+    } else {
+        return Err(DatabaseError::MemberAuthenticationFailed);
+    };
+    if let Some(replay) = transaction
+        .query_row(
+            "SELECT request_sha256, response_account_json, issued_at,
+                    access_expires_at, refresh_expires_at
+             FROM refresh_idempotency_records
+             WHERE network_id = ?1 AND session_id = ?2 AND source_generation = ?3
+               AND idempotency_key_sha256 = ?4",
+            params![
+                network.network_id,
+                session_id.to_string(),
+                source_generation,
+                key_digest.as_slice(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        if replay.0.as_slice() != request_digest {
+            return Err(DatabaseError::IdempotencyKeyConflict);
+        }
+        let device_id = stored
+            .1
+            .parse::<DeviceId>()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        let response = RefreshSessionResponse {
+            account: serde_json::from_str(&replay.1)?,
+            credentials: derive_refresh_credentials(
+                identity,
+                &network.network_id,
+                session_id,
+                device_id,
+                source_generation,
+                &key_digest,
+                &request_digest,
+                replay.2,
+                replay.3,
+                replay.4,
+            )?,
+        };
+        transaction.commit()?;
+        return Ok(response);
+    }
+    if previous_matches {
+        transaction.execute(
+            "UPDATE refresh_sessions SET revoked_at = COALESCE(revoked_at, ?1),
+                 revoke_reason = COALESCE(revoke_reason, 'refresh-reuse')
+             WHERE network_id = ?2 AND session_id = ?3",
+            params![now, network.network_id, session_id.to_string()],
+        )?;
+        insert_audit_event(
+            &transaction,
+            Some(&network.network_id),
+            "device",
+            Some(&stored.1),
+            "session.refresh-reuse",
+            "session",
+            Some(&session_id.to_string()),
+            "rejected",
+            &serde_json::json!({}),
+            now,
+        )?;
+        transaction.commit()?;
+        return Err(DatabaseError::RefreshCredentialReused);
+    }
+    if !current_matches
+        || stored.6.is_some()
+        || stored.5 <= now
+        || stored.7 != stored.8
+        || stored.9 != "active"
+        || stored.10 != "active"
+    {
+        return Err(DatabaseError::MemberAuthenticationFailed);
+    }
+    let user_id = stored
+        .0
+        .parse::<UserId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let device_id = stored
+        .1
+        .parse::<DeviceId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let access_expires_at = now
+        .checked_add(ACCESS_TOKEN_LIFETIME_SECONDS)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let account = load_account_metadata(&transaction, &network.network_id, user_id)?;
+    let credentials = derive_refresh_credentials(
+        identity,
+        &network.network_id,
+        session_id,
+        device_id,
+        source_generation,
+        &key_digest,
+        &request_digest,
+        now,
+        access_expires_at,
+        stored.5,
+    )?;
+    let next_refresh_verifier = credential_verifier(
+        identity,
+        REFRESH_TOKEN_DOMAIN,
+        credentials.refresh_credential.expose_secret().as_bytes(),
+    )?;
+    let next_access_verifier = credential_verifier(
+        identity,
+        ACCESS_TOKEN_DOMAIN,
+        credentials.access_token.expose_secret().as_bytes(),
+    )?;
+    transaction.execute(
+        "UPDATE refresh_sessions SET generation = generation + 1,
+             previous_refresh_verifier = current_refresh_verifier,
+             current_refresh_verifier = ?1, current_access_verifier = ?2,
+             access_expires_at = ?3, rotated_at = ?4
+         WHERE network_id = ?5 AND session_id = ?6",
+        params![
+            next_refresh_verifier.as_slice(),
+            next_access_verifier.as_slice(),
+            access_expires_at,
+            now,
+            network.network_id,
+            session_id.to_string(),
+        ],
+    )?;
+    let response = RefreshSessionResponse {
+        account,
+        credentials,
+    };
+    transaction.execute(
+        "INSERT INTO refresh_idempotency_records(
+            network_id, session_id, source_generation, idempotency_key_sha256,
+            request_sha256, response_account_json, issued_at, access_expires_at,
+            refresh_expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            network.network_id,
+            session_id.to_string(),
+            source_generation,
+            key_digest.as_slice(),
+            request_digest.as_slice(),
+            serde_json::to_string(&response.account)?,
+            now,
+            access_expires_at,
+            stored.5,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE devices SET last_seen_at = ?1 WHERE network_id = ?2 AND device_id = ?3",
+        params![now, network.network_id, stored.1],
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "device",
+        Some(&device_id.to_string()),
+        "session.refreshed",
+        "session",
+        Some(&session_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "sourceGeneration": source_generation,
+            "generation": source_generation + 1,
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(response)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derive_refresh_credentials(
+    identity: &ControllerIdentity,
+    network_id: &str,
+    session_id: SessionId,
+    device_id: DeviceId,
+    source_generation: i64,
+    key_digest: &[u8; 32],
+    request_digest: &[u8; 32],
+    issued_at: i64,
+    access_expires_at: i64,
+    refresh_expires_at: i64,
+) -> Result<SessionCredentials, DatabaseError> {
+    let mut context = Vec::new();
+    context.extend_from_slice(network_id.as_bytes());
+    context.extend_from_slice(session_id.to_string().as_bytes());
+    context.extend_from_slice(device_id.to_string().as_bytes());
+    context.extend_from_slice(&source_generation.to_be_bytes());
+    context.extend_from_slice(key_digest);
+    context.extend_from_slice(request_digest);
+    context.extend_from_slice(&issued_at.to_be_bytes());
+    Ok(SessionCredentials {
+        session_id,
+        access_token: Secret::new(format!(
+            "rca1.{session_id}.{}",
+            derive_secret(identity, ACCESS_TOKEN_DOMAIN, &context)?
+        )),
+        access_expires_at: timestamp(access_expires_at)?,
+        refresh_credential: Secret::new(format!(
+            "rcr1.{session_id}.{}",
+            derive_secret(identity, REFRESH_TOKEN_DOMAIN, &context)?
+        )),
+        refresh_expires_at: timestamp(refresh_expires_at)?,
+    })
+}
+
+fn authenticate_member(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    raw_access_token: &str,
+) -> Result<AuthenticatedMember, DatabaseError> {
+    let session_id = parse_prefixed_id::<SessionId>(raw_access_token, "rca1")?;
+    let verifier = credential_verifier(identity, ACCESS_TOKEN_DOMAIN, raw_access_token.as_bytes())?;
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let stored = transaction
+        .query_row(
+            "SELECT session.user_id, session.device_id, session.current_access_verifier,
+                    session.access_expires_at, session.expires_at, session.revoked_at,
+                    session.credential_version, user.credential_version, user.status, device.status
+             FROM refresh_sessions AS session
+             JOIN users AS user ON user.network_id = session.network_id AND user.user_id = session.user_id
+             JOIN devices AS device ON device.network_id = session.network_id
+                AND device.device_id = session.device_id AND device.user_id = session.user_id
+             WHERE session.network_id = ?1 AND session.session_id = ?2",
+            params![network.network_id, session_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?, row.get::<_, i64>(7)?, row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::MemberAuthenticationFailed)?;
+    if !bool::from(stored.2.as_slice().ct_eq(verifier.as_slice()))
+        || stored.3 <= now
+        || stored.4 <= now
+        || stored.5.is_some()
+        || stored.6 != stored.7
+        || stored.8 != "active"
+        || stored.9 != "active"
+    {
+        return Err(DatabaseError::MemberAuthenticationFailed);
+    }
+    let user_id = stored
+        .0
+        .parse()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let device_id = stored
+        .1
+        .parse()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    transaction.execute(
+        "UPDATE devices SET last_seen_at = ?1 WHERE network_id = ?2 AND device_id = ?3",
+        params![now, network.network_id, stored.1],
+    )?;
+    transaction.commit()?;
+    Ok(AuthenticatedMember {
+        network_id: network
+            .network_id
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        user_id,
+        device_id,
+        session_id,
+    })
+}
+
+fn revoke_member_session(
+    connection: &mut Connection,
+    member: AuthenticatedMember,
+    path_device_id: DeviceId,
+    reason: &str,
+) -> Result<(), DatabaseError> {
+    if member.device_id != path_device_id {
+        return Err(DatabaseError::MemberAuthenticationFailed);
+    }
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "UPDATE refresh_sessions SET revoked_at = COALESCE(revoked_at, ?1),
+             revoke_reason = COALESCE(revoke_reason, ?2)
+         WHERE network_id = ?3 AND session_id = ?4 AND device_id = ?5",
+        params![
+            now,
+            reason,
+            member.network_id.to_string(),
+            member.session_id.to_string(),
+            member.device_id.to_string()
+        ],
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&member.network_id.to_string()),
+        "device",
+        Some(&member.device_id.to_string()),
+        "session.logout",
+        "session",
+        Some(&member.session_id.to_string()),
+        "success",
+        &serde_json::json!({}),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn revoke_member_device(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    device_id: DeviceId,
+) -> Result<(), DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut network = load_network(&transaction)?;
+    let user_id = transaction
+        .query_row(
+            "SELECT user_id FROM devices WHERE network_id = ?1 AND device_id = ?2",
+            params![network.network_id, device_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::DeviceNotFound)?
+        .parse::<UserId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let changed = transaction.execute(
+        "UPDATE devices SET status = 'revoked', revoked_at = COALESCE(revoked_at, ?1)
+         WHERE network_id = ?2 AND device_id = ?3 AND status = 'active'",
+        params![now, network.network_id, device_id.to_string()],
+    )?;
+    transaction.execute(
+        "UPDATE refresh_sessions SET revoked_at = COALESCE(revoked_at, ?1),
+             revoke_reason = COALESCE(revoke_reason, 'device-revoked')
+         WHERE network_id = ?2 AND device_id = ?3 AND revoked_at IS NULL",
+        params![now, network.network_id, device_id.to_string()],
+    )?;
+    let revisions = if changed == 1 {
+        let affected_nodes =
+            rotate_account_credentials(&transaction, &network.network_id, user_id, now)?;
+        publish_account_revisions(
+            &transaction,
+            identity,
+            &mut network,
+            &affected_nodes,
+            "member-device-revocation",
+            now,
+        )?
+    } else {
+        Vec::new()
+    };
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "admin",
+        None,
+        "device.revoked",
+        "device",
+        Some(&device_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "changed": changed > 0,
+            "publishedRevisions": revision_audit_details(&revisions),
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn rotate_account_credentials(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+    now: i64,
+) -> Result<BTreeSet<NodeId>, DatabaseError> {
+    let assignments = load_stored_assignments(connection, network_id, user_id)?;
+    let mut affected_nodes = BTreeSet::new();
+    for (node_id, assignment) in assignments {
+        if assignment.status != "enabled" {
+            continue;
+        }
+        revoke_assignment_credentials(connection, network_id, assignment.assignment_id, now)?;
+        issue_assignment_credential(
+            connection,
+            network_id,
+            assignment.assignment_id,
+            user_id,
+            node_id,
+            now,
+        )?;
+        affected_nodes.insert(node_id);
+    }
+    Ok(affected_nodes)
+}
+
+fn revoke_user_sessions(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+    now: i64,
+    reason: &str,
+) -> Result<usize, DatabaseError> {
+    Ok(connection.execute(
+        "UPDATE refresh_sessions SET revoked_at = COALESCE(revoked_at, ?1),
+             revoke_reason = COALESCE(revoke_reason, ?2)
+         WHERE network_id = ?3 AND user_id = ?4 AND revoked_at IS NULL",
+        params![now, reason, network_id, user_id.to_string()],
+    )?)
+}
+
+fn load_account_metadata(
+    connection: &Connection,
+    network_id: &str,
+    user_id: UserId,
+) -> Result<AccountMetadata, DatabaseError> {
+    connection
+        .query_row(
+            "SELECT display_name, status FROM users WHERE network_id = ?1 AND user_id = ?2",
+            params![network_id, user_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(DatabaseError::from)
+        .and_then(|stored| {
+            Ok(AccountMetadata {
+                user_id,
+                display_name: stored.0,
+                status: parse_account_status(&stored.1)?,
+            })
+        })
+}
+
+fn derive_secret(
+    identity: &ControllerIdentity,
+    domain: &[u8],
+    context: &[u8],
+) -> Result<String, DatabaseError> {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(context);
+    let signature = identity.sign(&digest.finalize())?;
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(signature.as_str().as_bytes())))
+}
+
+fn credential_verifier(
+    identity: &ControllerIdentity,
+    domain: &[u8],
+    raw: &[u8],
+) -> Result<[u8; 32], DatabaseError> {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(raw);
+    let keyed = identity.sign(&digest.finalize())?;
+    Ok(Sha256::digest(keyed.as_str().as_bytes()).into())
+}
+
+fn canonical_request_digest<T: serde::Serialize>(
+    domain: &[u8],
+    request: &T,
+) -> Result<[u8; 32], DatabaseError> {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(serde_json::to_vec(request)?);
+    Ok(digest.finalize().into())
+}
+
+fn parse_prefixed_id<T>(raw: &str, prefix: &str) -> Result<T, DatabaseError>
+where
+    T: std::str::FromStr,
+{
+    let mut parts = raw.split('.');
+    if parts.next() != Some(prefix) {
+        return Err(DatabaseError::MemberAuthenticationFailed);
+    }
+    let id = parts
+        .next()
+        .ok_or(DatabaseError::MemberAuthenticationFailed)?;
+    if parts.next().is_none() || parts.next().is_some() {
+        return Err(DatabaseError::MemberAuthenticationFailed);
+    }
+    id.parse()
+        .map_err(|_| DatabaseError::MemberAuthenticationFailed)
+}
+
+#[allow(clippy::too_many_lines)]
+fn member_profile_bundle(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    member: AuthenticatedMember,
+) -> Result<StoredProfileBundle, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    if network.network_id != member.network_id.to_string() {
+        return Err(DatabaseError::MemberAuthenticationFailed);
+    }
+    let device_key = transaction
+        .query_row(
+            "SELECT device.encryption_public_key
+             FROM devices AS device
+             JOIN users AS user ON user.network_id = device.network_id AND user.user_id = device.user_id
+             JOIN refresh_sessions AS session ON session.network_id = device.network_id
+                AND session.device_id = device.device_id AND session.user_id = device.user_id
+             WHERE device.network_id = ?1 AND device.device_id = ?2 AND device.user_id = ?3
+               AND session.session_id = ?4 AND device.status = 'active' AND user.status = 'active'
+               AND session.revoked_at IS NULL AND session.expires_at > ?5
+               AND session.credential_version = user.credential_version",
+            params![
+                network.network_id,
+                member.device_id.to_string(),
+                member.user_id.to_string(),
+                member.session_id.to_string(),
+                now,
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::MemberAuthenticationFailed)?
+        .parse::<control_protocol::crypto::X25519PublicKey>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let profiles = load_bundle_profiles(&transaction, identity, &network, member.user_id, now)?;
+    let source_json = serde_json::to_vec(&profiles)?;
+    let source_digest: [u8; 32] = Sha256::digest(&source_json).into();
+    if let Some(stored) = transaction
+        .query_row(
+            "SELECT artifact_json, artifact_sha256, etag
+             FROM profile_bundles WHERE network_id = ?1 AND device_id = ?2
+               AND superseded_at IS NULL AND source_sha256 = ?3 AND offline_expires_at > ?4
+             ORDER BY generation DESC LIMIT 1",
+            params![
+                network.network_id,
+                member.device_id.to_string(),
+                source_digest.as_slice(),
+                now,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        let digest: [u8; 32] = Sha256::digest(stored.0.as_bytes()).into();
+        if stored.1.as_slice() != digest {
+            return Err(DatabaseError::StoredProfileBundleCorrupt);
+        }
+        let bundle: SignedProfileBundle = serde_json::from_str(&stored.0)?;
+        let transcript =
+            profile_bundle_signature_transcript(&bundle.manifest, &bundle.encrypted_profiles)?;
+        control_protocol::account_crypto::verify_profile_bundle_signature(
+            &identity.public_key(),
+            &bundle.signature,
+            &transcript,
+        )?;
+        transaction.commit()?;
+        return Ok(StoredProfileBundle {
+            bundle,
+            etag: stored.2,
+        });
+    }
+
+    let generation_value: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM profile_bundles
+         WHERE network_id = ?1 AND device_id = ?2",
+        params![network.network_id, member.device_id.to_string()],
+        |row| row.get(0),
+    )?;
+    let generation = BundleGeneration::new(generation_value)
+        .map_err(|_| DatabaseError::BundleGenerationOverflow)?;
+    let bundle_id = BundleId::new();
+    let issued_at = timestamp(now)?;
+    let refresh_after_value = now
+        .checked_add(BUNDLE_REFRESH_SECONDS)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let offline_expires_value = now
+        .checked_add(BUNDLE_OFFLINE_SECONDS)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let mut encrypted_profiles = Vec::with_capacity(profiles.len());
+    let mut descriptors = Vec::with_capacity(profiles.len());
+    for (priority, profile) in profiles.iter().enumerate() {
+        let aad = profile_encryption_aad(
+            member.network_id,
+            member.user_id,
+            member.device_id,
+            bundle_id,
+            generation,
+            profile.node_id,
+        );
+        let encrypted = encrypt_profile(&device_key, &serde_json::to_vec(profile)?, &aad)?;
+        let payload = EncryptedProfilePayload {
+            node_id: profile.node_id,
+            algorithm: encrypted.algorithm,
+            ephemeral_public_key: encrypted.ephemeral_public_key,
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext,
+        };
+        descriptors.push(ProfileDescriptor {
+            node_id: profile.node_id,
+            display_name: profile.display_name.clone(),
+            region: profile.region.clone(),
+            endpoint_mode: profile.endpoint.mode,
+            encrypted_payload_digest: encrypted_profile_digest(&payload)?,
+            priority: u16::try_from(priority).map_err(|_| DatabaseError::StoredProtocolValue)?,
+        });
+        encrypted_profiles.push(payload);
+    }
+    let manifest = ProfileBundleManifest {
+        schema_version: 1,
+        format_version: 1,
+        bundle_id,
+        network_id: member.network_id,
+        user_id: member.user_id,
+        device_id: member.device_id,
+        signing_key_id: controller_signing_key_id(identity)?,
+        controller_instance_id: network
+            .controller_epoch
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        generation,
+        issued_at,
+        not_before: issued_at,
+        refresh_after: timestamp(refresh_after_value)?,
+        offline_expires_at: timestamp(offline_expires_value)?,
+        min_client_version: "0.1.0".to_string(),
+        account_status: AccountStatus::Active,
+        profiles: descriptors,
+        selection_hints: SelectionHints {
+            minimum_hold_seconds: 300,
+            latency_tolerance_milliseconds: 40,
+            failure_threshold: 3,
+        },
+        replacement: None,
+    };
+    let transcript = profile_bundle_signature_transcript(&manifest, &encrypted_profiles)?;
+    let signature = identity.sign(&transcript)?;
+    let bundle = SignedProfileBundle {
+        manifest,
+        encrypted_profiles,
+        signature,
+    };
+    bundle.validate_shape(&[1], &[1])?;
+    let artifact_json = serde_json::to_string(&bundle)?;
+    let artifact_digest: [u8; 32] = Sha256::digest(artifact_json.as_bytes()).into();
+    let etag = format!("\"sha256-{}\"", URL_SAFE_NO_PAD.encode(artifact_digest));
+    transaction.execute(
+        "UPDATE profile_bundles SET superseded_at = ?1
+         WHERE network_id = ?2 AND device_id = ?3 AND superseded_at IS NULL",
+        params![now, network.network_id, member.device_id.to_string()],
+    )?;
+    transaction.execute(
+        "INSERT INTO profile_bundles(
+            network_id, bundle_id, user_id, device_id, generation, source_sha256,
+            artifact_json, artifact_sha256, signature, etag, issued_at,
+            refresh_after, offline_expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            network.network_id,
+            bundle_id.to_string(),
+            member.user_id.to_string(),
+            member.device_id.to_string(),
+            generation.get(),
+            source_digest.as_slice(),
+            artifact_json,
+            artifact_digest.as_slice(),
+            bundle.signature.as_str(),
+            etag,
+            now,
+            refresh_after_value,
+            offline_expires_value,
+        ],
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "device",
+        Some(&member.device_id.to_string()),
+        "profile-bundle.issued",
+        "profile-bundle",
+        Some(&bundle_id.to_string()),
+        "success",
+        &serde_json::json!({"generation": generation, "profileCount": profiles.len()}),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(StoredProfileBundle { bundle, etag })
+}
+
+#[allow(clippy::too_many_lines)]
+fn load_bundle_profiles(
+    connection: &Connection,
+    identity: &ControllerIdentity,
+    network: &NetworkRecord,
+    user_id: UserId,
+    now: i64,
+) -> Result<Vec<NodeProfile>, DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT node.node_id, node.display_name, node.reality_public_key,
+                node.reality_short_id, node.applied_revision,
+                credential.credential_id, credential.vless_uuid,
+                candidate.mode, candidate.address, candidate.port,
+                verification.latency_ms
+         FROM user_node_assignments AS assignment
+         JOIN users AS user ON user.network_id = assignment.network_id AND user.user_id = assignment.user_id
+         JOIN nodes AS node ON node.network_id = assignment.network_id AND node.node_id = assignment.node_id
+         JOIN user_node_credentials AS credential ON credential.network_id = assignment.network_id
+            AND credential.assignment_id = assignment.assignment_id AND credential.user_id = assignment.user_id
+            AND credential.node_id = assignment.node_id
+         JOIN node_revision_member_credentials AS applied ON applied.network_id = node.network_id
+            AND applied.node_id = node.node_id AND applied.revision = node.applied_revision
+            AND applied.assignment_id = assignment.assignment_id AND applied.credential_id = credential.credential_id
+         JOIN node_revision_results AS result ON result.network_id = node.network_id
+            AND result.node_id = node.node_id AND result.revision = node.applied_revision
+            AND result.state = 'applied'
+         JOIN node_endpoint_candidates AS candidate ON candidate.network_id = node.network_id
+            AND candidate.node_id = node.node_id AND candidate.applied_revision = node.applied_revision
+            AND candidate.withdrawn_at IS NULL
+         JOIN node_endpoint_verifications AS verification ON verification.network_id = candidate.network_id
+            AND verification.node_id = candidate.node_id AND verification.endpoint_id = candidate.endpoint_id
+            AND verification.status = 'verified' AND verification.verification_expires_at > ?3
+         WHERE assignment.network_id = ?1 AND assignment.user_id = ?2
+           AND user.status = 'active' AND assignment.status = 'enabled'
+           AND node.status = 'active' AND node.provider_paused = 0
+           AND credential.status = 'active'
+           AND node.reality_public_key IS NOT NULL AND node.reality_short_id IS NOT NULL
+           AND EXISTS(
+               SELECT 1 FROM endpoint_probe_attempts AS probe
+               WHERE probe.network_id = candidate.network_id AND probe.node_id = candidate.node_id
+                 AND probe.endpoint_id = candidate.endpoint_id AND probe.phase = 'protocol'
+                 AND probe.status = 'succeeded' AND probe.applied_revision = candidate.applied_revision
+                 AND probe.address = candidate.address AND probe.port = candidate.port
+           )
+         ORDER BY node.node_id ASC,
+             CASE candidate.mode WHEN 'direct' THEN 0 ELSE 1 END ASC,
+             verification.latency_ms ASC, candidate.endpoint_id ASC",
+    )?;
+    let rows = statement
+        .query_map(
+            params![network.network_id, user_id.to_string(), now],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, u16>(9)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut profiles = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row in rows {
+        let node_id = row
+            .0
+            .parse::<NodeId>()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        if !seen.insert(node_id) {
+            continue;
+        }
+        let stored = load_stored_desired_revision(connection, &network.network_id, &row.0, row.4)?
+            .ok_or(DatabaseError::StoredDesiredStateCorrupt)?;
+        let desired = verify_desired_revision(identity, network, node_id, &stored)?;
+        let server_name = desired
+            .document
+            .xray
+            .server_names
+            .first()
+            .cloned()
+            .ok_or(DatabaseError::StoredDesiredStateCorrupt)?;
+        profiles.push(NodeProfile {
+            node_id,
+            credential_id: row
+                .5
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            display_name: row.1,
+            region: None,
+            endpoint: ProfileEndpoint {
+                mode: match row.7.as_str() {
+                    "direct" => control_protocol::node::EndpointMode::Direct,
+                    "relay" => control_protocol::node::EndpointMode::Relay,
+                    _ => return Err(DatabaseError::StoredProtocolValue),
+                },
+                address: row.8,
+                port: row.9,
+            },
+            connection: RealityConnectionParameters {
+                vless_uuid: Secret::new(row.6),
+                flow: "xtls-rprx-vision".to_string(),
+                server_name,
+                fingerprint: "chrome".to_string(),
+                reality_public_key: Secret::new(row.2),
+                short_id: Secret::new(row.3),
+                spider_x: Secret::new("/".to_string()),
+            },
+        });
+    }
+    Ok(profiles)
+}
+
+fn profile_encryption_aad(
+    network_id: NetworkId,
+    user_id: UserId,
+    device_id: DeviceId,
+    bundle_id: BundleId,
+    generation: BundleGeneration,
+    node_id: NodeId,
+) -> Vec<u8> {
+    format!(
+        "control/profile-aad/v1\0{network_id}\0{user_id}\0{device_id}\0{bundle_id}\0{}\0{node_id}",
+        generation.get()
+    )
+    .into_bytes()
+}
+
 fn create_account(
     connection: &mut Connection,
     request: &CreateAccountRequest,
@@ -4784,6 +6921,7 @@ fn apply_account_status_transition(
                  WHERE network_id = ?2 AND user_id = ?3",
                 params![now, network_id, user_id.to_string()],
             )?;
+            revoke_user_sessions(connection, network_id, user_id, now, "account-disabled")?;
             let assignments = load_stored_assignments(connection, network_id, user_id)?;
             for assignment in assignments.values() {
                 if assignment.status == "enabled" {
@@ -4816,6 +6954,7 @@ fn apply_account_status_transition(
                  WHERE network_id = ?2 AND user_id = ?3",
                 params![now, network_id, user_id.to_string()],
             )?;
+            revoke_user_sessions(connection, network_id, user_id, now, "account-deleted")?;
             connection.execute(
                 "UPDATE user_node_assignments
                  SET status = 'deleted', deleted_at = ?1,
@@ -5933,6 +8072,8 @@ pub enum DatabaseError {
     #[error(transparent)]
     EnrollmentCrypto(#[from] EnrollmentCryptoError),
     #[error(transparent)]
+    AccountCrypto(#[from] AccountCryptoError),
+    #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     TimestampComponent(#[from] time::error::ComponentRange),
@@ -6023,6 +8164,28 @@ pub enum DatabaseError {
     NodeNotFound,
     #[error("the member account was not found")]
     AccountNotFound,
+    #[error("the device activation is invalid")]
+    ActivationInvalid,
+    #[error("the device activation has expired")]
+    ActivationExpired,
+    #[error("the device activation was already consumed")]
+    ActivationConsumed,
+    #[error("the device enrollment proof is invalid")]
+    InvalidDeviceProof,
+    #[error("member authentication failed")]
+    MemberAuthenticationFailed,
+    #[error("the account cannot authenticate in its current lifecycle state")]
+    AccountAuthenticationBlocked,
+    #[error("a rotated refresh credential was reused and the family was revoked")]
+    RefreshCredentialReused,
+    #[error("the member device was not found")]
+    DeviceNotFound,
+    #[error("password hashing failed")]
+    PasswordHash,
+    #[error("profile bundle generation sequence is exhausted")]
+    BundleGenerationOverflow,
+    #[error("the stored profile bundle is corrupt")]
+    StoredProfileBundleCorrupt,
     #[error("the idempotency key was already used for a different request")]
     IdempotencyKeyConflict,
     #[error("cannot change account from {current_status} to {requested_status}")]

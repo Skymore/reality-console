@@ -1,10 +1,10 @@
-use super::invite::RealityProfile;
+use super::connection::ConnectionProfile;
 use serde_json::{json, Value};
 
 pub const DEFAULT_SOCKS_PORT: u16 = 10808;
 pub const DEFAULT_HTTP_PORT: u16 = 10809;
 
-pub fn build_xray_config(profile: &RealityProfile, socks_port: u16, http_port: u16) -> Value {
+pub fn build_xray_config(profile: &ConnectionProfile, socks_port: u16, http_port: u16) -> Value {
     json!({
         "log": {
             "loglevel": "warning"

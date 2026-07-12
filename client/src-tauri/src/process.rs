@@ -1,5 +1,5 @@
 use crate::core::config::{build_xray_config, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
-use crate::core::invite::RealityProfile;
+use crate::core::connection::ConnectionProfile;
 use crate::error::ClientError;
 use crate::state::{ClientPhase, ClientState, ProxyMode};
 use std::fs;
@@ -55,7 +55,7 @@ impl XraySupervisor {
         &self,
         app: &AppHandle,
         profile_id: String,
-        profile: RealityProfile,
+        profile: ConnectionProfile,
         mode: ProxyMode,
     ) -> Result<ClientState, ClientError> {
         if mode == ProxyMode::System {
@@ -272,7 +272,7 @@ fn ports_ready(socks_port: u16, http_port: u16) -> bool {
         && TcpStream::connect(("127.0.0.1", http_port)).is_ok()
 }
 
-fn write_runtime_config(path: &Path, profile: &RealityProfile) -> Result<(), ClientError> {
+fn write_runtime_config(path: &Path, profile: &ConnectionProfile) -> Result<(), ClientError> {
     let config = build_xray_config(profile, DEFAULT_SOCKS_PORT, DEFAULT_HTTP_PORT);
     let bytes = serde_json::to_vec_pretty(&config).map_err(|_| process_error("config_failed"))?;
     let parent = path

@@ -114,6 +114,61 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn activation_invalid(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::ActivationInvalid,
+            "The device activation is invalid.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn activation_expired(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::GONE,
+            ErrorCode::ActivationExpired,
+            "The device activation has expired.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn activation_consumed(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::ActivationConsumed,
+            "The device activation was already consumed.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn account_disabled(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::AccountDisabled,
+            "The account is disabled.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn refresh_reuse(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::RefreshCredentialReuse,
+            "The refresh credential was reused and its session was revoked.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
     pub fn signature_invalid(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
