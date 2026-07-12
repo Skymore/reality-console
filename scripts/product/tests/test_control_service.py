@@ -105,6 +105,33 @@ class ControlServiceProductTests(unittest.TestCase):
         with patch.object(control, "urlopen", return_value=Response()) as request:
             self.assertEqual(control.admin_request(config, "GET", "/v1/admin/nodes"), {"nodes": []})
         self.assertEqual(request.call_args.args[0].full_url, "http://127.0.0.1:8787/v1/admin/nodes")
+        self.assertNotIn("Idempotency-key", request.call_args.args[0].headers)
+
+    def test_admin_mutation_uses_the_explicit_idempotency_key(self):
+        config = {"bindAddress": "127.0.0.1:8787", "bootstrapToken": "secret-token"}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def read():
+                return b'{"account":{"userId":"00000000-0000-0000-0000-000000000001"}}'
+
+        with patch.object(control, "urlopen", return_value=Response()) as request:
+            control.admin_request(
+                config,
+                "POST",
+                "/v1/admin/accounts",
+                {"displayName": "Friend"},
+                "retry-key",
+            )
+        sent = request.call_args.args[0]
+        self.assertEqual(sent.headers["Idempotency-key"], "retry-key")
+        self.assertEqual(json.loads(sent.data), {"displayName": "Friend"})
 
 
 if __name__ == "__main__":

@@ -111,11 +111,44 @@ List controller-visible node status with:
 python3 scripts/product/control-service.py nodes
 ```
 
-## 6. Remaining Product Stages
+## 6. Create a Friend Account
+
+Account operations are separate atomic steps. This makes retries and failures visible instead of
+hiding partial work inside one long command.
+
+```bash
+# Returns account.userId.
+python3 scripts/product/control-service.py create-account --display-name "Friend 1"
+
+# The repeated --node-id values atomically replace the complete assigned node set.
+python3 scripts/product/control-service.py assign-account \
+  --user-id USER_ID \
+  --node-id NODE_ID_1 \
+  --node-id NODE_ID_2
+
+# Returns one short-lived setupCode for Connect.
+python3 scripts/product/control-service.py create-connect-code --user-id USER_ID
+
+python3 scripts/product/control-service.py accounts
+```
+
+Run `assign-account` without any `--node-id` to remove the account from every node. Disable or
+terminally delete an account across all assigned nodes with:
+
+```bash
+python3 scripts/product/control-service.py set-account-status \
+  --user-id USER_ID \
+  --status disabled
+```
+
+The `create-account`, `create-node`, and `create-connect-code` commands accept an optional explicit
+`--idempotency-key` for exact operational retries. Connect consumes only the returned setup code;
+the friend does not select or configure nodes manually.
+
+## 7. Remaining Product Stages
 
 The next product stages build on this running controller:
 
 1. Install the signed Node Host package on a separate Mac and confirm the same one-code path.
-2. Create a friend account and assign one or more ready nodes.
-3. Activate Connect with one account setup code and automatically receive the node list.
-4. Prove a real client connection through the complete installed path.
+2. Activate Connect with one account setup code and automatically receive the node list.
+3. Prove a real client connection through the complete installed path.

@@ -324,6 +324,7 @@ def admin_request(
     method: str,
     path: str,
     body: dict[str, object] | None = None,
+    idempotency_key: str | None = None,
 ) -> object:
     host, port = validate_bind(str(config["bindAddress"]))
     origin = f"http://{host}:{port}"
@@ -332,7 +333,8 @@ def admin_request(
     if body is not None:
         data = json.dumps(body, separators=(",", ":")).encode()
         headers["Content-Type"] = "application/json"
-        headers["Idempotency-Key"] = str(uuid.uuid4())
+    if idempotency_key is not None:
+        headers["Idempotency-Key"] = idempotency_key
     request = Request(f"{origin}{path}", data=data, headers=headers, method=method)
     try:
         with urlopen(request, timeout=10) as response:
@@ -361,7 +363,13 @@ def node_invitation_body(args: argparse.Namespace) -> dict[str, object]:
 
 def create_node(args: argparse.Namespace) -> None:
     config = load_config(args.data_dir)
-    value = admin_request(config, "POST", "/v1/admin/node-invitations", node_invitation_body(args))
+    value = admin_request(
+        config,
+        "POST",
+        "/v1/admin/node-invitations",
+        node_invitation_body(args),
+        args.idempotency_key or str(uuid.uuid4()),
+    )
     if not isinstance(value, dict) or not isinstance(value.get("setupCode"), str):
         raise ProductError("Control Service returned an invalid node setup response")
     print(json.dumps(value, indent=2))
@@ -370,6 +378,62 @@ def create_node(args: argparse.Namespace) -> None:
 def nodes(args: argparse.Namespace) -> None:
     config = load_config(args.data_dir)
     print(json.dumps(admin_request(config, "GET", "/v1/admin/nodes"), indent=2))
+
+
+def create_account(args: argparse.Namespace) -> None:
+    config = load_config(args.data_dir)
+    value = admin_request(
+        config,
+        "POST",
+        "/v1/admin/accounts",
+        {"displayName": args.display_name},
+        args.idempotency_key or str(uuid.uuid4()),
+    )
+    print(json.dumps(value, indent=2))
+
+
+def accounts(args: argparse.Namespace) -> None:
+    config = load_config(args.data_dir)
+    print(json.dumps(admin_request(config, "GET", "/v1/admin/accounts"), indent=2))
+
+
+def assign_account(args: argparse.Namespace) -> None:
+    config = load_config(args.data_dir)
+    node_ids = list(dict.fromkeys(args.node_id))
+    if len(node_ids) != len(args.node_id):
+        raise ProductError("node IDs must not be repeated")
+    value = admin_request(
+        config,
+        "PUT",
+        f"/v1/admin/accounts/{args.user_id}/nodes",
+        {"nodeIds": node_ids},
+    )
+    print(json.dumps(value, indent=2))
+
+
+def set_account_status(args: argparse.Namespace) -> None:
+    config = load_config(args.data_dir)
+    value = admin_request(
+        config,
+        "PUT",
+        f"/v1/admin/accounts/{args.user_id}/status",
+        {"status": args.status},
+    )
+    print(json.dumps(value, indent=2))
+
+
+def create_connect_code(args: argparse.Namespace) -> None:
+    config = load_config(args.data_dir)
+    value = admin_request(
+        config,
+        "POST",
+        f"/v1/admin/accounts/{args.user_id}/device-activations",
+        {"expiresInSeconds": args.expires_in_seconds},
+        args.idempotency_key or str(uuid.uuid4()),
+    )
+    if not isinstance(value, dict) or not isinstance(value.get("setupCode"), str):
+        raise ProductError("Control Service returned an invalid Connect setup response")
+    print(json.dumps(value, indent=2))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -393,8 +457,28 @@ def parser() -> argparse.ArgumentParser:
     create_node_parser.add_argument("--public-port", type=int, default=443)
     create_node_parser.add_argument("--server-name", default="www.microsoft.com")
     create_node_parser.add_argument("--target")
+    create_node_parser.add_argument("--idempotency-key")
     nodes_parser = commands.add_parser("nodes")
     nodes_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    create_account_parser = commands.add_parser("create-account")
+    create_account_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    create_account_parser.add_argument("--display-name", required=True)
+    create_account_parser.add_argument("--idempotency-key")
+    accounts_parser = commands.add_parser("accounts")
+    accounts_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    assign_parser = commands.add_parser("assign-account")
+    assign_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    assign_parser.add_argument("--user-id", required=True)
+    assign_parser.add_argument("--node-id", action="append", default=[])
+    account_status_parser = commands.add_parser("set-account-status")
+    account_status_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    account_status_parser.add_argument("--user-id", required=True)
+    account_status_parser.add_argument("--status", choices=("active", "disabled", "deleted"), required=True)
+    connect_parser = commands.add_parser("create-connect-code")
+    connect_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    connect_parser.add_argument("--user-id", required=True)
+    connect_parser.add_argument("--expires-in-seconds", type=int, default=900)
+    connect_parser.add_argument("--idempotency-key")
     return root
 
 
@@ -413,8 +497,18 @@ def main() -> int:
             admin_token(args)
         elif args.command == "create-node":
             create_node(args)
-        else:
+        elif args.command == "nodes":
             nodes(args)
+        elif args.command == "create-account":
+            create_account(args)
+        elif args.command == "accounts":
+            accounts(args)
+        elif args.command == "assign-account":
+            assign_account(args)
+        elif args.command == "set-account-status":
+            set_account_status(args)
+        else:
+            create_connect_code(args)
     except (ProductError, OSError, subprocess.CalledProcessError, ValueError) as error:
         print(f"control-service: {error}", file=sys.stderr)
         return 1
