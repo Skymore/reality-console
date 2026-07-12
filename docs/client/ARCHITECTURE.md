@@ -51,6 +51,17 @@ The Control Service distributes identity and configuration but is not in the mem
 The renderer cannot access credentials, signed payload bytes, generated Xray configuration,
 filesystem primitives, process primitives, or arbitrary probe targets.
 
+The installed executable also has a closed `headless --output <absolute-path>` mode for operator
+automation and release acceptance. Requests are bounded, deny unknown fields, and arrive only on
+stdin; setup codes are held in zeroizing memory and have no argument or environment-variable form.
+Release acceptance drives this interface through `run-connect-network-scenario.py`. Its proof file
+contains only stable outcomes and digests, is owner-only, and is bound to the exact package, binary,
+source commit, release target, and CI attempt. A proof cannot be reused by another lifecycle job.
+Results contain only the same safe snapshots as the renderer and use create-new `0600` files on
+Unix. A connect request uses explicit selection and proxy modes, emits a ready snapshot, runs for a
+bounded interval, then stops Xray, restores owned proxy state, emits a final snapshot, and exits.
+It reuses `ConnectRuntimeRegistry`; there is no separate test data plane.
+
 ## 3. Backend Services
 
 ### `account_session`

@@ -30,7 +30,17 @@ REQUIRED_COMPONENT_CHECKS = {
     "node-host": {"format", "build", "test", "clippy", "rustdoc", "migration-empty", "migration-previous"},
     "relay": {"format", "build", "test", "clippy", "rustdoc"},
     "relay-provisioning": {"format", "build", "test", "clippy", "rustdoc"},
-    "connect": {"format", "build", "test", "clippy", "rustdoc", "sidecar-test", "typecheck", "production-build"},
+    "connect": {
+        "format",
+        "build",
+        "test",
+        "clippy",
+        "rustdoc",
+        "headless-smoke",
+        "sidecar-test",
+        "typecheck",
+        "production-build",
+    },
     "control-app": {"format", "build", "test", "clippy", "rustdoc", "typecheck", "production-build"},
     "node-host-app": {"format", "build", "test", "clippy", "rustdoc", "package-frontend"},
     "probe-worker": {"test", "typecheck", "production-build"},
@@ -53,6 +63,50 @@ EXPECTED_SCENARIOS = {
     "failed-upgrade-rollback",
     "logout-removal-cleanup",
     "uninstall-retention-choice",
+}
+NETWORK_PROOF_SCENARIOS = {
+    "online": {"activation-enrollment", "direct-path"},
+    "offline": {"offline-restart"},
+    "logout": {"logout-removal-cleanup"},
+    "direct-failed": set(),
+    "relay-failed": set(),
+}
+NETWORK_PROOF_CHECKS = {
+    "online": {"activationEnrollment", "directResponseSha256", "relayResponseSha256"},
+    "offline": {
+        "offlineRefreshFailedClosed",
+        "directResponseSha256",
+        "relayResponseSha256",
+        "offlineRestart",
+    },
+    "logout": {"logoutRemovalCleanup"},
+    "direct-failed": {"directPathUnavailable", "relayResponseSha256"},
+    "relay-failed": {"relayPathUnavailable", "directResponseSha256"},
+}
+NETWORK_SCENARIO_REQUIREMENTS = {
+    "activation-enrollment": {"online"},
+    "direct-path": {"online"},
+    "relay-path-isolation": {"direct-failed", "relay-failed"},
+    "offline-restart": {"offline"},
+    "logout-removal-cleanup": {"logout"},
+}
+NODE_HOST_PROOF_CHECKS = {
+    "online": {"activationEnrollment", "directProtocolVerified", "relayProtocolVerified"},
+    "offline-restart": {
+        "controlUnavailableDuringRestart",
+        "serviceInstanceChanged",
+        "lastKnownGoodPreserved",
+    },
+    "isolation": {"directFailureIsolated", "relayFailureIsolated"},
+    "logout": {"logoutRemovalCleanup"},
+}
+NODE_HOST_SCENARIO_REQUIREMENTS = {
+    "activation-enrollment": {"online"},
+    "direct-path": {"online"},
+    "relay-path-isolation": {"isolation"},
+    "offline-restart": {"offline-restart"},
+    "sleep-wake-service-restart": {"offline-restart"},
+    "logout-removal-cleanup": {"logout"},
 }
 COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -232,7 +286,17 @@ def matrix_records(directory: Path, source_commit: str) -> tuple[list[dict[str, 
         value = read_json(path)
         require_exact(
             value,
-            {"schemaVersion", "kind", "evidenceType", "sourceCommit", "target", "artifact", "results", "ci"},
+            {
+                "schemaVersion",
+                "kind",
+                "evidenceType",
+                "sourceCommit",
+                "target",
+                "artifact",
+                "results",
+                "sources",
+                "ci",
+            },
             path.name,
         )
         if value["schemaVersion"] != 1 or value["kind"] != "package-lifecycle":
@@ -250,6 +314,98 @@ def matrix_records(directory: Path, source_commit: str) -> tuple[list[dict[str, 
             raise EvidenceError(f"invalid lifecycle artifact digest: {path.name}")
         run = ci_run(value["ci"], f"lifecycle {target}")
         runs.append(run)
+        if not isinstance(value["sources"], list):
+            raise EvidenceError(f"lifecycle sources are not an array: {path.name}")
+        source_modes: dict[str, dict[str, Any]] = {}
+        for source in value["sources"]:
+            require_exact(source, {"kind", "mode", "name", "sha256"}, f"{path.name} source")
+            kind = source["kind"]
+            mode = source["mode"]
+            if kind == "connect-network-scenario":
+                expected_checks = NETWORK_PROOF_CHECKS.get(mode)
+                expected_job = f"connect-network-scenario ({target})"
+                expected_fields = {
+                    "schemaVersion",
+                    "kind",
+                    "mode",
+                    "target",
+                    "sourceCommit",
+                    "artifact",
+                    "binarySha256",
+                    "ci",
+                    "status",
+                    "checks",
+                    "errorCode",
+                }
+                kind_matches_target = target.startswith("connect-")
+            elif kind == "node-host-network-scenario":
+                expected_checks = NODE_HOST_PROOF_CHECKS.get(mode)
+                expected_job = f"node-host-network-scenario ({target})"
+                expected_fields = {
+                    "schemaVersion",
+                    "kind",
+                    "mode",
+                    "target",
+                    "sourceCommit",
+                    "artifact",
+                    "binarySha256",
+                    "hooksSha256",
+                    "ci",
+                    "status",
+                    "checks",
+                    "errorCode",
+                }
+                kind_matches_target = target.startswith("node-host-")
+            else:
+                expected_checks = None
+                expected_job = ""
+                expected_fields = set()
+                kind_matches_target = False
+            if (
+                expected_checks is None
+                or not kind_matches_target
+                or mode in source_modes
+                or Path(source["name"]).name != source["name"]
+                or not SHA256.fullmatch(source["sha256"])
+            ):
+                raise EvidenceError(f"lifecycle source identity is invalid: {path.name}")
+            matches = list(directory.rglob(source["name"]))
+            if len(matches) != 1 or sha256_file(matches[0]) != source["sha256"]:
+                raise EvidenceError(f"lifecycle source bytes are missing or mismatched: {source['name']}")
+            proof = read_json(matches[0])
+            require_exact(proof, expected_fields, source["name"])
+            proof_artifact = proof["artifact"]
+            require_exact(proof_artifact, {"name", "sha256"}, f"{source['name']} artifact")
+            proof_ci = ci_run(proof["ci"], f"network proof {source['name']}")
+            if (
+                proof["schemaVersion"] != 1
+                or proof["kind"] != kind
+                or proof["mode"] != mode
+                or proof["target"] != target
+                or proof["sourceCommit"] != source_commit
+                or proof_artifact != artifact
+                or not SHA256.fullmatch(proof["binarySha256"])
+                or proof["status"] != "passed"
+                or proof["errorCode"] is not None
+                or (proof_ci["repository"], proof_ci["workflow"], proof_ci["runId"], proof_ci["runAttempt"])
+                != (run["repository"], run["workflow"], run["runId"], run["runAttempt"])
+                or proof_ci["job"] != expected_job
+                or (
+                    kind == "node-host-network-scenario"
+                    and not SHA256.fullmatch(proof["hooksSha256"])
+                )
+            ):
+                raise EvidenceError(f"network proof identity or outcome is invalid: {source['name']}")
+            checks = proof["checks"]
+            if not isinstance(checks, dict) or set(checks) != expected_checks:
+                raise EvidenceError(f"network proof checks are invalid: {source['name']}")
+            for check, result in checks.items():
+                if check.endswith("ResponseSha256"):
+                    if not isinstance(result, str) or not SHA256.fullmatch(result):
+                        raise EvidenceError(f"network proof digest is invalid: {source['name']}/{check}")
+                elif result is not True:
+                    raise EvidenceError(f"network proof check failed: {source['name']}/{check}")
+            source_modes[mode] = source
         if not isinstance(value["results"], dict):
             raise EvidenceError(f"lifecycle results are not an object: {path.name}")
         if set(value["results"]) != EXPECTED_SCENARIOS:
@@ -257,6 +413,16 @@ def matrix_records(directory: Path, source_commit: str) -> tuple[list[dict[str, 
         for scenario, status in value["results"].items():
             if scenario not in EXPECTED_SCENARIOS or status not in {"passed", "failed", "incomplete"}:
                 raise EvidenceError(f"invalid lifecycle result {target}/{scenario}")
+            required_modes = NETWORK_SCENARIO_REQUIREMENTS.get(scenario, set())
+            if target.startswith("node-host-"):
+                required_modes = NODE_HOST_SCENARIO_REQUIREMENTS.get(scenario, set())
+            if (
+                status == "passed"
+                and (target.startswith("connect-") or target.startswith("node-host-"))
+                and required_modes
+                and not required_modes <= set(source_modes)
+            ):
+                raise EvidenceError(f"lifecycle result has no matching network proof: {target}/{scenario}")
             key = (target, scenario)
             if key in records:
                 raise EvidenceError(f"duplicate lifecycle result {target}/{scenario}")

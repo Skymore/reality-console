@@ -112,6 +112,93 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 "status": "verified",
             }))
             artifact_sha = acceptance.sha256_file(self.artifacts / artifact_name)
+            sources = []
+            if product == "connect":
+                proof_checks = {
+                    "online": {
+                        "activationEnrollment": True,
+                        "directResponseSha256": "1" * 64,
+                        "relayResponseSha256": "2" * 64,
+                    },
+                    "offline": {
+                        "offlineRefreshFailedClosed": True,
+                        "directResponseSha256": "1" * 64,
+                        "relayResponseSha256": "2" * 64,
+                        "offlineRestart": True,
+                    },
+                    "logout": {"logoutRemovalCleanup": True},
+                    "direct-failed": {
+                        "directPathUnavailable": True,
+                        "relayResponseSha256": "2" * 64,
+                    },
+                    "relay-failed": {
+                        "relayPathUnavailable": True,
+                        "directResponseSha256": "1" * 64,
+                    },
+                }
+                for mode, checks in proof_checks.items():
+                    proof_name = f"{target}.{mode}.network.json"
+                    proof_path = self.lifecycle / proof_name
+                    proof_path.write_text(json.dumps({
+                        "schemaVersion": 1,
+                        "kind": "connect-network-scenario",
+                        "mode": mode,
+                        "target": target,
+                        "sourceCommit": COMMIT,
+                        "artifact": {"name": artifact_name, "sha256": artifact_sha},
+                        "binarySha256": "c" * 64,
+                        "ci": self._ci(f"connect-network-scenario ({target})"),
+                        "status": "passed",
+                        "checks": checks,
+                        "errorCode": None,
+                    }))
+                    sources.append({
+                        "kind": "connect-network-scenario",
+                        "mode": mode,
+                        "name": proof_name,
+                        "sha256": acceptance.sha256_file(proof_path),
+                    })
+            elif product == "nodeHost":
+                proof_checks = {
+                    "online": {
+                        "activationEnrollment": True,
+                        "directProtocolVerified": True,
+                        "relayProtocolVerified": True,
+                    },
+                    "offline-restart": {
+                        "controlUnavailableDuringRestart": True,
+                        "serviceInstanceChanged": True,
+                        "lastKnownGoodPreserved": True,
+                    },
+                    "isolation": {
+                        "directFailureIsolated": True,
+                        "relayFailureIsolated": True,
+                    },
+                    "logout": {"logoutRemovalCleanup": True},
+                }
+                for mode, checks in proof_checks.items():
+                    proof_name = f"{target}.{mode}.node.json"
+                    proof_path = self.lifecycle / proof_name
+                    proof_path.write_text(json.dumps({
+                        "schemaVersion": 1,
+                        "kind": "node-host-network-scenario",
+                        "mode": mode,
+                        "target": target,
+                        "sourceCommit": COMMIT,
+                        "artifact": {"name": artifact_name, "sha256": artifact_sha},
+                        "binarySha256": "c" * 64,
+                        "hooksSha256": "d" * 64,
+                        "ci": self._ci(f"node-host-network-scenario ({target})"),
+                        "status": "passed",
+                        "checks": checks,
+                        "errorCode": None,
+                    }))
+                    sources.append({
+                        "kind": "node-host-network-scenario",
+                        "mode": mode,
+                        "name": proof_name,
+                        "sha256": acceptance.sha256_file(proof_path),
+                    })
             (self.lifecycle / f"{target}.lifecycle.json").write_text(json.dumps({
                 "schemaVersion": 1,
                 "kind": "package-lifecycle",
@@ -120,6 +207,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
                 "target": target,
                 "artifact": {"name": artifact_name, "sha256": artifact_sha},
                 "results": {scenario: "passed" for scenario in acceptance.EXPECTED_SCENARIOS},
+                "sources": sources,
                 "ci": self._ci(f"artifact-lifecycle ({target})"),
             }))
         self.release_evidence.write_text(json.dumps({
@@ -156,6 +244,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
         )
 
     def test_complete_release_is_accepted_and_reverified(self) -> None:
+        self.assertIn("headless-smoke", acceptance.REQUIRED_COMPONENT_CHECKS["connect"])
         evidence = acceptance.aggregate(self._args())
         self.assertEqual(evidence["decision"]["state"], "accepted")
         path = self.root / "accepted.json"
@@ -212,6 +301,15 @@ class AcceptanceEvidenceTests(unittest.TestCase):
         path.write_text(json.dumps(value))
         evidence = acceptance.aggregate(self._args())
         self.assertEqual(evidence["decision"]["state"], "rejected")
+
+    def test_connect_isolation_requires_both_failure_proofs(self) -> None:
+        path = self.lifecycle / "connect-macos-aarch64.lifecycle.json"
+        value = json.loads(path.read_text())
+        value["sources"] = [source for source in value["sources"] if source["mode"] != "relay-failed"]
+        path.write_text(json.dumps(value))
+        evidence = acceptance.aggregate(self._args())
+        self.assertEqual(evidence["decision"]["state"], "rejected")
+        self.assertTrue(any("relay-path-isolation" in reason for reason in evidence["decision"]["reasons"]))
 
     def test_evidence_from_another_ci_attempt_is_rejected(self) -> None:
         path = self.components / "relay.component.json"

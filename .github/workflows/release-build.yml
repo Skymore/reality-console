@@ -88,7 +88,7 @@ jobs:
           python3 -m json.tool packaging/release-config.json >/dev/null
           python3 -m json.tool packaging/release-trust.json >/dev/null
           python3 -m json.tool packaging/release-acceptance-evidence.schema.json >/dev/null
-          python3 -m py_compile scripts/release/*.py
+          python3 -m py_compile scripts/release/*.py scripts/smoke/*.py
           while IFS= read -r script; do
             if head -1 "$script" | grep -q bash; then bash -n "$script"; else sh -n "$script"; fi
           done < <(find scripts packaging -type f \( -name '*.sh' -o -path '*/pkg-scripts/*' \) | sort)
@@ -104,6 +104,8 @@ jobs:
           scripts/smoke/release-manifest.sh
           packaging/macos/tests/preinstall-keeps-service-running.sh
           packaging/macos/tests/service-state-rollback.sh
+          packaging/macos/tests/uninstall-node-host.sh
+          packaging/macos/tests/validation-lifecycle-is-nonprivileged.sh
           python3 -m unittest discover -s scripts/release/tests -v
 
   windows-lifecycle-smoke:

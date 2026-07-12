@@ -569,21 +569,7 @@ impl SystemSetupExecutor {
     async fn service_status(&self) -> Result<SystemServiceStatus> {
         let package_verified = self.verifier.verify().await.is_ok();
         if let Ok(local) = query_local_service_status(&self.paths.data_dir).await {
-            let phase = if local.last_error.is_some() {
-                SystemServicePhase::NeedsAttention
-            } else if local.applied_revision.is_some() {
-                SystemServicePhase::Ready
-            } else {
-                SystemServicePhase::Enrolled
-            };
-            return Ok(SystemServiceStatus {
-                phase,
-                package_verified,
-                node_id: Some(local.node_id),
-                applied_revision: local.applied_revision,
-                last_sync_at: local.last_sync_at,
-                provider_policy: Some(local.provider_policy),
-            });
+            return Ok(SystemServiceStatus::from_local(&local, package_verified));
         }
         match status(&self.paths.data_dir) {
             Ok(host) => Ok(status_from_host(&host, package_verified)),
@@ -598,6 +584,12 @@ impl SystemSetupExecutor {
                 applied_revision: None,
                 last_sync_at: None,
                 provider_policy: None,
+                service_instance_id: None,
+                runtime_state: None,
+                setup_phase: None,
+                direct_verification: crate::system_setup::ProtocolVerification::Pending,
+                relay_verification: crate::system_setup::ProtocolVerification::Pending,
+                relay_connection: crate::system_setup::RelayConnectionState::NotRegistered,
             }),
         }
     }
@@ -841,6 +833,12 @@ fn status_from_host(host: &HostStatus, package_verified: bool) -> SystemServiceS
         applied_revision: host.applied_revision,
         last_sync_at: host.last_sync_at,
         provider_policy: Some(host.provider_policy.clone()),
+        service_instance_id: None,
+        runtime_state: None,
+        setup_phase: None,
+        direct_verification: crate::system_setup::ProtocolVerification::Pending,
+        relay_verification: crate::system_setup::ProtocolVerification::Pending,
+        relay_connection: crate::system_setup::RelayConnectionState::NotRegistered,
     }
 }
 

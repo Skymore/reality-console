@@ -109,13 +109,20 @@ Signed artifact and real-platform evidence intentionally remain outside this sta
 
 ## Stage 7: Signed Candidate Acceptance
 
-Status: pending.
+Status: in progress; signed-candidate evidence pending.
 
 One immutable candidate must satisfy every row in `docs/RELEASE_ACCEPTANCE.md` on the required real
 platforms. This stage supplies production trust roots and signing identities, runs the direct and
 relay topology, installs signed artifacts on clean macOS/Windows hosts, records the complete
 evidence matrix, and publishes only an `accepted` candidate. Unsigned or simulated artifacts cannot
 complete this stage.
+
+Current implementation work adds non-privileged validation inspection, clean package payload
+enforcement, explicit Node Host preserve/purge uninstall, authenticated installed-service headless
+control, installed Connect headless control on macOS and Windows, candidate-bound direct/relay/
+offline/logout scenario coordination, and actual-package lifecycle coverage. Acceptance remains
+open until the complete Connect and Node Host scenario matrix, including sleep and upgrade/rollback,
+runs on signed Apple Silicon, Intel macOS, and Windows artifacts.
 
 ## Engineering Gates
 

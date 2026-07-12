@@ -642,9 +642,10 @@ pub use setup_session::{
 };
 pub use sync::sync_once;
 pub use system_setup::{
-    provider_relay_consent, SetupInvitation, SystemServicePhase, SystemServiceStatus,
-    SystemSetupError, SystemSetupErrorCode, SystemSetupOperation, SystemSetupOutcome,
-    SystemSetupRequest, SystemSetupResponse, SystemSetupResult,
+    provider_relay_consent, ProtocolVerification, RelayConnectionState, SetupInvitation,
+    SystemServicePhase, SystemServiceStatus, SystemSetupError, SystemSetupErrorCode,
+    SystemSetupOperation, SystemSetupOutcome, SystemSetupRequest, SystemSetupResponse,
+    SystemSetupResult,
 };
 #[cfg(target_os = "macos")]
 pub use system_setup_macos::{

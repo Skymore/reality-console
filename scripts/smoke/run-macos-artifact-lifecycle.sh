@@ -17,7 +17,7 @@ mount=
 installed=
 cleanup() {
   if [[ -n "$mount" ]]; then hdiutil detach "$mount" -force >/dev/null 2>&1 || true; fi
-  if [[ "$target" == node-host-macos-* ]]; then
+  if [[ "$target" == node-host-macos-* && -n "$installed" ]]; then
     sudo launchctl bootout system/com.sky.realitynode.agent >/dev/null 2>&1 || true
     sudo rm -f /Library/LaunchDaemons/com.sky.realitynode.agent.plist
     sudo rm -rf "/Applications/Private Network Node.app" "/Library/Application Support/Private Network Node"
@@ -54,16 +54,42 @@ status=unsigned-validation
 artifact_signer=
 installer_signer=
 clean_result=incomplete
+uninstall_result=incomplete
 artifact_sha=$(shasum -a 256 "$artifact" | awk '{print $1}')
+writer_args=(
+  --artifact "$artifact"
+  --target "$target"
+  --source-commit "${GITHUB_SHA:?GITHUB_SHA is required}"
+)
+
+if [[ "$target" == connect-* && -n "${CONNECT_NETWORK_PROOF_DIR:-}" ]]; then
+  for proof_mode in online offline direct-failed relay-failed logout; do
+    proof="$CONNECT_NETWORK_PROOF_DIR/$target.$proof_mode.network.json"
+    [[ -f "$proof" ]] || { echo "Connect network proof is missing: $proof" >&2; exit 66; }
+    copied_proof="$(dirname "$lifecycle_output")/$(basename "$proof")"
+    cp "$proof" "$copied_proof"
+    writer_args+=(--network-proof "$copied_proof")
+  done
+fi
+if [[ "$target" == node-host-* && -n "${NODE_HOST_NETWORK_PROOF_DIR:-}" ]]; then
+  for proof_mode in online offline-restart isolation logout; do
+    proof="$NODE_HOST_NETWORK_PROOF_DIR/$target.$proof_mode.node.json"
+    [[ -f "$proof" ]] || { echo "Node Host network proof is missing: $proof" >&2; exit 66; }
+    copied_proof="$(dirname "$lifecycle_output")/$(basename "$proof")"
+    cp "$proof" "$copied_proof"
+    writer_args+=(--node-host-proof "$copied_proof")
+  done
+fi
 
 if [[ "$artifact" == *.dmg ]]; then
   if [[ "$mode" == release ]]; then
     spctl --assess --type open --context context:primary-signature -vv "$artifact"
   fi
   mount=$(hdiutil attach "$artifact" -readonly -nobrowse -plist | \
-    python3 -c 'import plistlib,sys; print(next(x["mount-point"] for x in plistlib.load(sys.stdin.buffer)["system-entities"] if "mount-point" in x))')
+    python3 -c 'import plistlib,sys; value=plistlib.loads(sys.stdin.buffer.read()); print(next(x["mount-point"] for x in value["system-entities"] if "mount-point" in x))')
   app=$(find "$mount" -maxdepth 2 -name '*.app' -type d -print -quit)
   [[ -n "$app" ]] || { echo "DMG contains no application" >&2; exit 65; }
+  smoke_app=$app
   if [[ "$mode" == release ]]; then
     codesign --verify --deep --strict --verbose=2 "$app"
     spctl --assess --type execute -vv "$app"
@@ -75,6 +101,17 @@ if [[ "$artifact" == *.dmg ]]; then
     installer_signer=$artifact_signer
     status=verified
     clean_result=passed
+    smoke_app=$installed
+  fi
+  if [[ "$target" == connect-macos-* ]]; then
+    executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$smoke_app/Contents/Info.plist")
+    [[ -n "$executable" && -x "$smoke_app/Contents/MacOS/$executable" ]] || {
+      echo "Connect bundle main executable is unavailable" >&2
+      exit 65
+    }
+    "$root/scripts/smoke/run-connect-headless.sh" "$smoke_app/Contents/MacOS/$executable"
+    connect_binary_sha=$(shasum -a 256 "$smoke_app/Contents/MacOS/$executable" | awk '{print $1}')
+    writer_args+=(--connect-binary-sha256 "$connect_binary_sha")
   fi
 elif [[ "$artifact" == *.pkg ]]; then
   pkgutil --expand-full "$artifact" "$work/expanded"
@@ -87,8 +124,38 @@ elif [[ "$artifact" == *.pkg ]]; then
     sudo installer -pkg "$artifact" -target /
     installed="/Library/Application Support/Private Network Node"
     verify_inner "$installed" >/dev/null
+    node_host_sha=$(shasum -a 256 "$installed/current/node-host" | awk '{print $1}')
+    writer_args+=(--node-host-binary-sha256 "$node_host_sha")
     status=verified
     clean_result=passed
+    uninstaller="$installed/bin/private-network-node-uninstall"
+    [[ -x "$uninstaller" ]] || { echo "installed package has no supported uninstaller" >&2; exit 65; }
+    state="$installed/service-state/state"
+    logs="/Library/Logs/Private Network Node"
+    sentinel=".acceptance-retained-${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
+    sudo -u _privnetnode /usr/bin/touch "$state/$sentinel" "$logs/$sentinel"
+    sudo "$uninstaller" --preserve-data
+    [[ -f "$state/$sentinel" && -f "$logs/$sentinel" ]] || {
+      echo "preserve-data uninstall removed retained state" >&2
+      exit 65
+    }
+    [[ ! -e "/Applications/Private Network Node.app" && ! -e "$installed/current" ]] || {
+      echo "preserve-data uninstall left executable assets installed" >&2
+      exit 65
+    }
+    sudo installer -pkg "$artifact" -target /
+    [[ -f "$state/$sentinel" && -f "$logs/$sentinel" ]] || {
+      echo "reinstall did not preserve retained state" >&2
+      exit 65
+    }
+    uninstaller="$installed/bin/private-network-node-uninstall"
+    sudo "$uninstaller" --purge-data --confirm-unpaired
+    [[ ! -e "$installed" && ! -e "$logs" && ! -e "/Applications/Private Network Node.app" ]] || {
+      echo "purge-data uninstall left package or state assets" >&2
+      exit 65
+    }
+    installed=
+    uninstall_result=passed
   fi
 else
   echo "unsupported macOS package type" >&2
@@ -110,14 +177,14 @@ value = {
 pathlib.Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 PY
 
-python3 "$root/scripts/release/write-lifecycle-evidence.py" \
-  --artifact "$artifact" \
-  --target "$target" \
-  --source-commit "${GITHUB_SHA:?GITHUB_SHA is required}" \
+writer_args+=( \
   --result "clean-install-signature=$clean_result" \
+  --result "uninstall-retention-choice=$uninstall_result" \
   --repository "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}" \
   --workflow "${GITHUB_WORKFLOW_REF:?GITHUB_WORKFLOW_REF is required}" \
   --run-id "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}" \
   --run-attempt "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}" \
   --job "artifact-lifecycle ($target)" \
-  --output "$lifecycle_output"
+  --output "$lifecycle_output" \
+)
+python3 "$root/scripts/release/write-lifecycle-evidence.py" "${writer_args[@]}"

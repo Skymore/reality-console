@@ -1,6 +1,6 @@
 # Product Completion Audit
 
-Status: Stage 6 complete; Stage 7 signed-candidate acceptance pending.
+Status: Stage 6 complete; Stage 7 implementation in progress and signed-candidate acceptance pending.
 
 This document prevents implementation milestones from being mistaken for product acceptance. A
 requirement is complete only when the production path and a scope-matched test prove it. Signed
@@ -15,6 +15,15 @@ packaged privileged setup,
 automatic Relay provisioning/rotation, exact Relay quota enforcement, telemetry replay evidence,
 and fail-closed release aggregation. Stage 7 remains pending until signed artifacts run the complete
 direct-plus-relay matrix on clean supported machines.
+
+Stage 7 implementation now includes installed Connect/Node Host headless control, explicit Node Host
+preserve/purge uninstall, non-privileged package validation, and a fail-closed Connect release-lab
+coordinator for online, offline, independent direct/relay failure, and logout proof. These are
+implementation assets only until their candidate-bound proofs run on the required signed packages.
+Connect state-preserving and failed-update rollback remain an implementation gap: bundle-cache and
+system-proxy recovery do not constitute transactional application-package rollback. Those lifecycle
+rows must remain `incomplete` until a real updater/helper preserves the installed predecessor and
+restores it after an injected package-switch failure on macOS and Windows.
 
 ## Functional Requirement Matrix
 

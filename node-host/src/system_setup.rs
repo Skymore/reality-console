@@ -1,5 +1,9 @@
-use crate::{ManualEndpointInput, ManualEndpointStatus, ProviderPolicy, ProviderPolicyStatus};
-use control_protocol::id::{NodeId, Revision, Timestamp};
+use crate::{
+    LocalServiceStatus, ManualEndpointInput, ManualEndpointStatus, NodeSetupPhase, ProviderPolicy,
+    ProviderPolicyStatus, RelayRuntimeState,
+};
+use control_protocol::id::{EndpointId, NodeId, Revision, Timestamp};
+use control_protocol::node::{EndpointReadiness, NodeEndpointStatus, NodeRuntimeState};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
@@ -273,6 +277,20 @@ pub enum SystemServicePhase {
     NeedsAttention,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProtocolVerification {
+    Pending,
+    Verified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RelayConnectionState {
+    NotRegistered,
+    Registered,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SystemServiceStatus {
@@ -282,11 +300,80 @@ pub struct SystemServiceStatus {
     pub applied_revision: Option<Revision>,
     pub last_sync_at: Option<Timestamp>,
     pub provider_policy: Option<ProviderPolicyStatus>,
+    /// Random identity for the currently running service process.
+    pub service_instance_id: Option<Uuid>,
+    /// Current managed Xray/admission state when the live service is available.
+    pub runtime_state: Option<NodeRuntimeState>,
+    /// Conservative end-to-end setup progress derived by the service.
+    pub setup_phase: Option<NodeSetupPhase>,
+    /// A non-relay endpoint has current protocol-verification evidence.
+    pub direct_verification: ProtocolVerification,
+    /// The assigned relay endpoint has current protocol-verification evidence.
+    pub relay_verification: ProtocolVerification,
+    /// The current service process has an authenticated registered relay route.
+    pub relay_connection: RelayConnectionState,
+}
+
+impl SystemServiceStatus {
+    pub(crate) fn from_local(local: &LocalServiceStatus, package_verified: bool) -> Self {
+        let (direct_verification, relay_verification) = endpoint_verification(
+            local
+                .controller_status
+                .as_ref()
+                .map_or(&[], |controller| controller.endpoints.as_slice()),
+            local.relay_assignment.endpoint_id,
+        );
+        let phase = if local.last_error.is_some() {
+            SystemServicePhase::NeedsAttention
+        } else if local.applied_revision.is_some() {
+            SystemServicePhase::Ready
+        } else {
+            SystemServicePhase::Enrolled
+        };
+        Self {
+            phase,
+            package_verified,
+            node_id: Some(local.node_id),
+            applied_revision: local.applied_revision,
+            last_sync_at: local.last_sync_at,
+            provider_policy: Some(local.provider_policy.clone()),
+            service_instance_id: Some(local.service_instance_id),
+            runtime_state: Some(local.runtime_state),
+            setup_phase: Some(local.setup_phase()),
+            direct_verification,
+            relay_verification,
+            relay_connection: if local.relay_runtime == RelayRuntimeState::Registered {
+                RelayConnectionState::Registered
+            } else {
+                RelayConnectionState::NotRegistered
+            },
+        }
+    }
+}
+
+fn endpoint_verification(
+    endpoints: &[NodeEndpointStatus],
+    relay_endpoint: Option<EndpointId>,
+) -> (ProtocolVerification, ProtocolVerification) {
+    let mut direct = ProtocolVerification::Pending;
+    let mut relay = ProtocolVerification::Pending;
+    for endpoint in endpoints {
+        if endpoint.readiness != EndpointReadiness::Verified {
+            continue;
+        }
+        if Some(endpoint.endpoint_id) == relay_endpoint {
+            relay = ProtocolVerification::Verified;
+        } else {
+            direct = ProtocolVerification::Verified;
+        }
+    }
+    (direct, relay)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::OffsetDateTime;
 
     #[test]
     fn request_schema_is_closed_and_secret_debug_is_redacted() {
@@ -337,5 +424,41 @@ mod tests {
         )
         .unwrap();
         assert!(provider_relay_consent(directory.path()).is_err());
+    }
+
+    #[test]
+    fn endpoint_verification_distinguishes_relay_identity_and_protocol_evidence() {
+        let direct_id = EndpointId::new();
+        let relay_id = EndpointId::new();
+        let checked = Timestamp::from_datetime(OffsetDateTime::now_utc());
+        let mut endpoints = vec![
+            NodeEndpointStatus {
+                endpoint_id: direct_id,
+                readiness: EndpointReadiness::Verified,
+                last_checked_at: Some(checked),
+                error_code: None,
+            },
+            NodeEndpointStatus {
+                endpoint_id: relay_id,
+                readiness: EndpointReadiness::TcpReachable,
+                last_checked_at: Some(checked),
+                error_code: None,
+            },
+        ];
+        assert_eq!(
+            endpoint_verification(&endpoints, Some(relay_id)),
+            (
+                ProtocolVerification::Verified,
+                ProtocolVerification::Pending
+            )
+        );
+        endpoints[1].readiness = EndpointReadiness::Verified;
+        assert_eq!(
+            endpoint_verification(&endpoints, Some(relay_id)),
+            (
+                ProtocolVerification::Verified,
+                ProtocolVerification::Verified
+            )
+        );
     }
 }

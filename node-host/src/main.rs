@@ -10,7 +10,11 @@ use node_host::{
     LocalServiceStatus, ManualEndpointInput, ProviderPolicy, SyncLoopOptions,
     UserServiceInstallRequest,
 };
+#[cfg(target_os = "macos")]
+use node_host::{SetupInvitation, SystemServiceClient, SystemSetupOperation, SystemSetupOutcome};
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -171,6 +175,11 @@ enum Command {
     },
     /// Run the installer-owned macOS `LaunchDaemon` using fixed package paths.
     SystemService,
+    /// Control the installed macOS system service through authenticated fixed-path IPC.
+    SystemControl {
+        #[command(subcommand)]
+        command: SystemControlCommand,
+    },
     /// Rebind a package-migrated identity to the fixed macOS system layout.
     #[command(hide = true)]
     MigrateSystemLayout,
@@ -232,6 +241,52 @@ enum ServiceCommand {
     },
     /// Stop and unregister the service while retaining identity and state.
     Remove,
+}
+
+#[derive(Debug, Subcommand)]
+enum SystemControlCommand {
+    /// Print the installed service's secret-free status as JSON.
+    Status,
+    /// Consume one setup invitation read only from stdin.
+    ConfirmSetup {
+        #[arg(long)]
+        provider_policy_file: PathBuf,
+        #[arg(long)]
+        accept_host_owner: bool,
+        #[arg(long)]
+        accept_exit_ip: bool,
+        #[arg(long)]
+        accept_router_mapping: bool,
+        #[arg(long)]
+        accept_relay: bool,
+    },
+    /// Replace the complete provider-local policy from a closed JSON DTO.
+    UpdateProviderPolicy {
+        #[arg(long)]
+        provider_policy_file: PathBuf,
+    },
+    /// Immediately withdraw every shared data path.
+    Pause,
+    /// Resume sharing subject to the provider-owned policy.
+    Resume,
+    /// Publish one finite explicit direct endpoint candidate.
+    ConfigureManualEndpoint {
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        public_port: u16,
+        #[arg(long)]
+        forwarded_local_port: u16,
+        #[arg(long, default_value_t = 86_400)]
+        ttl_seconds: u32,
+    },
+    /// Withdraw the provider-owned manual endpoint candidate.
+    ClearManualEndpoint,
+    /// Stop every live data path and remove enrollment with exact-ID confirmation.
+    Unpair {
+        #[arg(long)]
+        confirm_node_id: control_protocol::id::NodeId,
+    },
 }
 
 #[tokio::main]
@@ -321,11 +376,7 @@ async fn main() -> Result<()> {
             data_dir,
             policy_file,
         } => {
-            let bytes = fs::read(&policy_file)?;
-            if bytes.is_empty() || bytes.len() > 64 * 1024 {
-                anyhow::bail!("provider policy file must contain between 1 and 65536 bytes");
-            }
-            let policy: ProviderPolicy = serde_json::from_slice(&bytes)?;
+            let policy = load_provider_policy(&policy_file)?;
             configure_provider_policy(&data_dir, &policy)?;
             status(&data_dir)?
         }
@@ -365,6 +416,16 @@ async fn main() -> Result<()> {
             node_host::run_system_service().await?;
             #[cfg(not(target_os = "macos"))]
             anyhow::bail!("system-service is supported only by the macOS package");
+            return Ok(());
+        }
+        Command::SystemControl { command } => {
+            #[cfg(target_os = "macos")]
+            handle_system_control(command).await?;
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = command;
+                anyhow::bail!("system-control is supported only by the macOS package");
+            }
             return Ok(());
         }
         Command::MigrateSystemLayout => {
@@ -414,6 +475,81 @@ async fn main() -> Result<()> {
         }
     };
     print_status(&status);
+    Ok(())
+}
+
+fn load_provider_policy(path: &std::path::Path) -> Result<ProviderPolicy> {
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() || bytes.len() > 64 * 1024 {
+        anyhow::bail!("provider policy file must contain between 1 and 65536 bytes");
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(target_os = "macos")]
+async fn handle_system_control(command: SystemControlCommand) -> Result<()> {
+    let operation = match command {
+        SystemControlCommand::Status => SystemSetupOperation::Status {},
+        SystemControlCommand::ConfirmSetup {
+            provider_policy_file,
+            accept_host_owner,
+            accept_exit_ip,
+            accept_router_mapping,
+            accept_relay,
+        } => {
+            let mut invitation = String::new();
+            std::io::stdin()
+                .take(32 * 1024 + 1)
+                .read_to_string(&mut invitation)?;
+            while invitation.ends_with('\r') || invitation.ends_with('\n') {
+                invitation.pop();
+            }
+            if invitation.is_empty() || invitation.len() > 32 * 1024 {
+                zeroize::Zeroize::zeroize(&mut invitation);
+                anyhow::bail!("setup invitation stdin length is invalid");
+            }
+            SystemSetupOperation::ConfirmSetup {
+                setup_invitation: SetupInvitation::new(invitation),
+                accept_host_owner,
+                accept_exit_ip,
+                accept_router_mapping,
+                accept_relay,
+                provider_policy: load_provider_policy(&provider_policy_file)?,
+            }
+        }
+        SystemControlCommand::UpdateProviderPolicy {
+            provider_policy_file,
+        } => SystemSetupOperation::UpdateProviderPolicy {
+            provider_policy: load_provider_policy(&provider_policy_file)?,
+        },
+        SystemControlCommand::Pause => SystemSetupOperation::Pause {},
+        SystemControlCommand::Resume => SystemSetupOperation::Resume {},
+        SystemControlCommand::ConfigureManualEndpoint {
+            address,
+            public_port,
+            forwarded_local_port,
+            ttl_seconds,
+        } => SystemSetupOperation::ConfigureManualEndpoint {
+            endpoint: ManualEndpointInput {
+                address,
+                public_port,
+                forwarded_local_port,
+                ttl_seconds,
+            },
+        },
+        SystemControlCommand::ClearManualEndpoint => SystemSetupOperation::ClearManualEndpoint {},
+        SystemControlCommand::Unpair { confirm_node_id } => {
+            SystemSetupOperation::Unpair { confirm_node_id }
+        }
+    };
+    let response = SystemServiceClient::production()?
+        .request(operation)
+        .await?;
+    let failed = matches!(response.outcome, SystemSetupOutcome::Error { .. });
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    if failed {
+        anyhow::bail!("installed Node Host service rejected the operation");
+    }
     Ok(())
 }
 
@@ -615,5 +751,43 @@ fn print_controller_status(status: Option<&control_protocol::node::NodeHeartbeat
             endpoint.endpoint_id,
             endpoint.readiness.as_str()
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn system_control_exposes_only_closed_subcommands() {
+        assert!(Cli::try_parse_from(["node-host", "system-control", "status"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["node-host", "system-control", "raw", "--method", "exec"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn setup_invitation_has_no_command_line_argument() {
+        assert!(Cli::try_parse_from([
+            "node-host",
+            "system-control",
+            "confirm-setup",
+            "--provider-policy-file",
+            "/tmp/policy.json",
+            "--accept-host-owner",
+            "--accept-exit-ip",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "node-host",
+            "system-control",
+            "confirm-setup",
+            "--provider-policy-file",
+            "/tmp/policy.json",
+            "--setup-invitation",
+            "secret",
+        ])
+        .is_err());
     }
 }

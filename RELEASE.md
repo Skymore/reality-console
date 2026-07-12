@@ -99,11 +99,13 @@ and stops launchd before replacement. The postinstall verifies the installed app
 sidecar independently. If verification, ownership setup, or launchd bootstrap fails, its exit trap
 atomically restores the retained previous `current` symlink before returning failure.
 
-The Tauri app is intentionally a minimal native packaging shell. Its backend can retain a bounded
-setup code in process for safe preview/cancel and report only fixed-path package/launchd status. It
-does not expose arbitrary shell, path, or network operations. The existing Node Host crate has no
-production privileged setup IPC yet, so the shell does not claim that GUI pairing can mutate the
-root-owned system state.
+The Tauri app is intentionally a minimal native packaging shell. Its backend retains a bounded
+setup code in process for safe preview/cancel and talks to the dedicated `_privnetnode` LaunchDaemon
+over authenticated, bounded, fixed-path Unix-socket IPC. The closed operation set covers status,
+setup confirmation, provider policy, pause/resume, manual endpoint configuration, and exact-ID
+unpair. It exposes no arbitrary shell, path, network request, or raw Xray configuration surface.
+Invitation material crosses the privilege boundary only in the authenticated request frame and is
+never placed in process arguments, temporary files, logs, or ordinary renderer status state.
 
 Windows installs versioned payloads under `%ProgramFiles%\Private Network Node`, mutable state under
 `%ProgramData%\Private Network Node`, and wraps the console agent with WinSW as `LocalService`.
@@ -111,8 +113,12 @@ Linux installs immutable payloads under `/opt/private-network-node`, state under
 `/var/lib/private-network-node`, and runs as the locked `reality-node` account with a restricted
 `systemd` sandbox.
 
-Default uninstall preserves identity/state. Explicit purge removes it. Platform installers always
-stop/disable their owned service before removing binaries.
+The packaged macOS uninstaller requires an explicit retention choice. `--preserve-data` removes the
+app, daemon definition, immutable releases, runtime socket, and package receipt while retaining the
+service state and logs. `--purge-data` removes those retained paths only after exact node-ID
+confirmation, or `--confirm-unpaired` when no enrolled database exists. Windows and Linux follow
+the same preserve-by-default principle. Platform uninstallers always stop/disable only their owned
+service before removing binaries.
 
 ## Local Validation
 
@@ -122,7 +128,7 @@ The macOS-safe validation sequence is:
 python3 -m json.tool packaging/release-config.json >/dev/null
 python3 -m json.tool packaging/release-trust.json >/dev/null
 python3 -m json.tool packaging/release-acceptance-evidence.schema.json >/dev/null
-python3 -m py_compile scripts/release/*.py scripts/release/tests/*.py
+python3 -m py_compile scripts/release/*.py scripts/release/tests/*.py scripts/smoke/*.py
 bash -n scripts/release/run-component-gate.sh scripts/smoke/run-macos-artifact-lifecycle.sh
 find packaging scripts -type f -path '*/pkg-scripts/*' -exec sh -n {} \;
 plutil -lint packaging/macos/com.sky.realitynode.agent.plist
@@ -156,5 +162,12 @@ The following cannot be proven on the current macOS development machine and rema
 - production release/rollback trust roots and protected-environment key access;
 - GUI-to-root privileged setup IPC, firewall mutation, and system-keychain service ACLs;
 - end-to-end connection/recovery tests against a real Control Service and external network.
+
+The Connect release-lab path is executable rather than an operator checklist:
+`run-connect-network-acceptance.py` drives the installed package through online enrollment,
+Control-offline restart, independent direct/relay failure, recovery, and logout. Environment-specific
+controls are closed argument arrays with mandatory cleanup, not shell strings. Its five proof files
+are accepted only when they match the same source commit, CI attempt, package digest, target, and
+main executable digest later recomputed by the platform artifact lifecycle.
 
 No artifact may be promoted while one of its required platform rows lacks signed release evidence.

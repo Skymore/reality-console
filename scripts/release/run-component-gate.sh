@@ -73,9 +73,10 @@ case "$component" in
     version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$manifest" | head -1)
     ;;
   connect)
-    checks=(format build test clippy rustdoc sidecar-test typecheck production-build)
+    checks=(format build test clippy rustdoc headless-smoke sidecar-test typecheck production-build)
     scripts/release/prepare-sidecars.sh --product connect --target aarch64-apple-darwin
     rust_gate client/src-tauri/Cargo.toml
+    scripts/smoke/run-connect-headless.sh client/src-tauri/target/debug/reality-client
     npm_gate client "npm run test:sidecar" "npx tsc --noEmit" "npm run build"
     version=$(python3 -c 'import json; print(json.load(open("client/src-tauri/tauri.conf.json"))["version"])')
     ;;

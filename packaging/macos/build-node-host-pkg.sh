@@ -45,6 +45,7 @@ install -m 755 "$AGENT" "$BASE/releases/$VERSION/node-host"
 install -m 755 "$XRAY" "$BASE/releases/$VERSION/xray"
 install -m 644 "$WORK/sidecars.json" "$BASE/releases/$VERSION/sidecars.json"
 install -m 755 "$ROOT/packaging/macos/reality-node-service" "$BASE/bin/reality-node-service"
+install -m 755 "$ROOT/packaging/macos/uninstall-node-host.sh" "$BASE/bin/private-network-node-uninstall"
 ln -s "releases/$VERSION" "$BASE/current"
 install -m 644 "$ROOT/packaging/macos/com.sky.realitynode.agent.plist" "$PAYLOAD/Library/LaunchDaemons/com.sky.realitynode.agent.plist"
 # Copy script bytes instead of metadata so Finder/provenance xattrs cannot become AppleDouble files.
@@ -52,6 +53,19 @@ install -m 644 "$ROOT/packaging/macos/com.sky.realitynode.agent.plist" "$PAYLOAD
 /bin/cat "$ROOT/packaging/macos/pkg-scripts/postinstall" > "$PKG_SCRIPTS/postinstall"
 /bin/cat "$ROOT/packaging/macos/pkg-scripts/service-state-rollback" > "$PKG_SCRIPTS/service-state-rollback"
 /bin/chmod 755 "$PKG_SCRIPTS/preinstall" "$PKG_SCRIPTS/postinstall" "$PKG_SCRIPTS/service-state-rollback"
+
+# Provenance and Finder xattrs become AppleDouble `._*` payload entries when
+# pkgbuild archives the tree. Release packages carry only normal files and the
+# embedded Mach-O signatures, never host-local metadata sidecars.
+/usr/bin/xattr -cr "$PAYLOAD"
+if /usr/bin/xattr -lr "$PAYLOAD" 2>/dev/null | /usr/bin/grep -q 'com\.apple\.provenance:'; then
+  echo "build host retains protected com.apple.provenance metadata; refusing a polluted package" >&2
+  exit 65
+fi
+if /usr/bin/find "$PAYLOAD" -name '._*' -print -quit | /usr/bin/grep -q .; then
+  echo "payload contains an AppleDouble metadata file" >&2
+  exit 65
+fi
 
 PKG="$OUTPUT/private-network-node-$VERSION-$TARGET-unsigned-validation.pkg"
 /usr/bin/pkgbuild \
@@ -61,6 +75,13 @@ PKG="$OUTPUT/private-network-node-$VERSION-$TARGET-unsigned-validation.pkg"
   --version "$VERSION" \
   --install-location / \
   "$PKG"
+
+appledouble=$(/usr/sbin/pkgutil --payload-files "$PKG" | /usr/bin/grep -E '(^|/)\._' || true)
+if [ -n "$appledouble" ]; then
+  /bin/rm -f "$PKG"
+  printf 'package contains AppleDouble metadata files:\n%s\n' "$appledouble" >&2
+  exit 65
+fi
 
 if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
   SIGNED="$OUTPUT/private-network-node-$VERSION-$TARGET.pkg"

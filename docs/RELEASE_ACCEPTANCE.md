@@ -47,6 +47,7 @@ The release job additionally verifies:
 
 1. every embedded Xray asset name, version, and SHA-256 against `client/xray-sidecar.json`;
 2. generated packages contain the expected target-specific sidecar and no other executable payload;
+   macOS package payloads also contain no AppleDouble metadata sidecars;
 3. macOS code-sign verification covers nested executables before notarization and stapling;
 4. Windows Authenticode verification covers the installer and installed executables;
 5. the SBOM and update manifest describe the exact package digests;
@@ -77,7 +78,9 @@ Control <----------+---- outbound-only node/control sessions
 ```
 
 No acceptance step may read or mutate the operator's live Xray configuration, live router mapping,
-normal Keychain namespace, normal system-proxy state, or production Control database.
+normal Keychain namespace, normal system-proxy state, production Control database, or an existing
+Node Host installation. Validation-mode artifact inspection must not invoke privileged install or
+cleanup commands; release lifecycle jobs run only on disposable clean hosts.
 
 ## 4. Product Acceptance Matrix
 
@@ -114,6 +117,46 @@ Windows and Intel macOS evidence must come from matching CI runners or matching 
 cross-compile check from Apple Silicon is useful compiler evidence but does not satisfy package,
 signature, installation, proxy, service, sleep, or uninstall behavior.
 
+Connect network evidence is collected from the installed executable with
+`scripts/smoke/run-connect-network-scenario.py`. The coordinator prepares a disposable Control
+instance, one direct node, one independently routed relay node, a fixed test origin, and a one-time
+Connect setup code. It then runs `online`, stops Control and runs `offline`, restores Control,
+independently withdraws the direct and relay paths for `direct-failed` and `relay-failed`, restores
+both paths, and runs `logout`. The setup code is supplied only on stdin. Every other mode accepts
+empty stdin.
+Every proof binds the source commit, CI run attempt, release target, package SHA-256, and installed
+binary SHA-256. `write-lifecycle-evidence.py --network-proof ...` rejects a proof from another
+candidate, package, packaged main binary, target, CI job, or CI attempt. The platform lifecycle
+recomputes the main-binary digest from the mounted DMG or installed Windows directory rather than
+trusting the scenario command line. The current online proof satisfies activation/enrollment
+and direct-path only; merely reaching a relay does not satisfy relay-path isolation because that row
+also requires an independently injected route failure.
+
+The five proof filenames are fixed as `<target>.<mode>.network.json` for `online`, `offline`,
+`direct-failed`, `relay-failed`, and `logout`. After the coordinator restores a clean
+installed-package state, it
+sets `CONNECT_NETWORK_PROOF_DIR` when invoking the platform artifact lifecycle script. Supplying the
+directory is all-or-nothing: a missing mode fails the job. The lifecycle script copies the proof
+bytes into its uploaded evidence directory before importing them; the acceptance aggregator locates
+those bytes again and independently verifies their digest and candidate identity.
+
+`run-connect-network-acceptance.py` implements the coordinator sequence. Its hook file is a closed
+schema of bounded argument arrays, never shell command strings, and contains no setup code. Hooks
+must be idempotent release-lab controls for readiness, Control stop/start, direct disable/enable,
+relay disable/enable, and final cleanup. Cleanup runs after success or failure; the setup code is
+read once from stdin and forwarded only to the `online` child. The proof directory must be a new
+absolute directory so a previous run cannot be mistaken for the current candidate.
+
+Node Host packages use `run-node-host-network-acceptance.py` against the installed agent's closed
+`system-control` interface. It consumes the invitation only on stdin, waits until the exact applied
+revision has both direct and relay protocol-verification evidence and a registered relay, then
+restarts the service with Control stopped and requires a new service-instance ID with the same node
+and applied revision. Release-lab hooks independently withdraw and probe each path, restore both,
+and final unpair must return an unpaired secret-free status. The four `online`, `offline-restart`,
+`isolation`, and `logout` proof files contain no node ID, invitation, endpoint, or policy contents.
+`NODE_HOST_NETWORK_PROOF_DIR` imports all four or fails; the package lifecycle recomputes the agent
+SHA-256 from the installed `.pkg` payload before accepting them.
+
 ## 6. Failure Isolation
 
 The matrix deliberately injects these failures and records only stable error codes and timing:
@@ -148,6 +191,12 @@ then retires the predecessor. Interrupted rotation resumes from durable state.
 Uninstall stops owned processes and services, releases owned router mappings, restores owned proxy
 state, and removes executable/runtime files. Destructive identity or telemetry deletion requires a
 separate explicit choice and is tested independently from ordinary uninstall.
+
+The macOS Node Host artifact lifecycle writes service-owned sentinels after clean package install,
+runs the packaged preserve-data uninstaller, reinstalls the exact same artifact and proves the
+sentinels survived, then runs the explicit unpaired purge and proves application, runtime, state,
+log, and receipt-owned paths were removed. Source-level tests separately prove exact-ID confirmation
+for purging paired state and reject symlinked fixed paths before deletion.
 
 ## 8. Support Bundle Evidence
 

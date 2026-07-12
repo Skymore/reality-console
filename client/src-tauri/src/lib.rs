@@ -3,6 +3,7 @@ pub mod connect_service;
 pub mod control_api;
 mod core;
 mod error;
+mod headless;
 mod member_setup;
 mod process;
 mod profile;
@@ -25,6 +26,8 @@ use session::DeviceMetadata;
 use state::{ClientState, ProxyMode};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+
+pub use headless::HeadlessInvocation;
 
 async fn run_blocking<T, F>(task: F) -> Result<T, ClientError>
 where
@@ -218,8 +221,16 @@ async fn connect_logout(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    run_application(None);
+}
+
+pub fn run_headless(invocation: HeadlessInvocation) {
+    run_application(Some(invocation));
+}
+
+fn run_application(headless: Option<HeadlessInvocation>) {
     let app = tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             let app_data_dir = app.path().app_data_dir()?;
             let profiles = ProfileRepository::native(app_data_dir.clone())
                 .map_err(|error| std::io::Error::other(error.message))?;
@@ -235,7 +246,16 @@ pub fn run() {
             });
             app.manage(SetupSessionStore::new());
             app.manage(ConnectRuntimeRegistry::new(app_data_dir, supervisor));
-            tauri::async_runtime::spawn(runtime::run_background_maintenance(app.handle().clone()));
+            if let Some(invocation) = headless {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.hide()?;
+                }
+                tauri::async_runtime::spawn(headless::execute(app.handle().clone(), invocation));
+            } else {
+                tauri::async_runtime::spawn(runtime::run_background_maintenance(
+                    app.handle().clone(),
+                ));
+            }
             Ok(())
         })
         .plugin(tauri_plugin_shell::init())

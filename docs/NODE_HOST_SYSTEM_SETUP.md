@@ -114,12 +114,25 @@ Development/tests may inject an explicit identity directory. Production always p
 | `/Library/Application Support/Private Network Node/service-state` | `_privnetnode`, `0700` | Parent retained across unpair |
 | `/Library/Application Support/Private Network Node/service-state/state` | `_privnetnode`, `0700` | Copyable operational state removed by unpair |
 | `/Library/Application Support/Private Network Node/service-state/identity` | `_privnetnode`, `0700` | Non-copyable installation identity removed by unpair |
+| `/Library/Application Support/Private Network Node/bin/private-network-node-uninstall` | `root:wheel`, `0755` | Fixed-path explicit preserve/purge uninstaller |
 | `/var/run/private-network-node` | `root:_privnetnode`, `0775` | Protected socket namespace |
 | `/Library/LaunchDaemons/com.sky.realitynode.agent.plist` | `root:wheel`, `0644` | Dedicated-user LaunchDaemon |
 
 The LaunchDaemon invokes only the root-owned wrapper, which invokes `node-host system-service`
 without mutable arguments. The wrapper retains a fixed-path fallback only so package rollback can
 restart the final pre-system-service release.
+
+The same installed agent exposes `node-host system-control` for headless administration and release
+acceptance. It is a client of the authenticated socket, not a second privileged implementation.
+Its closed subcommands mirror status, setup, policy, pause/resume, manual endpoint, and unpair DTOs.
+Setup invitation bytes are accepted only on stdin; there is no invitation argument, arbitrary RPC,
+path mutation, shell, or raw Xray configuration option.
+
+The status response includes only safe acceptance evidence: current service-instance ID, runtime
+and setup phases, direct/relay protocol-verification states, and whether the relay is registered.
+Endpoint IDs, addresses, credentials, generated configuration, and invitation material remain
+absent. Direct verification is a verified controller endpoint other than the current relay endpoint;
+relay verification must match the exact assigned relay endpoint ID.
 
 ## Unpair Barrier
 
@@ -168,6 +181,10 @@ the installer does not start the previous binary against a partially migrated sc
   retaining enrollment and last-known-good revision.
 - Unpair stops and acknowledges every live data path first, removes local credentials, state, and
   external identity, then returns the installed package to an empty unpaired mode.
+- Package uninstall requires an explicit `--preserve-data` or `--purge-data` choice. Purging paired
+  state additionally requires the exact node ID; purging an already unpaired installation requires
+  `--confirm-unpaired`. The uninstaller refuses symlinked or unexpectedly owned fixed paths and
+  preserves service state plus logs unless purge was explicitly selected.
 
 ## Required Tests
 
@@ -183,3 +200,4 @@ the installer does not start the previous binary against a partially migrated sc
   external identity, and retries from both pending and complete markers;
 - preinstall payload failure leaves the previous service running;
 - post-migration failure restores schema, WAL/SHM, seeds, modes, layout, and previous service.
+- package uninstall proves both explicit data preservation and confirmed purge paths.
