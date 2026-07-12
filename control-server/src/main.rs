@@ -5,6 +5,7 @@ use control_server::{build_router, operations, AppState, Database, ProbeMode, Se
 use std::error::Error;
 use std::ffi::OsString;
 use std::future::IntoFuture as _;
+use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -27,22 +28,29 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .init();
 
     let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments
+    let config_path = if arguments
         .first()
         .is_some_and(|argument| argument == "serve")
     {
         arguments.remove(0);
-        if !arguments.is_empty() {
-            return Err("serve does not accept positional arguments".into());
+        match arguments.as_slice() {
+            [] => None,
+            [flag, path] if flag == "--config" => Some(PathBuf::from(path)),
+            _ => return Err("usage: control-server serve [--config ABSOLUTE_JSON_PATH]".into()),
         }
     } else if is_operation_command(arguments.first()) {
         operations::run_operation_command(arguments)?;
         return Ok(());
     } else if !arguments.is_empty() {
         return Err(operations::OperationCliError::Usage.into());
-    }
+    } else {
+        None
+    };
 
-    let mut config = ServiceConfig::from_env()?;
+    let mut config = match config_path {
+        Some(path) => ServiceConfig::from_file(&path)?,
+        None => ServiceConfig::from_env()?,
+    };
     let probe_mode = config.probe_mode;
     let probe_options = config.probe_options;
     let remote_probe = config.remote_probe.take();

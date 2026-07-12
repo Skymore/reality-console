@@ -156,6 +156,23 @@ npm --prefix probe-worker test
 npm --prefix probe-worker run deploy -- --dry-run
 ```
 
+## MVP Operations
+
+The first operator-facing product path is the macOS Control Service bootstrap. It compiles and
+installs the service into an owner-only application data directory, writes a closed JSON
+configuration, registers a background LaunchAgent, and waits for the health endpoint:
+
+```bash
+python3 scripts/product/control-service.py install \
+  --network-name "Friends Network" \
+  --xray-path /opt/homebrew/bin/xray
+
+python3 scripts/product/control-service.py status
+```
+
+See [docs/MVP_OPERATIONS.md](./docs/MVP_OPERATIONS.md) for lifecycle commands, storage locations,
+and the HTTPS-origin requirement before issuing setup codes to other machines.
+
 Control Service defaults `CONTROL_PROBE_MODE` to `disabled`. `local-tcp` is a development or
 external-controller mode only: the Control Service process must be outside the candidate node's
 LAN, otherwise the result tests router hairpin behavior rather than Internet reachability. TCP

@@ -11458,6 +11458,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn relay_predecessor_is_retained_until_successor_acknowledgement() {
         let temp = TempDir::new().unwrap();
         let database = Database::open(&database_path(&temp), "Relay rotation").unwrap();

@@ -32,12 +32,13 @@ npm_gate() {
 case "$component" in
   control)
     manifest=control-server/Cargo.toml
-    checks=(format build test clippy rustdoc migration-empty migration-previous)
+    checks=(format build test clippy rustdoc migration-empty migration-previous product-bootstrap)
     rust_gate "$manifest"
     cargo test --locked --manifest-path "$manifest" --lib db::tests::applies_required_pragmas_and_records_authoritative_migration -- --exact
     cargo test --locked --manifest-path "$manifest" --lib db::tests::v3_upgrade_discards_untrusted_heartbeat_progress_and_builds_revision_journal -- --exact
     cargo test --locked --manifest-path "$manifest" --lib db::tests::v4_upgrade_preserves_revision_graph_and_accepts_schema_two -- --exact
     python3 scripts/release/verify-control-previous-migration.py
+    python3 -m unittest discover -s scripts/product/tests -v
     version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' control-server/Cargo.toml | head -1)
     ;;
   protocol)

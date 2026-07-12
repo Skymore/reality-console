@@ -3,9 +3,12 @@ use crate::probe::{
     ProbeMode, RemoteTcpProbeConfig, RemoteTcpProbeConfigError, TcpProbeLoopOptions,
 };
 use crate::protocol_canary::{CanaryConfigError, ProtocolCanaryConfig, ProtocolCanaryLoopOptions};
+use serde::Deserialize;
 use std::env;
+use std::fs;
+use std::io::Read as _;
 use std::net::{AddrParseError, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 use url::{Host, Url};
@@ -15,6 +18,25 @@ const DEFAULT_DATABASE_PATH: &str = "data/control-service.sqlite3";
 const DEFAULT_NETWORK_NAME: &str = "Private Network";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_TEST_CONTROLLER_ORIGIN: &str = "https://control.test";
+const SERVICE_CONFIG_SCHEMA_VERSION: u16 = 1;
+const MAX_SERVICE_CONFIG_BYTES: u64 = 64 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServiceConfigFile {
+    schema_version: u16,
+    bind_address: String,
+    database_path: PathBuf,
+    network_name: String,
+    bootstrap_token: String,
+    public_origin: String,
+    request_timeout_seconds: u64,
+    probe_mode: String,
+    tcp_probe_url: Option<String>,
+    tcp_probe_token: Option<String>,
+    protocol_canary_xray_path: Option<PathBuf>,
+    protocol_canary_xray_sha256: Option<String>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -104,6 +126,86 @@ impl ServiceConfig {
             protocol_canary,
             protocol_canary_options: ProtocolCanaryLoopOptions::default(),
             relay_provisioning,
+        })
+    }
+
+    /// Loads one closed owner-only JSON configuration for a background service.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when the path is relative, linked, accessible by
+    /// group/other users, oversized, malformed, or contains invalid service values.
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
+        if !path.is_absolute() {
+            return Err(ConfigError::UnsafeConfigFile);
+        }
+        let metadata = fs::symlink_metadata(path).map_err(ConfigError::ConfigFileRead)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() == 0
+            || metadata.len() > MAX_SERVICE_CONFIG_BYTES
+        {
+            return Err(ConfigError::UnsafeConfigFile);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(ConfigError::UnsafeConfigFile);
+            }
+        }
+        let capacity =
+            usize::try_from(metadata.len()).map_err(|_| ConfigError::UnsafeConfigFile)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        fs::File::open(path)
+            .map_err(ConfigError::ConfigFileRead)?
+            .take(MAX_SERVICE_CONFIG_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(ConfigError::ConfigFileRead)?;
+        if bytes.is_empty()
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SERVICE_CONFIG_BYTES
+        {
+            return Err(ConfigError::UnsafeConfigFile);
+        }
+        let file: ServiceConfigFile =
+            serde_json::from_slice(&bytes).map_err(ConfigError::ConfigFileJson)?;
+        if file.schema_version != SERVICE_CONFIG_SCHEMA_VERSION {
+            return Err(ConfigError::UnsupportedConfigFileSchema);
+        }
+        if !file.database_path.is_absolute() {
+            return Err(ConfigError::UnsafeConfigFile);
+        }
+        let bind_address = file.bind_address.parse()?;
+        validate_network_name(&file.network_name)?;
+        let bootstrap_token = BootstrapTokenVerifier::new(&file.bootstrap_token)?;
+        let controller_origin = normalize_controller_origin(&file.public_origin)?;
+        if !(1..=60).contains(&file.request_timeout_seconds) {
+            return Err(ConfigError::InvalidTimeout);
+        }
+        let probe_mode = file
+            .probe_mode
+            .parse()
+            .map_err(|_| ConfigError::InvalidProbeMode)?;
+        let remote_probe =
+            build_remote_probe_config(probe_mode, file.tcp_probe_url, file.tcp_probe_token)?;
+        let protocol_canary = build_protocol_canary_config(
+            file.protocol_canary_xray_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            file.protocol_canary_xray_sha256,
+        )?;
+        Ok(Self {
+            bind_address,
+            database_path: file.database_path,
+            network_display_name: file.network_name,
+            bootstrap_token,
+            controller_origin,
+            request_timeout: Duration::from_secs(file.request_timeout_seconds),
+            probe_mode,
+            probe_options: TcpProbeLoopOptions::default(),
+            remote_probe,
+            protocol_canary,
+            protocol_canary_options: ProtocolCanaryLoopOptions::default(),
+            relay_provisioning: None,
         })
     }
 
@@ -343,15 +445,25 @@ pub enum ConfigError {
     InvalidRelayProvisioning,
     #[error(transparent)]
     InvalidProtocolCanary(#[from] CanaryConfigError),
+    #[error("control service config file is unsafe or has invalid bounds")]
+    UnsafeConfigFile,
+    #[error("control service config file schema is unsupported")]
+    UnsupportedConfigFileSchema,
+    #[error("failed to read control service config file")]
+    ConfigFileRead(#[source] std::io::Error),
+    #[error("control service config file JSON is invalid")]
+    ConfigFileJson(#[source] serde_json::Error),
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         build_remote_probe_config, normalize_controller_origin, ConfigError,
-        RelayProvisioningConfig,
+        RelayProvisioningConfig, ServiceConfig,
     };
     use crate::probe::ProbeMode;
+    use serde_json::json;
+    use std::fs;
 
     const TOKEN: &str = "remote-config-test-token-with-at-least-32-bytes";
 
@@ -374,6 +486,58 @@ mod tests {
             normalize_controller_origin("http://[::1]:8787/").unwrap(),
             "http://[::1]:8787"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_file_is_closed_absolute_and_owner_only() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("control.json");
+        let value = json!({
+            "schemaVersion": 1,
+            "bindAddress": "127.0.0.1:8787",
+            "databasePath": temporary.path().join("control.sqlite3"),
+            "networkName": "Friends",
+            "bootstrapToken": TOKEN,
+            "publicOrigin": "http://127.0.0.1:8787",
+            "requestTimeoutSeconds": 10,
+            "probeMode": "disabled",
+            "tcpProbeUrl": null,
+            "tcpProbeToken": null,
+            "protocolCanaryXrayPath": null,
+            "protocolCanaryXraySha256": null
+        });
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let config = ServiceConfig::from_file(&path).unwrap();
+        assert_eq!(
+            config.database_path,
+            temporary.path().join("control.sqlite3")
+        );
+        assert_eq!(config.controller_origin, "http://127.0.0.1:8787");
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            ServiceConfig::from_file(&path),
+            Err(ConfigError::UnsafeConfigFile)
+        ));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = temporary.path().join("linked.json");
+        symlink(&path, &link).unwrap();
+        assert!(matches!(
+            ServiceConfig::from_file(&link),
+            Err(ConfigError::UnsafeConfigFile)
+        ));
+
+        let mut extended = value;
+        extended["unknown"] = json!(true);
+        fs::write(&path, serde_json::to_vec(&extended).unwrap()).unwrap();
+        assert!(matches!(
+            ServiceConfig::from_file(&path),
+            Err(ConfigError::ConfigFileJson(_))
+        ));
     }
 
     #[test]

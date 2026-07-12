@@ -24,7 +24,16 @@ EXPECTED_COMPONENTS = {
     "probe-worker",
 }
 REQUIRED_COMPONENT_CHECKS = {
-    "control": {"format", "build", "test", "clippy", "rustdoc", "migration-empty", "migration-previous"},
+    "control": {
+        "format",
+        "build",
+        "test",
+        "clippy",
+        "rustdoc",
+        "migration-empty",
+        "migration-previous",
+        "product-bootstrap",
+    },
     "protocol": {"format", "build", "test", "clippy", "rustdoc"},
     "xray-runtime": {"format", "build", "test", "clippy", "rustdoc"},
     "node-host": {"format", "build", "test", "clippy", "rustdoc", "migration-empty", "migration-previous"},

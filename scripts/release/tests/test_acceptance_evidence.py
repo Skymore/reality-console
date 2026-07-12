@@ -245,6 +245,7 @@ class AcceptanceEvidenceTests(unittest.TestCase):
 
     def test_complete_release_is_accepted_and_reverified(self) -> None:
         self.assertIn("headless-smoke", acceptance.REQUIRED_COMPONENT_CHECKS["connect"])
+        self.assertIn("product-bootstrap", acceptance.REQUIRED_COMPONENT_CHECKS["control"])
         evidence = acceptance.aggregate(self._args())
         self.assertEqual(evidence["decision"]["state"], "accepted")
         path = self.root / "accepted.json"
