@@ -13,8 +13,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 LABEL = "com.private-network.control-service"
@@ -317,6 +319,59 @@ def admin_token(args: argparse.Namespace) -> None:
     print(config["bootstrapToken"])
 
 
+def admin_request(
+    config: dict[str, object],
+    method: str,
+    path: str,
+    body: dict[str, object] | None = None,
+) -> object:
+    host, port = validate_bind(str(config["bindAddress"]))
+    origin = f"http://{host}:{port}"
+    headers = {"Authorization": f"Bearer {config['bootstrapToken']}"}
+    data = None
+    if body is not None:
+        data = json.dumps(body, separators=(",", ":")).encode()
+        headers["Content-Type"] = "application/json"
+        headers["Idempotency-Key"] = str(uuid.uuid4())
+    request = Request(f"{origin}{path}", data=data, headers=headers, method=method)
+    try:
+        with urlopen(request, timeout=10) as response:
+            return json.loads(response.read())
+    except HTTPError as error:
+        raise ProductError(f"Control Service rejected the request with HTTP {error.code}") from error
+    except (URLError, TimeoutError) as error:
+        raise ProductError("Control Service is unavailable") from error
+
+
+def node_invitation_body(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "displayName": args.display_name,
+        "expiresInSeconds": args.expires_in_seconds,
+        "initialConfiguration": {
+            "minAgentVersion": "0.1.0",
+            "xray": {
+                "listenPort": args.listen_port,
+                "publicPort": args.public_port,
+                "serverNames": [args.server_name],
+                "target": args.target or f"{args.server_name}:443",
+            },
+        },
+    }
+
+
+def create_node(args: argparse.Namespace) -> None:
+    config = load_config(args.data_dir)
+    value = admin_request(config, "POST", "/v1/admin/node-invitations", node_invitation_body(args))
+    if not isinstance(value, dict) or not isinstance(value.get("setupCode"), str):
+        raise ProductError("Control Service returned an invalid node setup response")
+    print(json.dumps(value, indent=2))
+
+
+def nodes(args: argparse.Namespace) -> None:
+    config = load_config(args.data_dir)
+    print(json.dumps(admin_request(config, "GET", "/v1/admin/nodes"), indent=2))
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser()
     commands = root.add_subparsers(dest="command", required=True)
@@ -330,6 +385,16 @@ def parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("--data-dir", type=Path, default=default_data_dir())
     commands.add_parser("stop")
+    create_node_parser = commands.add_parser("create-node")
+    create_node_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    create_node_parser.add_argument("--display-name", required=True)
+    create_node_parser.add_argument("--expires-in-seconds", type=int, default=3600)
+    create_node_parser.add_argument("--listen-port", type=int, default=10443)
+    create_node_parser.add_argument("--public-port", type=int, default=443)
+    create_node_parser.add_argument("--server-name", default="www.microsoft.com")
+    create_node_parser.add_argument("--target")
+    nodes_parser = commands.add_parser("nodes")
+    nodes_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
     return root
 
 
@@ -344,8 +409,12 @@ def main() -> int:
             start(args)
         elif args.command == "stop":
             stop(args)
-        else:
+        elif args.command == "admin-token":
             admin_token(args)
+        elif args.command == "create-node":
+            create_node(args)
+        else:
+            nodes(args)
     except (ProductError, OSError, subprocess.CalledProcessError, ValueError) as error:
         print(f"control-service: {error}", file=sys.stderr)
         return 1

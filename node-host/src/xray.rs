@@ -758,7 +758,10 @@ fn normalize_version(output: &str) -> Result<String> {
     {
         bail!("Xray version output is invalid");
     }
-    Ok(version.to_owned())
+    Ok(format!(
+        "Xray {}",
+        release.expect("validated release exists")
+    ))
 }
 
 fn validate_reality_seed(seed: &SecretSeed) -> Result<()> {
@@ -798,6 +801,13 @@ mod tests {
         assert_eq!(
             normalize_version("Xray 25.7.1\nA unified platform").unwrap(),
             "Xray 25.7.1"
+        );
+        assert_eq!(
+            normalize_version(
+                "Xray 26.3.27 (Xray, Penetrates Everything.) Custom (go1.26.1 darwin/arm64)"
+            )
+            .unwrap(),
+            "Xray 26.3.27"
         );
         assert!(normalize_version("").is_err());
         assert!(normalize_version("Xray\t25").is_err());

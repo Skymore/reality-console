@@ -75,11 +75,47 @@ python3 scripts/product/control-service.py install \
 The reverse tunnel must forward only to `http://127.0.0.1:8787`. The service remains loopback-only,
 and reconfiguration preserves the existing database, controller identity, and administrator token.
 
-## 5. Remaining Product Stages
+## 5. Create a Node Setup Code
+
+After the public origin is configured, create one single-use code with the node's intended public
+port. The target defaults to the selected server name on port 443.
+
+```bash
+python3 scripts/product/control-service.py create-node \
+  --display-name "Friend Mac" \
+  --listen-port 10443 \
+  --public-port 443
+```
+
+The returned `setupCode` is a short-lived secret. Send it only to the intended node owner. It is
+entered into the Node Host application; no JSON, controller URL, key, or certificate is required.
+
+The installed Node Host service reports a secret-free status to its application. For a headless
+development check, the same backend contract reads the code from stdin so it never appears in
+process arguments:
+
+```bash
+node-host setup \
+  --data-dir /absolute/private/state \
+  --xray-binary-path /absolute/installed/xray \
+  --xray-sha256 64-lowercase-hex-characters \
+  --accept-host-owner \
+  --accept-exit-ip
+
+node-host status --data-dir /absolute/private/state
+```
+
+List controller-visible node status with:
+
+```bash
+python3 scripts/product/control-service.py nodes
+```
+
+## 6. Remaining Product Stages
 
 The next product stages build on this running controller:
 
-1. Install Node Host and join it with one setup code.
+1. Install the signed Node Host package on a separate Mac and confirm the same one-code path.
 2. Create a friend account and assign one or more ready nodes.
 3. Activate Connect with one account setup code and automatically receive the node list.
 4. Prove a real client connection through the complete installed path.

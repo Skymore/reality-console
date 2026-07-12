@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).parents[1] / "control-service.py"
@@ -62,6 +63,48 @@ class ControlServiceProductTests(unittest.TestCase):
         encoded = json.dumps(value)
         self.assertNotIn(token, encoded)
         self.assertEqual(value["ProgramArguments"], [str(binary), "serve", "--config", str(config)])
+
+    def test_node_invitation_has_complete_initial_configuration(self):
+        class Args:
+            display_name = "Friend Mac"
+            expires_in_seconds = 900
+            listen_port = 10443
+            public_port = 443
+            server_name = "www.microsoft.com"
+            target = None
+
+        body = control.node_invitation_body(Args())
+        self.assertEqual(body["displayName"], "Friend Mac")
+        self.assertEqual(body["initialConfiguration"]["xray"], {
+            "listenPort": 10443,
+            "publicPort": 443,
+            "serverNames": ["www.microsoft.com"],
+            "target": "www.microsoft.com:443",
+        })
+
+    def test_admin_requests_stay_on_loopback_when_public_origin_is_remote(self):
+        config = {
+            "bindAddress": "127.0.0.1:8787",
+            "publicOrigin": "https://control.example.test",
+            "bootstrapToken": "secret-token",
+        }
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def read():
+                return b'{"nodes":[]}'
+
+        with patch.object(control, "urlopen", return_value=Response()) as request:
+            self.assertEqual(control.admin_request(config, "GET", "/v1/admin/nodes"), {"nodes": []})
+        self.assertEqual(request.call_args.args[0].full_url, "http://127.0.0.1:8787/v1/admin/nodes")
 
 
 if __name__ == "__main__":

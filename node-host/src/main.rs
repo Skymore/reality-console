@@ -13,7 +13,6 @@ use node_host::{
 #[cfg(target_os = "macos")]
 use node_host::{SetupInvitation, SystemServiceClient, SystemSetupOperation, SystemSetupOutcome};
 use std::fs;
-#[cfg(target_os = "macos")]
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,6 +26,33 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Join with one setup code read from stdin and prepare the local runtime.
+    Setup {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Explicit absolute path to the installer-bundled Xray executable.
+        #[arg(long)]
+        xray_binary_path: PathBuf,
+        /// Trusted installer-manifest SHA-256 for the bundled Xray executable.
+        #[arg(long)]
+        xray_sha256: String,
+        /// Confirms that you own or are authorized to operate this host.
+        #[arg(long)]
+        accept_host_owner: bool,
+        /// Confirms that this network may expose your public IP as an exit IP.
+        #[arg(long)]
+        accept_exit_ip: bool,
+        /// Enables one finite TCP router mapping after the disclosure is accepted.
+        #[arg(long)]
+        accept_router_mapping: bool,
+        /// Registers the enrolled host as the current user's macOS `LaunchAgent`.
+        #[arg(long)]
+        install_user_service: bool,
+        /// Explicit installed Node Host agent path; defaults to this executable.
+        #[arg(long, requires = "install_user_service")]
+        agent_binary_path: Option<PathBuf>,
+    },
     /// Run installer-owned local setup and one-time node enrollment.
     Bootstrap {
         /// Persistent state directory.
@@ -293,6 +319,39 @@ enum SystemControlCommand {
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let status = match Cli::parse().command {
+        Command::Setup {
+            data_dir,
+            xray_binary_path,
+            xray_sha256,
+            accept_host_owner,
+            accept_exit_ip,
+            accept_router_mapping,
+            install_user_service,
+            agent_binary_path,
+        } => {
+            let setup_input = read_setup_invitation()?;
+            let request = BootstrapRequest::from_setup_code(
+                &setup_input,
+                xray_binary_path,
+                xray_sha256,
+                accept_host_owner,
+                accept_exit_ip,
+                accept_router_mapping,
+            )?;
+            if install_user_service {
+                let agent_binary_path = agent_binary_path.map_or_else(std::env::current_exe, Ok)?;
+                let outcome = bootstrap_and_install_user_service(
+                    &data_dir,
+                    request,
+                    &UserServiceInstallRequest::new(agent_binary_path),
+                )
+                .await?;
+                print_service_status(&outcome.service);
+                outcome.host
+            } else {
+                bootstrap(&data_dir, request).await?
+            }
+        }
         Command::Bootstrap {
             data_dir,
             invitation_file,
@@ -486,6 +545,20 @@ fn load_provider_policy(path: &std::path::Path) -> Result<ProviderPolicy> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+fn read_setup_invitation() -> Result<zeroize::Zeroizing<String>> {
+    let mut invitation = zeroize::Zeroizing::new(String::new());
+    std::io::stdin()
+        .take(32 * 1024 + 1)
+        .read_to_string(&mut invitation)?;
+    while invitation.ends_with('\r') || invitation.ends_with('\n') {
+        invitation.pop();
+    }
+    if invitation.is_empty() || invitation.len() > 32 * 1024 {
+        anyhow::bail!("setup invitation stdin length is invalid");
+    }
+    Ok(invitation)
+}
+
 #[cfg(target_os = "macos")]
 async fn handle_system_control(command: SystemControlCommand) -> Result<()> {
     let operation = match command {
@@ -497,19 +570,9 @@ async fn handle_system_control(command: SystemControlCommand) -> Result<()> {
             accept_router_mapping,
             accept_relay,
         } => {
-            let mut invitation = String::new();
-            std::io::stdin()
-                .take(32 * 1024 + 1)
-                .read_to_string(&mut invitation)?;
-            while invitation.ends_with('\r') || invitation.ends_with('\n') {
-                invitation.pop();
-            }
-            if invitation.is_empty() || invitation.len() > 32 * 1024 {
-                zeroize::Zeroize::zeroize(&mut invitation);
-                anyhow::bail!("setup invitation stdin length is invalid");
-            }
+            let invitation = read_setup_invitation()?;
             SystemSetupOperation::ConfirmSetup {
-                setup_invitation: SetupInvitation::new(invitation),
+                setup_invitation: SetupInvitation::new(invitation.to_string()),
                 accept_host_owner,
                 accept_exit_ip,
                 accept_router_mapping,
@@ -769,6 +832,32 @@ mod cli_tests {
 
     #[test]
     fn setup_invitation_has_no_command_line_argument() {
+        assert!(Cli::try_parse_from([
+            "node-host",
+            "setup",
+            "--data-dir",
+            "/tmp/node",
+            "--xray-binary-path",
+            "/tmp/xray",
+            "--xray-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--accept-host-owner",
+            "--accept-exit-ip",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "node-host",
+            "setup",
+            "--data-dir",
+            "/tmp/node",
+            "--xray-binary-path",
+            "/tmp/xray",
+            "--xray-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--setup-code",
+            "secret",
+        ])
+        .is_err());
         assert!(Cli::try_parse_from([
             "node-host",
             "system-control",
