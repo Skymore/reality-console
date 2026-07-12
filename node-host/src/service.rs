@@ -4,6 +4,7 @@ use crate::local_api::{
     LocalServiceStatus, LocalStatusServer,
 };
 use crate::mapping::RouterMappingSupervisor;
+use crate::policy::{ProviderAvailability, ProviderPolicyStatus};
 use crate::relay::{RelaySupervisor, RelayTarget};
 use crate::{
     status_locked,
@@ -124,17 +125,32 @@ where
         bail!("node host must be enrolled before starting its sync service");
     }
     let mut runtime = ManagedRuntime::new()?;
+    let initial_policy = crate::policy::evaluate(data_dir)?;
+    runtime
+        .xray
+        .configure_admission_limits(
+            initial_policy.policy.max_concurrent_sessions,
+            initial_policy.policy.bandwidth_limit_bps,
+        )
+        .await?;
+    let initial_runtime_state = policy_runtime_state(&initial_policy, NodeRuntimeState::Idle);
     let service_instance_id = Uuid::new_v4();
     let initial_status = LocalServiceStatus::from_host(
         service_instance_id,
         &initial_host,
         LocalServicePhase::Starting,
-        NodeRuntimeState::Idle,
+        initial_runtime_state,
         runtime.relay.runtime_state(),
+        runtime.xray.admission_counters(),
         None,
     )?;
     let local_status = LocalStatusServer::start(data_dir, initial_status)?;
-    if let Err(recovery_error) = runtime.xray.recover(data_dir).await {
+    let recovery = if policy_is_available(&initial_policy) {
+        runtime.xray.recover(data_dir).await
+    } else {
+        withdraw_data_paths(data_dir, &mut runtime).await
+    };
+    if let Err(recovery_error) = recovery {
         publish_local_status(
             &local_status,
             service_instance_id,
@@ -310,6 +326,9 @@ async fn wait_for_next_cycle<F>(
 where
     F: Future<Output = Result<()>>,
 {
+    let initially_available = crate::policy::evaluate(data_dir)
+        .map(|status| policy_is_available(&status))
+        .unwrap_or(false);
     let deadline = tokio::time::Instant::now() + jitter(base_delay, OsRng.next_u64());
     loop {
         let now = tokio::time::Instant::now();
@@ -321,15 +340,30 @@ where
             shutdown_result = shutdown.as_mut() => return WaitEvent::Shutdown(shutdown_result),
             () = tokio::time::sleep(wait) => {}
         }
-        if let Err(error) = runtime.xray.poll(data_dir).await {
-            if let Err(mapping_error) = runtime.direct.reconcile(data_dir, None).await {
-                tracing::warn!(error = %mapping_error, "router mapping cleanup failed after runtime health failure");
+        match crate::policy::evaluate(data_dir) {
+            Ok(status) if policy_is_available(&status) != initially_available => {
+                return WaitEvent::Deadline;
             }
-            if let Err(relay_error) = runtime.relay.reconcile(data_dir, None).await {
-                tracing::warn!(error = %relay_error, "relay cleanup failed after runtime health failure");
+            Ok(_) => {}
+            Err(error) => {
+                if let Err(cleanup_error) = withdraw_data_paths(data_dir, runtime).await {
+                    tracing::warn!(error = %cleanup_error, "data-path cleanup failed after provider policy error");
+                }
+                tracing::warn!(error = %error, "provider policy evaluation failed closed");
+                return WaitEvent::RuntimeFailed;
             }
-            tracing::warn!(error = %error, "managed Xray health check failed; retrying");
-            return WaitEvent::RuntimeFailed;
+        }
+        if initially_available {
+            if let Err(error) = runtime.xray.poll(data_dir).await {
+                if let Err(mapping_error) = runtime.direct.reconcile(data_dir, None).await {
+                    tracing::warn!(error = %mapping_error, "router mapping cleanup failed after runtime health failure");
+                }
+                if let Err(relay_error) = runtime.relay.reconcile(data_dir, None).await {
+                    tracing::warn!(error = %relay_error, "relay cleanup failed after runtime health failure");
+                }
+                tracing::warn!(error = %error, "managed Xray health check failed; retrying");
+                return WaitEvent::RuntimeFailed;
+            }
         }
         if runtime.relay.poll_status_change() {
             return WaitEvent::RelayChanged;
@@ -366,7 +400,8 @@ fn publish_local_status(
     last_error: Option<LocalServiceError>,
 ) {
     let result = (|| -> Result<()> {
-        let runtime_state = runtime.xray.observe_runtime_state()?;
+        let policy = crate::policy::evaluate(data_dir)?;
+        let runtime_state = policy_runtime_state(&policy, runtime.xray.observe_runtime_state()?);
         let host = status_locked(data_dir)?;
         let phase = phase.unwrap_or_else(|| phase_for_runtime(runtime_state));
         local_status.publish(LocalServiceStatus::from_host(
@@ -375,6 +410,7 @@ fn publish_local_status(
             phase,
             runtime_state,
             runtime.relay.runtime_state(),
+            runtime.xray.admission_counters(),
             last_error,
         )?)
     })();
@@ -384,16 +420,38 @@ fn publish_local_status(
 }
 
 async fn run_cycle(data_dir: &Path, runtime: &mut ManagedRuntime) -> Result<()> {
+    let mut policy = match crate::policy::evaluate(data_dir) {
+        Ok(policy) => policy,
+        Err(error) => {
+            withdraw_data_paths(data_dir, runtime).await?;
+            return Err(error).context("provider policy failed closed");
+        }
+    };
+    if !policy_is_available(&policy) {
+        withdraw_data_paths(data_dir, runtime).await?;
+        return sync_once_locked_with_runtime_snapshot(data_dir, || {
+            Ok(RuntimeHeartbeatSnapshot {
+                runtime_state: NodeRuntimeState::ProviderPaused,
+                relay_candidate: None,
+            })
+        })
+        .await
+        .map(|_| ());
+    }
+    runtime
+        .xray
+        .configure_admission_limits(
+            policy.policy.max_concurrent_sessions,
+            policy.policy.bandwidth_limit_bps,
+        )
+        .await?;
     runtime.xray.poll(data_dir).await?;
     // A previously acknowledged candidate can activate even if the controller
     // is temporarily unavailable after a service restart.
     runtime.xray.reconcile(data_dir).await?;
     let target = runtime.xray.router_mapping_target()?;
     let mapping_error = runtime.direct.reconcile(data_dir, target).await.err();
-    let relay_target = target.map(|target| RelayTarget {
-        revision: target.revision,
-        admission_port: target.internal_port,
-    });
+    let relay_target = consented_relay_target(data_dir, target);
     let relay_error = runtime.relay.reconcile(data_dir, relay_target).await.err();
     if matches!(
         runtime.xray.observe_runtime_state()?,
@@ -403,22 +461,48 @@ async fn run_cycle(data_dir: &Path, runtime: &mut ManagedRuntime) -> Result<()> 
             tracing::warn!(error = %error, "Xray traffic collection state could not be persisted");
         }
     }
-    sync_once_locked_with_runtime_snapshot(data_dir, || {
-        Ok(RuntimeHeartbeatSnapshot {
-            runtime_state: runtime.xray.observe_runtime_state()?,
-            relay_candidate: runtime.relay.candidate()?,
+    policy = crate::policy::evaluate(data_dir)?;
+    if !policy_is_available(&policy) {
+        withdraw_data_paths(data_dir, runtime).await?;
+        return sync_once_locked_with_runtime_snapshot(data_dir, || {
+            Ok(RuntimeHeartbeatSnapshot {
+                runtime_state: NodeRuntimeState::ProviderPaused,
+                relay_candidate: None,
+            })
         })
+        .await
+        .map(|_| ());
+    }
+    acknowledge_registered_relay(data_dir, runtime, relay_target).await?;
+    let sync_result = sync_once_locked_with_runtime_snapshot(data_dir, || {
+        runtime_heartbeat_snapshot(data_dir, runtime)
     })
-    .await?;
+    .await;
+    // Relay withdrawal and authentication denial must stop the connector even
+    // when the rest of the control cycle returns an error.
+    if runtime
+        .relay
+        .reconcile(data_dir, relay_target)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            error_code = "relay_runtime_reconcile_failed",
+            "relay runtime reconciliation failed closed independently"
+        );
+    }
+    sync_result?;
+    policy = crate::policy::evaluate(data_dir)?;
+    if !policy_is_available(&policy) {
+        withdraw_data_paths(data_dir, runtime).await?;
+        return Ok(());
+    }
     runtime.xray.reconcile(data_dir).await?;
     let target = runtime.xray.router_mapping_target()?;
     if let Err(error) = runtime.direct.reconcile(data_dir, target).await {
         tracing::warn!(error = %error, "direct mapping reconciliation failed after sync");
     }
-    let relay_target = target.map(|target| RelayTarget {
-        revision: target.revision,
-        admission_port: target.internal_port,
-    });
+    let relay_target = consented_relay_target(data_dir, target);
     if let Err(error) = runtime.relay.reconcile(data_dir, relay_target).await {
         tracing::warn!(error = %error, "relay reconciliation failed after sync");
     }
@@ -429,6 +513,126 @@ async fn run_cycle(data_dir: &Path, runtime: &mut ManagedRuntime) -> Result<()> 
         tracing::warn!(error = %error, "relay failed independently of direct mapping and heartbeat");
     }
     Ok(())
+}
+
+fn runtime_heartbeat_snapshot(
+    data_dir: &Path,
+    runtime: &mut ManagedRuntime,
+) -> Result<RuntimeHeartbeatSnapshot> {
+    let relay_candidate = match runtime.relay.candidate_for_state(data_dir) {
+        Ok(candidate) => candidate,
+        Err(_error) => {
+            tracing::warn!(
+                error_code = "relay_candidate_state_failed",
+                "relay candidate state failed closed independently"
+            );
+            None
+        }
+    };
+    Ok(RuntimeHeartbeatSnapshot {
+        runtime_state: runtime.xray.observe_runtime_state()?,
+        relay_candidate,
+    })
+}
+
+async fn acknowledge_registered_relay(
+    data_dir: &Path,
+    runtime: &mut ManagedRuntime,
+    relay_target: Option<RelayTarget>,
+) -> Result<()> {
+    let acknowledgement = match runtime.relay.acknowledgement_candidate(data_dir) {
+        Ok(acknowledgement) => acknowledgement,
+        Err(_error) => {
+            tracing::warn!(
+                error_code = "relay_acknowledgement_state_failed",
+                "relay acknowledgement state failed closed independently"
+            );
+            return Ok(());
+        }
+    };
+    let Some(acknowledgement) = acknowledgement else {
+        return Ok(());
+    };
+    match crate::sync::acknowledge_relay_assignment(data_dir, acknowledgement).await {
+        Ok(()) => {
+            if RelaySupervisor::acknowledgement_succeeded(data_dir, acknowledgement).is_err() {
+                tracing::warn!(
+                    error_code = "relay_acknowledgement_commit_failed",
+                    "relay acknowledgement committed remotely but local promotion will retry"
+                );
+            }
+            Ok(())
+        }
+        Err(_error) => {
+            tracing::warn!(
+                error_code = "relay_acknowledgement_failed",
+                "relay acknowledgement failed; retaining predecessor and retrying"
+            );
+            if runtime
+                .relay
+                .reconcile(data_dir, relay_target)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    error_code = "relay_runtime_reconcile_failed",
+                    "relay runtime reconciliation failed closed independently"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn consented_relay_target(
+    data_dir: &Path,
+    target: Option<crate::mapping::MappingTarget>,
+) -> Option<RelayTarget> {
+    match crate::relay::provider_relay_consented(data_dir) {
+        Ok(true) => target.map(|target| RelayTarget {
+            revision: target.revision,
+            admission_port: target.internal_port,
+        }),
+        Ok(false) => None,
+        Err(_error) => {
+            tracing::warn!(
+                error_code = "relay_consent_state_failed",
+                "relay consent state failed closed independently"
+            );
+            None
+        }
+    }
+}
+
+async fn withdraw_data_paths(data_dir: &Path, runtime: &mut ManagedRuntime) -> Result<()> {
+    let mapping_error = runtime.direct.reconcile(data_dir, None).await.err();
+    let relay_error = runtime.relay.reconcile(data_dir, None).await.err();
+    let runtime_error = runtime.xray.shutdown().await.err();
+    if let Some(error) = mapping_error {
+        return Err(error).context("provider policy could not withdraw router mapping");
+    }
+    if let Some(error) = relay_error {
+        return Err(error).context("provider policy could not withdraw relay candidate");
+    }
+    if let Some(error) = runtime_error {
+        return Err(error).context("provider policy could not stop member traffic");
+    }
+    Ok(())
+}
+
+const fn policy_is_available(status: &ProviderPolicyStatus) -> bool {
+    matches!(status.availability, ProviderAvailability::Available)
+}
+
+const fn policy_runtime_state(
+    status: &ProviderPolicyStatus,
+    runtime_state: NodeRuntimeState,
+) -> NodeRuntimeState {
+    if policy_is_available(status) {
+        runtime_state
+    } else {
+        NodeRuntimeState::ProviderPaused
+    }
 }
 
 async fn shutdown_services(data_dir: &Path, runtime: &mut ManagedRuntime) -> Result<()> {

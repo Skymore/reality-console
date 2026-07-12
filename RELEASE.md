@@ -1,7 +1,8 @@
 # Release And Installation Foundation
 
-Status: Stage 5 packaging foundation. This document describes executable build and lifecycle
-assets. It does not claim that unsigned validation artifacts are production releases.
+Status: Stage 6 release evidence and gating. This document describes executable build, lifecycle,
+and candidate-bound evidence assets. It does not claim that unsigned validation artifacts are
+production releases.
 
 ## Supported Build Matrix
 
@@ -60,8 +61,12 @@ Protected release environments provide these values:
 
 Tag builds require every applicable credential and notarization. Pull requests and branch builds
 run the same config/build/SBOM pipeline but upload artifacts explicitly named
-`unsigned-validation`. A tag is published only after signed artifact metadata, the signed update
-manifest, post-generation trust verification, checksums, and release evidence all succeed.
+`unsigned-validation`. Validation always remains `incomplete`; it cannot be relabeled accepted. A
+tag is published only after signed artifact metadata, the signed update manifest, post-generation
+trust verification, checksums, and strict acceptance evidence all succeed. The publish job
+re-downloads the component, lifecycle, manifest, and package evidence and fail-closed verifies the
+same source commit, CI run/attempt, release ID, candidate digest, and package/SBOM/metadata SHA-256
+values before creating a release.
 
 ## Sidecars And SBOM
 
@@ -90,7 +95,9 @@ releases under `/Library/Application Support/Private Network Node/releases/<vers
 `current` link selects one release. `com.sky.realitynode.agent` runs the fixed service wrapper as
 `_privnetnode`; an unpaired installation exits successfully instead of entering a crash loop.
 State and logs remain outside release directories. Package upgrade records one previous release
-and stops launchd before replacement.
+and stops launchd before replacement. The postinstall verifies the installed app, agent, and Xray
+sidecar independently. If verification, ownership setup, or launchd bootstrap fails, its exit trap
+atomically restores the retained previous `current` symlink before returning failure.
 
 The Tauri app is intentionally a minimal native packaging shell. Its backend can retain a bounded
 setup code in process for safe preview/cancel and report only fixed-path package/launchd status. It
@@ -114,28 +121,36 @@ The macOS-safe validation sequence is:
 ```sh
 python3 -m json.tool packaging/release-config.json >/dev/null
 python3 -m json.tool packaging/release-trust.json >/dev/null
-find scripts packaging -type f \( -name '*.sh' -o -path '*/pkg-scripts/*' \) \
-  -print0 | xargs -0 -n1 sh -n
+python3 -m json.tool packaging/release-acceptance-evidence.schema.json >/dev/null
+python3 -m py_compile scripts/release/*.py scripts/release/tests/*.py
+bash -n scripts/release/run-component-gate.sh scripts/smoke/run-macos-artifact-lifecycle.sh
+find packaging scripts -type f -path '*/pkg-scripts/*' -exec sh -n {} \;
 plutil -lint packaging/macos/com.sky.realitynode.agent.plist
 scripts/smoke/run-unix-lifecycle.sh
 scripts/smoke/release-manifest.sh
+python3 -m unittest discover -s scripts/release/tests -v
 cargo test --locked --manifest-path crates/release-manifest/Cargo.toml --all-targets
 cargo test --locked --manifest-path scripts/release-manifest-tool/Cargo.toml --all-targets
+cargo test --locked --manifest-path crates/relay-provisioning/Cargo.toml --all-targets
 ```
 
-The lifecycle smoke scripts exercise clean install, state-preserving upgrade, bounded rollback,
-state-preserving uninstall, and explicit purge in an isolated temporary root. They test the
-installer transaction after authorization; they do not substitute filesystem switching for a
-cryptographic rollback grant.
+The simulated lifecycle scripts exercise clean install, state-preserving upgrade, bounded
+rollback, state-preserving uninstall, and explicit purge in an isolated temporary root. They are
+code-level regression tests only and never emit release evidence. The actual-artifact lifecycle
+jobs download the produced packages, reject synthetic file bytes, verify installed nested
+signatures, and emit candidate-bound evidence. A failed macOS Node Host postinstall restores the
+saved `current` target and attempts to restart that restored service before returning failure.
+Unexecuted scenarios remain `incomplete`; package switching does not substitute for a cryptographic
+rollback grant or real topology evidence.
 
 ## Required Release-Lab Validation
 
 The following cannot be proven on the current macOS development machine and remain release gates:
 
-- Windows x86_64 Tauri/NSIS build, Authenticode verification, WinSW service install/upgrade/
-  rollback/uninstall, reboot recovery, and the PowerShell lifecycle smoke;
+- Windows x86_64 Authenticode credentials and clean-machine NSIS install/upgrade/rollback,
+  WinSW lifecycle, reboot recovery, and installed sidecar evidence;
 - Linux `systemd` install/upgrade/rollback/uninstall on supported distributions;
-- Intel macOS build and clean installation;
+- clean Intel macOS package lifecycle evidence on a matching runner or machine;
 - Apple Silicon and Intel Developer ID signing, installer signing, notarization, stapling, clean
   install, launchd restart, sleep/wake, upgrade, rollback, and uninstall;
 - production release/rollback trust roots and protected-environment key access;

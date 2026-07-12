@@ -1,5 +1,6 @@
 use control_server::probe::{run_local_tcp_until, run_remote_tcp_until};
 use control_server::protocol_canary::{run_protocol_canary_until, XrayProtocolCanaryExecutor};
+use control_server::relay::{run_relay_reconciliation_until, RelayProvisioner};
 use control_server::{build_router, operations, AppState, Database, ProbeMode, ServiceConfig};
 use std::error::Error;
 use std::ffi::OsString;
@@ -48,12 +49,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let protocol_canary = config.protocol_canary.take();
     let protocol_canary_options = config.protocol_canary_options;
     let database = Database::open(&config.database_path, &config.network_display_name)?;
-    let state = AppState::new(
+    let relay = config
+        .relay_provisioning
+        .take()
+        .map(|relay_config| {
+            RelayProvisioner::new(
+                database.clone(),
+                database.controller_identity(),
+                relay_config,
+            )
+        })
+        .transpose()?;
+    let mut state = AppState::new(
         database.clone(),
         config.bootstrap_token.clone(),
         config.controller_origin,
         config.request_timeout,
     );
+    if let Some(relay) = relay.clone() {
+        state = state.with_relay(relay);
+    }
     let app = build_router(state);
     let listener = TcpListener::bind(config.bind_address).await?;
 
@@ -125,6 +140,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
         run_retention_until(retention_database, &mut retention_shutdown).await;
         Ok(())
     });
+    if let Some(relay) = relay {
+        let mut relay_shutdown = shutdown_sender.subscribe();
+        workers.spawn(async move {
+            run_relay_reconciliation_until(relay, async move {
+                wait_for_shutdown(&mut relay_shutdown).await;
+            })
+            .await;
+            Ok(())
+        });
+    }
     let mut http_shutdown = shutdown_sender.subscribe();
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(async move {

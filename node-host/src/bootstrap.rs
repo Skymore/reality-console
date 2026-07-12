@@ -2,8 +2,9 @@ use crate::enrollment::{
     join_invitation, parse_invitation_json, read_invitation, require_provider_consent,
 };
 use crate::{
-    configure_xray, initialize, install_user_service, mapping::configure_bootstrap_policy,
-    parse_controller, BackgroundServiceStatus, HostStatus, UserServiceInstallRequest,
+    configure_xray, initialize, initialize_with_identity_dir, install_user_service,
+    mapping::configure_bootstrap_policy, parse_controller, BackgroundServiceStatus, HostStatus,
+    UserServiceInstallRequest,
 };
 use anyhow::{Context as _, Result};
 use control_protocol::crypto::Sha256Digest;
@@ -202,10 +203,43 @@ fn decode_setup_input(value: &str) -> Result<NodeSetupInvitation> {
 /// Returns a stage-specific error for missing provider consent, conflicting
 /// local state, bundled runtime verification, or controller enrollment.
 pub async fn bootstrap(data_dir: &Path, request: BootstrapRequest) -> Result<HostStatus> {
+    bootstrap_inner(data_dir, None, request).await
+}
+
+/// Performs packaged setup using an explicit installation identity directory.
+///
+/// This is the system-service equivalent of [`bootstrap`]. It binds identity
+/// outside copyable state before any invitation can be consumed.
+///
+/// # Errors
+///
+/// Returns the same stage-specific errors as [`bootstrap`], plus an error when
+/// the installation identity path is unsafe or conflicts with an existing
+/// immutable binding.
+pub async fn bootstrap_with_identity_dir(
+    data_dir: &Path,
+    identity_dir: &Path,
+    request: BootstrapRequest,
+) -> Result<HostStatus> {
+    bootstrap_inner(data_dir, Some(identity_dir), request).await
+}
+
+async fn bootstrap_inner(
+    data_dir: &Path,
+    identity_dir: Option<&Path>,
+    request: BootstrapRequest,
+) -> Result<HostStatus> {
     require_provider_consent(request.accept_host_owner, request.accept_exit_ip)
         .context("Node Host bootstrap requires explicit provider consent")?;
-    initialize(data_dir, &request.invitation.controller_origin)
-        .context("Node Host bootstrap could not initialize local state")?;
+    match identity_dir {
+        Some(identity_dir) => initialize_with_identity_dir(
+            data_dir,
+            identity_dir,
+            &request.invitation.controller_origin,
+        ),
+        None => initialize(data_dir, &request.invitation.controller_origin),
+    }
+    .context("Node Host bootstrap could not initialize local state")?;
     configure_xray(
         data_dir,
         &request.xray_binary_path,

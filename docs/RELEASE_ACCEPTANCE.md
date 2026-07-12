@@ -12,7 +12,8 @@ manifest satisfy every required row below.
 Every candidate records:
 
 - source commit and clean-tree state;
-- Control, Node Host, Connect, relay, protocol, and Xray versions;
+- Control, protocol, Xray runtime, Node Host, relay, relay provisioning, Connect, Control app,
+  Node Host app, and probe worker versions;
 - target OS, architecture, package digest, SBOM digest, and signing identity;
 - update-manifest digest and signature;
 - database schema and minimum compatible agent/client versions; and
@@ -22,12 +23,25 @@ The evidence manifest is machine-readable JSON, is retained with the release, an
 tokens, invitation material, device identifiers, member identifiers, node credentials, endpoint
 secrets, REALITY private keys, or generated Xray configuration.
 
+`packaging/release-acceptance-evidence.schema.json` is the closed schema for this record. Unknown
+fields are rejected. `scripts/release/acceptance-evidence.py` binds its decision to a canonical
+candidate digest over mode, source commit, clean-tree state, release ID, and Git ref. It also
+records exact component checks, schema compatibility, release-manifest digest/status, signer
+identities bound to the package name and SHA-256, CI run/attempt/job identities,
+package/SBOM/metadata digests, and lifecycle matrix results. Evidence from another CI attempt,
+partial lifecycle matrix, synthetic package, or mismatched manifest/package digest is rejected.
+
 ## 2. Mandatory Component Gates
 
 Each Rust component must pass formatting, all-target tests, warnings-as-errors Clippy, and Rustdoc
 warnings-as-errors using its committed lockfile. TypeScript components must pass their committed
 test, typecheck, and production-build commands. Database migration tests must start from both an
 empty database and the previous release schema.
+
+The mandatory product component set is Control, protocol, Xray runtime, Node Host, relay,
+relay provisioning, Connect, Control app, Node Host app, and probe worker. The release-manifest
+crate and manifest CLI run the same Rust quality checks as separate release-tooling gates; they are
+not mislabeled as shipped product components.
 
 The release job additionally verifies:
 
@@ -42,6 +56,11 @@ The release job additionally verifies:
 
 Unsigned builds may be retained only as explicitly named development artifacts. They never satisfy
 package acceptance and are never published through a production update channel.
+
+Filesystem-only Unix and Windows lifecycle smoke scripts are regression tests, not package
+evidence. Lifecycle evidence must identify `evidenceType: actual-package`, pass package-format
+validation, and bind every result to the SHA-256 of the downloaded CI build artifact. Renaming or
+writing text to `.dmg`, `.pkg`, or `.exe` cannot produce valid evidence.
 
 ## 3. End-to-End Topology
 
@@ -152,3 +171,10 @@ The release job emits one of three states:
 
 `incomplete` is not success. Manual exceptions may document a private development build, but they
 cannot relabel it as the first complete release.
+
+Branch and pull-request validation runs preserve the complete build and evidence path but are
+unconditionally `incomplete`, even if every locally available check passes. On a tag, `publish`
+downloads the acceptance record, component/lifecycle records, manifest evidence, and package bytes
+again, recomputes the candidate binding and all package/SBOM/metadata digests, requires `accepted`,
+and verifies the source commit, CI attempt, and release ID. Missing, malformed, rejected,
+incomplete, or byte-mismatched evidence fails before release creation.

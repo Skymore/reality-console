@@ -58,6 +58,7 @@ fn build_support_bundle(connection: &Connection) -> Result<serde_json::Value> {
         [],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
+    let provider = crate::policy::load_status_readonly(connection)?;
     Ok(json!({
         "schemaVersion": 1,
         "nodeHost": {
@@ -76,6 +77,21 @@ fn build_support_bundle(connection: &Connection) -> Result<serde_json::Value> {
             "retainedAcknowledgedEvents": spool.1,
             "serializedBytes": spool.2,
             "acknowledgedSequence": spool.3,
+        },
+        "providerPolicy": {
+            "schemaVersion": provider.policy.schema_version,
+            "generation": provider.generation,
+            "paused": provider.policy.paused,
+            "availability": provider.availability,
+            "scheduleWindowCount": provider.policy.weekly_schedule.len(),
+            "monthlyTransferCapBytes": provider.policy.monthly_transfer_cap_bytes,
+            "maxConcurrentSessions": provider.policy.max_concurrent_sessions,
+            "bandwidthLimitBps": provider.policy.bandwidth_limit_bps,
+            "utcMonth": provider.month_usage.utc_month,
+            "observedBytes": provider.month_usage.observed_bytes,
+            "usageCoverage": provider.month_usage.coverage,
+            "manualEndpointConfigured": provider.manual_endpoint.configured,
+            "manualEndpointCurrent": provider.manual_endpoint.current,
         }
     }))
 }
@@ -100,6 +116,10 @@ pub fn uninstall_local(data_dir: &Path, expected_node_id: NodeId) -> Result<()> 
     if stored_node_id != expected_node_id.to_string() {
         bail!("uninstall confirmation node ID does not match local enrollment");
     }
+    let (identity_dir, _) = crate::load_identity_binding(&connection)?
+        .context("node host installation identity binding is missing")?;
+    crate::validate_identity_dir_path(data_dir, &identity_dir)?;
+    crate::inspect_identity_directory(&identity_dir)?;
     let metadata = fs::symlink_metadata(data_dir)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("node data directory is unsafe");
@@ -112,12 +132,33 @@ pub fn uninstall_local(data_dir: &Path, expected_node_id: NodeId) -> Result<()> 
         .and_then(|value| value.to_str())
         .context("node data directory name is invalid")?;
     let tombstone = unique_tombstone(parent, file_name)?;
+    let identity_parent = identity_dir
+        .parent()
+        .context("installation identity directory has no parent")?;
+    let identity_name = identity_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("installation identity directory name is invalid")?;
+    let identity_tombstone = unique_tombstone(identity_parent, identity_name)?;
     drop(connection);
-    fs::rename(data_dir, &tombstone).context("failed to atomically detach node data")?;
+    fs::rename(&identity_dir, &identity_tombstone)
+        .context("failed to atomically detach installation identity")?;
+    if let Err(error) = fs::rename(data_dir, &tombstone) {
+        let _ = fs::rename(&identity_tombstone, &identity_dir);
+        return Err(error).context("failed to atomically detach node data");
+    }
     sync_directory(parent)?;
+    if identity_parent != parent {
+        sync_directory(identity_parent)?;
+    }
     drop(lock);
     fs::remove_dir_all(&tombstone).context("failed to remove detached node data")?;
+    fs::remove_dir_all(&identity_tombstone)
+        .context("failed to remove detached installation identity")?;
     sync_directory(parent)?;
+    if identity_parent != parent {
+        sync_directory(identity_parent)?;
+    }
     Ok(())
 }
 

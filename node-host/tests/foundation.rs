@@ -5,6 +5,7 @@ use fs2::FileExt as _;
 use predicates::prelude::*;
 use rusqlite::Connection;
 use std::fs::{self, OpenOptions};
+use std::path::Path;
 
 #[test]
 fn restart_is_idempotent_and_status_is_safe() {
@@ -24,8 +25,10 @@ fn restart_is_idempotent_and_status_is_safe() {
         second.encryption_public_key.as_str()
     );
 
-    let signing_seed = fs::read(data_dir.join("identity.ed25519.seed")).expect("signing seed");
-    let encryption_seed = fs::read(data_dir.join("identity.x25519.seed")).expect("encryption seed");
+    let identity_dir = node_host::default_installation_identity_dir(&data_dir).unwrap();
+    let signing_seed = fs::read(identity_dir.join("identity.ed25519.seed")).expect("signing seed");
+    let encryption_seed =
+        fs::read(identity_dir.join("identity.x25519.seed")).expect("encryption seed");
     let database = fs::read(data_dir.join("node-host.sqlite3")).expect("database bytes");
     assert!(!contains_bytes(&database, &signing_seed));
     assert!(!contains_bytes(&database, &encryption_seed));
@@ -41,6 +44,57 @@ fn restart_is_idempotent_and_status_is_safe() {
         ))
         .stdout(predicate::str::contains(URL_SAFE_NO_PAD.encode(&signing_seed)).not())
         .stdout(predicate::str::contains(URL_SAFE_NO_PAD.encode(&encryption_seed)).not());
+}
+
+#[test]
+fn explicit_installation_identity_is_immutable_and_outside_state() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path().join("state");
+    let identity_dir = temp.path().join("installation-identity");
+
+    let initialized = node_host::initialize_with_identity_dir(
+        &data_dir,
+        &identity_dir,
+        "https://controller.example",
+    )
+    .expect("initialize with explicit identity");
+    assert!(identity_dir.join("identity.ed25519.seed").is_file());
+    assert!(identity_dir.join("identity.x25519.seed").is_file());
+    assert!(!data_dir.join("identity.ed25519.seed").exists());
+    assert!(!data_dir.join("identity.x25519.seed").exists());
+
+    let other_identity = temp.path().join("other-identity");
+    let error = node_host::initialize_with_identity_dir(
+        &data_dir,
+        &other_identity,
+        "https://controller.example",
+    )
+    .expect_err("identity path replacement must fail");
+    assert!(error.to_string().contains("already bound"));
+    assert_eq!(
+        node_host::status(&data_dir)
+            .expect("bound identity remains usable")
+            .identity_public_key,
+        initialized.identity_public_key
+    );
+}
+
+#[test]
+fn copied_state_without_installation_identity_fails_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path().join("state");
+    node_host::initialize(&data_dir, "https://controller.example").expect("initialize");
+    let copied = temp.path().join("copied-state");
+    copy_tree(&data_dir, &copied);
+
+    let identity_dir = node_host::default_installation_identity_dir(&data_dir).unwrap();
+    fs::rename(&identity_dir, temp.path().join("detached-identity"))
+        .expect("simulate copying state to a host without installation identity");
+
+    let error = node_host::status(&copied).expect_err("copied state must not authenticate");
+    assert!(error
+        .to_string()
+        .contains("installation identity directory"));
 }
 
 #[test]
@@ -68,9 +122,9 @@ fn migrations_are_recorded_once_and_pragmas_are_enabled() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("migration metadata");
-    assert_eq!(count, 15);
+    assert_eq!(count, 17);
     assert_eq!(journal_mode, "wal");
-    assert_eq!(user_version, 15);
+    assert_eq!(user_version, 17);
     assert_eq!(migration.0, "node_host_foundation");
     assert_eq!(migration.1.len(), 64);
     assert!(migration.2 > 0);
@@ -85,7 +139,15 @@ fn schema_five_upgrades_without_recreating_node_identity() {
     let connection = Connection::open(data_dir.join("node-host.sqlite3")).expect("open database");
     connection
         .execute_batch(
-            "DROP TABLE xray_user_traffic_counters;
+            "DROP TRIGGER installation_identity_binding_no_update;
+             DROP TABLE installation_identity_binding;
+             DELETE FROM schema_migrations WHERE version = 17;
+             DROP TABLE provider_pending_traffic_delta;
+             DROP TABLE provider_manual_endpoint;
+             DROP TABLE provider_month_usage;
+             DROP TABLE provider_policy;
+             DELETE FROM schema_migrations WHERE version = 16;
+             DROP TABLE xray_user_traffic_counters;
              DROP TABLE xray_traffic_collection_state;
              ALTER TABLE xray_runtime_config DROP COLUMN stats_api_port;
              DELETE FROM schema_migrations WHERE version = 15;
@@ -127,7 +189,7 @@ fn schema_five_upgrades_without_recreating_node_identity() {
 
     let upgraded = node_host::initialize(&data_dir, "https://controller.example")
         .expect("upgrade existing schema");
-    assert_eq!(upgraded.schema_version, 15);
+    assert_eq!(upgraded.schema_version, 17);
     assert_eq!(
         upgraded.identity_public_key.as_str(),
         original.identity_public_key.as_str()
@@ -152,6 +214,42 @@ fn schema_five_upgrades_without_recreating_node_identity() {
         )
         .expect("heartbeat generation exists after upgrade");
     assert_eq!(heartbeat_generation, 0);
+}
+
+#[test]
+fn schema_sixteen_moves_legacy_identity_outside_state_without_rotation() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let data_dir = temp.path().join("state");
+    let original = node_host::initialize(&data_dir, "https://controller.example")
+        .expect("initialize current schema");
+    let identity_dir = node_host::default_installation_identity_dir(&data_dir).unwrap();
+    for name in ["identity.ed25519.seed", "identity.x25519.seed"] {
+        fs::rename(identity_dir.join(name), data_dir.join(name)).expect("restore legacy seed path");
+    }
+    fs::remove_dir(&identity_dir).expect("remove empty current identity directory");
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).expect("open database");
+    connection
+        .execute_batch(
+            "DROP TRIGGER installation_identity_binding_no_update;
+             DROP TABLE installation_identity_binding;
+             DELETE FROM schema_migrations WHERE version = 17;
+             PRAGMA user_version = 16;",
+        )
+        .expect("create coherent schema-sixteen fixture");
+    drop(connection);
+
+    let upgraded = node_host::initialize(&data_dir, "https://controller.example")
+        .expect("upgrade previous schema");
+    assert_eq!(upgraded.schema_version, 17);
+    assert_eq!(upgraded.identity_public_key, original.identity_public_key);
+    assert_eq!(
+        upgraded.encryption_public_key,
+        original.encryption_public_key
+    );
+    assert!(identity_dir.join("identity.ed25519.seed").is_file());
+    assert!(identity_dir.join("identity.x25519.seed").is_file());
+    assert!(!data_dir.join("identity.ed25519.seed").exists());
+    assert!(!data_dir.join("identity.x25519.seed").exists());
 }
 
 #[test]
@@ -230,13 +328,27 @@ fn identity_seed_files_are_owner_only() {
     let data_dir = temp.path().join("state");
     node_host::initialize(&data_dir, "https://controller.example").expect("initialize");
 
+    let identity_dir = node_host::default_installation_identity_dir(&data_dir).unwrap();
     for name in ["identity.ed25519.seed", "identity.x25519.seed"] {
-        let mode = fs::metadata(data_dir.join(name))
+        let mode = fs::metadata(identity_dir.join(name))
             .expect("seed metadata")
             .permissions()
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir(destination).expect("create copied state");
+    for entry in fs::read_dir(source).expect("read source state") {
+        let entry = entry.expect("state entry");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).expect("copy state entry");
+        }
     }
 }
 

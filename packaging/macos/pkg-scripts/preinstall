@@ -2,6 +2,7 @@
 set -eu
 
 BASE="/Library/Application Support/Private Network Node"
+/bin/rm -f "$BASE/.previous-release"
 if [ -L "$BASE/current" ]; then
   previous=$(readlink "$BASE/current")
   case "$previous" in
@@ -9,5 +10,4 @@ if [ -L "$BASE/current" ]; then
   esac
 fi
 
-/bin/launchctl bootout system/com.sky.realitynode.agent >/dev/null 2>&1 || true
 exit 0

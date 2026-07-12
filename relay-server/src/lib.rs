@@ -10,10 +10,12 @@ mod flow;
 pub mod frame;
 mod metrics;
 mod node;
+mod quota;
+mod registry;
 mod relay;
 mod tls;
 
-pub use config::{RelayConfig, RouteConfig, ServerConfig};
+pub use config::{ManagedRoutesConfig, RelayConfig, RouteConfig, ServerConfig};
 pub use error::{ErrorCode, RelayError, Result};
 pub use metrics::Metrics;
 pub use node::{ConnectorStatus, NodeConnectorConfig, RelayNodeConnector};

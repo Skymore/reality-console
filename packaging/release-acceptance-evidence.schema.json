@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reality-console.invalid/schemas/release-acceptance-evidence-v1.json",
+  "title": "Release acceptance evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "candidate",
+    "components",
+    "schema",
+    "signingIdentities",
+    "ciRuns",
+    "artifacts",
+    "matrixResults",
+    "decision"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "sourceCommit", "treeState", "releaseId", "ref", "candidateDigest"],
+      "properties": {
+        "mode": { "enum": ["release", "validation"] },
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+        "treeState": { "enum": ["clean", "dirty"] },
+        "releaseId": { "type": ["string", "null"] },
+        "ref": { "type": "string", "minLength": 1 },
+        "candidateDigest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/component" }
+    },
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["releaseManifest", "releaseManifestSha256", "releaseManifestSignatureStatus", "database", "minimumAgent", "minimumClient"],
+      "properties": {
+        "releaseManifest": { "type": ["integer", "null"], "minimum": 1 },
+        "releaseManifestSha256": { "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "releaseManifestSignatureStatus": { "type": ["string", "null"] },
+        "database": { "type": ["integer", "null"], "minimum": 1 },
+        "minimumAgent": { "type": ["string", "null"] },
+        "minimumClient": { "type": ["string", "null"] }
+      }
+    },
+    "signingIdentities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/signingIdentity" }
+    },
+    "ciRuns": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ciRun" }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "matrixResults": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/matrixResult" }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reasons", "evaluatedCandidateDigest"],
+      "properties": {
+        "state": { "enum": ["accepted", "rejected", "incomplete"] },
+        "reasons": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "evaluatedCandidateDigest": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "ciRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "workflow", "runId", "runAttempt", "job"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "workflow": { "type": "string", "minLength": 1 },
+        "runId": { "type": "string", "minLength": 1 },
+        "runAttempt": { "type": "integer", "minimum": 1 },
+        "job": { "type": "string", "minLength": 1 }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "sourceCommit", "requiredChecks", "checks", "ci"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "sourceCommit": { "type": "string" },
+        "requiredChecks": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "checks": {
+          "type": "object",
+          "additionalProperties": { "enum": ["passed", "failed", "incomplete"] }
+        },
+        "ci": { "$ref": "#/$defs/ciRun" }
+      }
+    },
+    "signingIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "artifactName", "artifactSha256", "artifactSigner", "installerSigner", "releaseManifestKeyId", "status", "evidenceArtifact"],
+      "properties": {
+        "target": { "type": "string" },
+        "artifactName": { "type": "string", "minLength": 1 },
+        "artifactSha256": { "$ref": "#/$defs/sha256" },
+        "artifactSigner": { "type": ["string", "null"] },
+        "installerSigner": { "type": ["string", "null"] },
+        "releaseManifestKeyId": { "type": ["string", "null"] },
+        "status": { "enum": ["verified", "failed", "incomplete", "unsigned-validation"] },
+        "evidenceArtifact": { "type": ["string", "null"] }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "name", "sha256", "sbomName", "sbomSha256", "metadataName", "metadataSha256", "sourceCommit"],
+      "properties": {
+        "target": { "type": "string" },
+        "name": { "type": "string" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "sbomName": { "type": "string" },
+        "sbomSha256": { "$ref": "#/$defs/sha256" },
+        "metadataName": { "type": "string" },
+        "metadataSha256": { "$ref": "#/$defs/sha256" },
+        "sourceCommit": { "type": "string" }
+      }
+    },
+    "matrixResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "scenario", "status", "artifactSha256", "evidenceArtifact", "ciRunId"],
+      "properties": {
+        "target": { "type": "string" },
+        "scenario": { "type": "string" },
+        "status": { "enum": ["passed", "failed", "incomplete"] },
+        "artifactSha256": { "type": ["string", "null"] },
+        "evidenceArtifact": { "type": ["string", "null"] },
+        "ciRunId": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

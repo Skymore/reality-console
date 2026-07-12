@@ -1,0 +1,143 @@
+#!/bin/sh
+set -eu
+
+if [ "${1-}" = "--test-root" ]; then
+  [ "$#" -eq 3 ] || { echo "usage: $0 --test-root BASE snapshot|restore|commit" >&2; exit 64; }
+  BASE=$2
+  action=$3
+  EXPECTED_UID=$(/usr/bin/id -u)
+  EXPECTED_GID=$(/usr/bin/id -g)
+else
+  [ "$#" -eq 1 ] || { echo "usage: $0 snapshot|restore|commit" >&2; exit 64; }
+  BASE="/Library/Application Support/Private Network Node"
+  action=$1
+  EXPECTED_UID=0
+  EXPECTED_GID=0
+fi
+
+SNAPSHOT="$BASE/.service-state-rollback"
+MANIFEST="$SNAPSHOT/layouts"
+FAILED="$BASE/.service-state-failed"
+NAMES="state identity .state.installation-identity service-state"
+
+fail() {
+  echo "service-state rollback: $*" >&2
+  exit 70
+}
+
+mode_of() {
+  /usr/bin/stat -f '%Lp' "$1"
+}
+
+uid_of() {
+  /usr/bin/stat -f '%u' "$1"
+}
+
+gid_of() {
+  /usr/bin/stat -f '%g' "$1"
+}
+
+require_plain_directory() {
+  path=$1
+  [ -d "$path" ] && [ ! -L "$path" ] || fail "unsafe directory $path"
+}
+
+require_base() {
+  require_plain_directory "$BASE"
+  [ "$(uid_of "$BASE")" = "$EXPECTED_UID" ] || fail "install root owner is invalid"
+  [ "$(gid_of "$BASE")" = "$EXPECTED_GID" ] || fail "install root group is invalid"
+  [ "$(mode_of "$BASE")" = 755 ] || fail "install root mode is not 0755"
+}
+
+require_snapshot() {
+  require_plain_directory "$SNAPSHOT"
+  [ "$(mode_of "$SNAPSHOT")" = 700 ] || fail "snapshot mode is not 0700"
+  [ "$(uid_of "$SNAPSHOT")" = "$EXPECTED_UID" ] || fail "snapshot owner is invalid"
+  [ "$(gid_of "$SNAPSHOT")" = "$EXPECTED_GID" ] || fail "snapshot group is invalid"
+  [ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] || fail "snapshot manifest is unsafe"
+}
+
+validate_name() {
+  case "$1" in
+    state|identity|.state.installation-identity|service-state) ;;
+    *) fail "snapshot manifest contains an unknown layout" ;;
+  esac
+}
+
+snapshot() {
+  require_base
+  [ ! -e "$SNAPSHOT" ] && [ ! -L "$SNAPSHOT" ] || fail "stale snapshot already exists"
+  [ ! -e "$FAILED" ] && [ ! -L "$FAILED" ] || fail "stale failed-state directory exists"
+  /bin/mkdir -m 700 "$SNAPSHOT"
+  /usr/sbin/chown "$EXPECTED_UID:$EXPECTED_GID" "$SNAPSHOT"
+  /usr/bin/touch "$MANIFEST"
+  /bin/chmod 600 "$MANIFEST"
+  /usr/sbin/chown "$EXPECTED_UID:$EXPECTED_GID" "$MANIFEST"
+  for name in $NAMES; do
+    source="$BASE/$name"
+    if [ -e "$source" ] || [ -L "$source" ]; then
+      require_plain_directory "$source"
+      /usr/bin/ditto --rsrc --extattr --acl "$source" "$SNAPSHOT/$name"
+      printf '%s\n' "$name" >> "$MANIFEST"
+    fi
+  done
+  /bin/sync
+}
+
+restore() {
+  require_base
+  require_snapshot
+  [ ! -e "$FAILED" ] && [ ! -L "$FAILED" ] || fail "stale failed-state directory exists"
+  seen=" "
+  while IFS= read -r name; do
+    [ -n "$name" ] || fail "snapshot manifest contains an empty entry"
+    validate_name "$name"
+    case "$seen" in *" $name "*) fail "snapshot manifest contains a duplicate layout" ;; esac
+    seen="$seen$name "
+    require_plain_directory "$SNAPSHOT/$name"
+  done < "$MANIFEST"
+
+  /bin/mkdir -m 700 "$FAILED"
+  /usr/sbin/chown "$EXPECTED_UID:$EXPECTED_GID" "$FAILED"
+  for name in $NAMES; do
+    current="$BASE/$name"
+    if [ -e "$current" ] || [ -L "$current" ]; then
+      require_plain_directory "$current"
+      /bin/mv "$current" "$FAILED/$name"
+    fi
+  done
+
+  while IFS= read -r name; do
+    staging="$BASE/.service-state-restore-$name"
+    [ ! -e "$staging" ] && [ ! -L "$staging" ] || fail "stale restore staging path exists"
+    /usr/bin/ditto --rsrc --extattr --acl "$SNAPSHOT/$name" "$staging"
+    /bin/mv "$staging" "$BASE/$name"
+  done < "$MANIFEST"
+  /bin/sync
+  /bin/rm -rf "$FAILED"
+  /bin/rm -rf "$SNAPSHOT"
+  /bin/sync
+}
+
+commit() {
+  require_base
+  require_snapshot
+  [ ! -e "$FAILED" ] && [ ! -L "$FAILED" ] || fail "stale failed-state directory exists"
+  seen=" "
+  while IFS= read -r name; do
+    [ -n "$name" ] || fail "snapshot manifest contains an empty entry"
+    validate_name "$name"
+    case "$seen" in *" $name "*) fail "snapshot manifest contains a duplicate layout" ;; esac
+    seen="$seen$name "
+    require_plain_directory "$SNAPSHOT/$name"
+  done < "$MANIFEST"
+  /bin/rm -rf "$SNAPSHOT"
+  /bin/sync
+}
+
+case "$action" in
+  snapshot) snapshot ;;
+  restore) restore ;;
+  commit) commit ;;
+  *) echo "usage: $0 snapshot|restore|commit" >&2; exit 64 ;;
+esac

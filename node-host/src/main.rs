@@ -2,12 +2,15 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use control_protocol::node::NodeRuntimeState;
 use node_host::{
-    bootstrap, bootstrap_and_install_user_service, configure_relay, configure_xray, initialize,
-    install_user_service, join, query_local_service_status, remove_user_service, revoke_relay, run,
-    status, support_bundle, sync_once, uninstall_local, user_service_status,
-    BackgroundServiceStatus, BootstrapRequest, HostStatus, LocalServiceStatus, SyncLoopOptions,
+    bootstrap, bootstrap_and_install_user_service, clear_manual_endpoint,
+    configure_manual_endpoint, configure_provider_policy, configure_relay, configure_xray,
+    initialize, install_user_service, join, pause_provider, query_local_service_status,
+    remove_user_service, resume_provider, revoke_relay, run, status, support_bundle, sync_once,
+    uninstall_local, user_service_status, BackgroundServiceStatus, BootstrapRequest, HostStatus,
+    LocalServiceStatus, ManualEndpointInput, ProviderPolicy, SyncLoopOptions,
     UserServiceInstallRequest,
 };
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -131,6 +134,46 @@ enum Command {
         #[arg(long)]
         confirm_endpoint_id: control_protocol::id::EndpointId,
     },
+    /// Replace the complete provider-local policy from a closed JSON DTO.
+    ConfigureProviderPolicy {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        policy_file: PathBuf,
+    },
+    /// Immediately stop sharing without deleting enrollment or applied state.
+    PauseProvider {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Re-enable sharing subject to schedule and quota policy.
+    ResumeProvider {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Advertise an explicit finite public endpoint for the current revision.
+    ConfigureManualEndpoint {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        public_port: u16,
+        #[arg(long)]
+        forwarded_local_port: u16,
+        #[arg(long, default_value_t = 86_400)]
+        ttl_seconds: u32,
+    },
+    /// Withdraw the provider-owned manual endpoint candidate.
+    ClearManualEndpoint {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Run the installer-owned macOS `LaunchDaemon` using fixed package paths.
+    SystemService,
+    /// Rebind a package-migrated identity to the fixed macOS system layout.
+    #[command(hide = true)]
+    MigrateSystemLayout,
     /// Run resilient outbound synchronization until the process is stopped.
     Run {
         /// Persistent state directory.
@@ -274,6 +317,63 @@ async fn main() -> Result<()> {
             revoke_relay(&data_dir, confirm_endpoint_id)?;
             status(&data_dir)?
         }
+        Command::ConfigureProviderPolicy {
+            data_dir,
+            policy_file,
+        } => {
+            let bytes = fs::read(&policy_file)?;
+            if bytes.is_empty() || bytes.len() > 64 * 1024 {
+                anyhow::bail!("provider policy file must contain between 1 and 65536 bytes");
+            }
+            let policy: ProviderPolicy = serde_json::from_slice(&bytes)?;
+            configure_provider_policy(&data_dir, &policy)?;
+            status(&data_dir)?
+        }
+        Command::PauseProvider { data_dir } => {
+            pause_provider(&data_dir)?;
+            status(&data_dir)?
+        }
+        Command::ResumeProvider { data_dir } => {
+            resume_provider(&data_dir)?;
+            status(&data_dir)?
+        }
+        Command::ConfigureManualEndpoint {
+            data_dir,
+            address,
+            public_port,
+            forwarded_local_port,
+            ttl_seconds,
+        } => {
+            configure_manual_endpoint(
+                &data_dir,
+                &ManualEndpointInput {
+                    address,
+                    public_port,
+                    forwarded_local_port,
+                    ttl_seconds,
+                },
+            )?;
+            status(&data_dir)?
+        }
+        Command::ClearManualEndpoint { data_dir } => {
+            clear_manual_endpoint(&data_dir)?;
+            status(&data_dir)?
+        }
+        Command::SystemService => {
+            init_logging();
+            #[cfg(target_os = "macos")]
+            node_host::run_system_service().await?;
+            #[cfg(not(target_os = "macos"))]
+            anyhow::bail!("system-service is supported only by the macOS package");
+            return Ok(());
+        }
+        Command::MigrateSystemLayout => {
+            #[cfg(target_os = "macos")]
+            node_host::migrate_system_layout_binding()?;
+            #[cfg(not(target_os = "macos"))]
+            anyhow::bail!("system layout migration is supported only by the macOS package");
+            return Ok(());
+        }
         Command::Run {
             data_dir,
             sync_interval_seconds,
@@ -366,6 +466,18 @@ fn print_local_service_status(status: &LocalServiceStatus) {
         None => println!("last_error: none"),
     }
     println!("relay_runtime: {:?}", status.relay_runtime);
+    println!(
+        "provider_availability: {:?}",
+        status.provider_policy.availability
+    );
+    println!(
+        "admission_active_sessions: {}",
+        status.admission.active_sessions
+    );
+    println!(
+        "admission_rejected_session_limit: {}",
+        status.admission.rejected_session_limit
+    );
 }
 
 const fn runtime_state_name(state: NodeRuntimeState) -> &'static str {
@@ -469,6 +581,22 @@ fn print_status(status: &HostStatus) {
         Some(endpoint_id) => println!("relay_endpoint_id: {endpoint_id}"),
         None => println!("relay_endpoint_id: none"),
     }
+    println!(
+        "provider_availability: {:?}",
+        status.provider_policy.availability
+    );
+    println!("provider_paused: {}", status.provider_policy.policy.paused);
+    println!(
+        "provider_month_usage: {} {} ({})",
+        status.provider_policy.month_usage.utc_month,
+        status.provider_policy.month_usage.observed_bytes,
+        status.provider_policy.month_usage.coverage
+    );
+    println!(
+        "manual_endpoint: configured={} current={}",
+        status.provider_policy.manual_endpoint.configured,
+        status.provider_policy.manual_endpoint.current
+    );
 }
 
 fn print_controller_status(status: Option<&control_protocol::node::NodeHeartbeatStatus>) {

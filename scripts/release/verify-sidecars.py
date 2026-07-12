@@ -67,6 +67,7 @@ def main() -> None:
         "version": xray["version"],
         "target": args.target,
         "sha256": actual,
+        "size": args.xray.stat().st_size,
         "versionOutput": version_line,
     }]
     if args.node_host:
@@ -77,6 +78,7 @@ def main() -> None:
             "version": args.node_host_version,
             "target": args.target,
             "sha256": sha256(args.node_host),
+            "size": args.node_host.stat().st_size,
             "versionOutput": None,
         })
     document = {"schemaVersion": 1, "components": components}

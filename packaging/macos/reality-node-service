@@ -2,12 +2,17 @@
 set -eu
 
 BASE="/Library/Application Support/Private Network Node"
-STATE="$BASE/state"
+STATE="$BASE/service-state/state"
 AGENT="$BASE/current/node-host"
 
-# An unpaired installation is intentionally dormant. Setup kicks launchd after
-# enrollment creates the database, avoiding a pre-enrollment crash loop.
-[ -f "$STATE/node-host.sqlite3" ] || exit 0
 [ -x "$AGENT" ] || { echo "installed Node Host agent is missing" >&2; exit 70; }
 
+# Fixed paths are compiled into this closed service entry point. Setup secrets,
+# package paths, and policy values are accepted only over authenticated IPC.
+if "$AGENT" --help 2>/dev/null | /usr/bin/grep -q 'system-service'; then
+  exec "$AGENT" system-service
+fi
+
+# Upgrade rollback compatibility for the last pre-system-service package.
+[ -f "$STATE/node-host.sqlite3" ] || exit 0
 exec "$AGENT" run --data-dir "$STATE"

@@ -29,6 +29,24 @@ pub struct ServiceConfig {
     pub remote_probe: Option<RemoteTcpProbeConfig>,
     pub protocol_canary: Option<ProtocolCanaryConfig>,
     pub protocol_canary_options: ProtocolCanaryLoopOptions,
+    pub relay_provisioning: Option<RelayProvisioningConfig>,
+}
+
+/// Operator-owned, static relay provisioning inputs. This is deliberately not
+/// expressible through the administrator HTTP API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayProvisioningConfig {
+    pub relay_id: control_protocol::id::RelayId,
+    pub public_host: String,
+    pub tunnel_host: String,
+    pub tunnel_port: u16,
+    pub tls_server_name: String,
+    pub managed_route_dir: PathBuf,
+    pub ca_certificate_path: PathBuf,
+    pub ca_private_key_path: PathBuf,
+    pub public_port_start: u16,
+    pub public_port_end: u16,
+    pub limits: control_protocol::relay::RelayLimits,
 }
 
 impl ServiceConfig {
@@ -71,6 +89,7 @@ impl ServiceConfig {
         let canary_path = optional_env("CONTROL_PROTOCOL_CANARY_XRAY_PATH")?;
         let canary_sha256 = optional_env("CONTROL_PROTOCOL_CANARY_XRAY_SHA256")?;
         let protocol_canary = build_protocol_canary_config(canary_path, canary_sha256)?;
+        let relay_provisioning = RelayProvisioningConfig::from_env()?;
 
         Ok(Self {
             bind_address,
@@ -84,6 +103,7 @@ impl ServiceConfig {
             remote_probe,
             protocol_canary,
             protocol_canary_options: ProtocolCanaryLoopOptions::default(),
+            relay_provisioning,
         })
     }
 
@@ -105,7 +125,103 @@ impl ServiceConfig {
             remote_probe: None,
             protocol_canary: None,
             protocol_canary_options: ProtocolCanaryLoopOptions::default(),
+            relay_provisioning: None,
         })
+    }
+}
+
+impl RelayProvisioningConfig {
+    /// Parses the complete relay profile. Any partial profile fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] for partial, malformed, or unsafe profiles.
+    pub fn from_env() -> Result<Option<Self>, ConfigError> {
+        const NAMES: [&str; 14] = [
+            "CONTROL_RELAY_ID",
+            "CONTROL_RELAY_PUBLIC_HOST",
+            "CONTROL_RELAY_TUNNEL_HOST",
+            "CONTROL_RELAY_TUNNEL_PORT",
+            "CONTROL_RELAY_TLS_SERVER_NAME",
+            "CONTROL_RELAY_MANAGED_ROUTE_DIR",
+            "CONTROL_RELAY_CA_CERT_PATH",
+            "CONTROL_RELAY_CA_KEY_PATH",
+            "CONTROL_RELAY_PUBLIC_PORT_START",
+            "CONTROL_RELAY_PUBLIC_PORT_END",
+            "CONTROL_RELAY_MAX_CONCURRENT_STREAMS",
+            "CONTROL_RELAY_MAX_BYTES_PER_SECOND",
+            "CONTROL_RELAY_MAX_BYTES_PER_CONNECTION",
+            "CONTROL_RELAY_MONTHLY_BYTE_LIMIT",
+        ];
+        let values = NAMES
+            .map(optional_env)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::from_optional_values(values)
+    }
+
+    fn from_optional_values(values: Vec<Option<String>>) -> Result<Option<Self>, ConfigError> {
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        if values.iter().any(Option::is_none) {
+            return Err(ConfigError::IncompleteRelayProvisioning);
+        }
+        let values = values.into_iter().flatten().collect::<Vec<_>>();
+        let relay_id = values[0]
+            .parse()
+            .map_err(|_| ConfigError::InvalidRelayProvisioning)?;
+        let tunnel_port = values[3]
+            .parse()
+            .map_err(|_| ConfigError::InvalidRelayProvisioning)?;
+        let public_port_start: u16 = values[8]
+            .parse()
+            .map_err(|_| ConfigError::InvalidRelayProvisioning)?;
+        let public_port_end: u16 = values[9]
+            .parse()
+            .map_err(|_| ConfigError::InvalidRelayProvisioning)?;
+        if public_port_start == 0 || public_port_start >= public_port_end {
+            return Err(ConfigError::InvalidRelayProvisioning);
+        }
+        let limits = control_protocol::relay::RelayLimits {
+            max_concurrent_streams: values[10]
+                .parse()
+                .map_err(|_| ConfigError::InvalidRelayProvisioning)?,
+            max_bytes_per_second: values[11]
+                .parse()
+                .map_err(|_| ConfigError::InvalidRelayProvisioning)?,
+            max_bytes_per_connection: values[12]
+                .parse()
+                .map_err(|_| ConfigError::InvalidRelayProvisioning)?,
+            monthly_byte_limit: values[13]
+                .parse()
+                .map_err(|_| ConfigError::InvalidRelayProvisioning)?,
+        };
+        limits
+            .validate()
+            .map_err(|_| ConfigError::InvalidRelayProvisioning)?;
+        for value in [&values[1], &values[2], &values[4]] {
+            if value.is_empty()
+                || value.len() > 253
+                || value.contains(['/', ':'])
+                || value.chars().any(char::is_whitespace)
+            {
+                return Err(ConfigError::InvalidRelayProvisioning);
+            }
+        }
+        Ok(Some(Self {
+            relay_id,
+            public_host: values[1].clone(),
+            tunnel_host: values[2].clone(),
+            tunnel_port,
+            tls_server_name: values[4].clone(),
+            managed_route_dir: PathBuf::from(&values[5]),
+            ca_certificate_path: PathBuf::from(&values[6]),
+            ca_private_key_path: PathBuf::from(&values[7]),
+            public_port_start,
+            public_port_end,
+            limits,
+        }))
     }
 }
 
@@ -221,13 +337,20 @@ pub enum ConfigError {
     InvalidRemoteProbe(#[from] RemoteTcpProbeConfigError),
     #[error("CONTROL_PROTOCOL_CANARY_XRAY_PATH and CONTROL_PROTOCOL_CANARY_XRAY_SHA256 must be set together")]
     IncompleteProtocolCanary,
+    #[error("CONTROL_RELAY_* provisioning variables must either all be absent or all be present")]
+    IncompleteRelayProvisioning,
+    #[error("CONTROL_RELAY_* provisioning values are invalid")]
+    InvalidRelayProvisioning,
     #[error(transparent)]
     InvalidProtocolCanary(#[from] CanaryConfigError),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_remote_probe_config, normalize_controller_origin, ConfigError};
+    use super::{
+        build_remote_probe_config, normalize_controller_origin, ConfigError,
+        RelayProvisioningConfig,
+    };
     use crate::probe::ProbeMode;
 
     const TOKEN: &str = "remote-config-test-token-with-at-least-32-bytes";
@@ -284,6 +407,46 @@ mod tests {
                 Some(TOKEN.to_string())
             ),
             Err(ConfigError::RemoteProbeSettingsWithoutMode)
+        ));
+    }
+
+    #[test]
+    fn relay_profile_is_all_or_none() {
+        let absent = vec![None; 14];
+        assert!(RelayProvisioningConfig::from_optional_values(absent)
+            .unwrap()
+            .is_none());
+        let partial = vec![Some("x".to_string()), None];
+        assert!(matches!(
+            RelayProvisioningConfig::from_optional_values(partial),
+            Err(ConfigError::IncompleteRelayProvisioning)
+        ));
+    }
+
+    #[test]
+    fn relay_profile_requires_rotation_overlap_ports() {
+        let values = [
+            uuid::Uuid::new_v4().to_string(),
+            "relay.example".to_string(),
+            "relay.example".to_string(),
+            "9443".to_string(),
+            "relay.example".to_string(),
+            "/var/lib/private-network/relay-routes".to_string(),
+            "/var/lib/private-network/relay-ca.pem".to_string(),
+            "/var/lib/private-network/relay-ca-key.pem".to_string(),
+            "20000".to_string(),
+            "20000".to_string(),
+            "1".to_string(),
+            "1024".to_string(),
+            "1048576".to_string(),
+            "1048576".to_string(),
+        ]
+        .into_iter()
+        .map(Some)
+        .collect();
+        assert!(matches!(
+            RelayProvisioningConfig::from_optional_values(values),
+            Err(ConfigError::InvalidRelayProvisioning)
         ));
     }
 }

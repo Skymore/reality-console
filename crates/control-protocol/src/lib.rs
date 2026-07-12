@@ -15,6 +15,7 @@ pub mod idempotency;
 pub mod node;
 pub mod node_status;
 pub mod probe;
+pub mod relay;
 pub mod request_auth;
 pub mod secret;
 pub mod telemetry;

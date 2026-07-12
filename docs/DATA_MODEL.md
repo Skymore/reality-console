@@ -133,10 +133,15 @@ consumption/device/session/request-response metadata. The raw secret and complet
 never stored. Exact creation and consumption retries reconstruct the same secret-bearing response
 from the controller identity; changed retries conflict.
 
-`password_reset_tokens` has the same one-time-token shape with `reset_id`, `user_id`, and nullable
-`consumed_at`. Reset consumption changes the password reference, increments `credential_version`,
-revokes existing refresh sessions, consumes the token, and writes the audit event in one
-transaction.
+`account_reset_tokens` stores `(network_id, token_id)`, `user_id`, a unique keyed 32-byte secret
+verifier, issue idempotency/request digests, expiry, creation time, and nullable consume time,
+consume idempotency/request digests, plus the bounded safe response JSON. The raw `rcr1` bearer and
+password are never stored. Exact issue retries derive the same bearer from controller identity;
+exact consume retries return the committed response. A different concurrent or later consume sees
+the terminal consumed state. Reset consumption changes the Argon2id password verifier, increments
+`credential_version`, revokes refresh sessions, rotates current assignment credentials, publishes
+the required per-node revisions, consumes the token, and writes the audit event in one
+`BEGIN IMMEDIATE` transaction. Migration 14 creates this table and its unconsumed-expiry index.
 
 `refresh_sessions`
 
@@ -297,6 +302,10 @@ last applied snapshot still contains them. Remote Xray removal still requires a 
 and a successfully applied replacement revision; Control never claims stronger offline revocation.
 
 ### 3.5 Immutable desired state and rollout state
+
+Administrator node summaries derive `lastFailure` from the highest revision with a terminal
+`rejected` or `rolledBack` result. The API parses the bounded stored result and exposes only its
+revision, state, stable error code, optional restored revision, and completion time.
 
 `config_revisions`
 
@@ -521,6 +530,15 @@ implemented tables and later planned policy/telemetry expansions.
   `relay_assignment` stores only endpoint/route metadata, expiry, owner-only material generation,
   and digest. Token, client certificate/private key, and relay CA bytes live under a 0700
   generation directory as 0600 files and are deleted on explicit revoke.
+
+Control migration 15 adds `relay_routes`, `relay_grants`, and `relay_outbox`. `relay_routes`
+contains the stable logical `route_id` and endpoint ID for a node. Each `relay_grants` row has a
+unique `grant_id` and monotonic generation, public metadata, HPKE ciphertext, signed route JSON,
+and digests only; it has no raw route token, issued client key, or client certificate plaintext.
+`relay_outbox` persists publish/revoke work across file-side-effect crashes. The managed filename
+and Relay/Node Host registration key are the exact `grant_id`, never the stable `route_id`.
+`published` follows an observed exact file; `revoked` follows observed absence. N+1 publication
+queues N revocation only after the new exact grant is published.
 
 Node-local REALITY private keys and raw controller credentials are outside SQLite. The database may
 be restored only when its node identity matches the credential-store identity; otherwise Node Host

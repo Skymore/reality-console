@@ -58,7 +58,9 @@ Put the printed token and certificate hashes into `config.toml`, choose one opaq
 files, set a future expiry, and set `node.toml`'s relay address and fixed loopback Xray target.
 
 The server requires owner-only permissions on its private key. The connector requires owner-only
-permissions on its private key and route token.
+permissions on its private key and route token. When `[managed_routes]` is enabled, its directory
+must be mode `0700`, and every route JSON must be a mode `0600` regular file owned by the relay
+process effective UID (normally root). Symlinks are rejected.
 
 ```bash
 chmod 600 pki/relay-server-key.pem pki/node-key.pem pki/route-token
@@ -109,9 +111,36 @@ Server TOML rejects unknown fields. Queue sizes, frame sizes, route count, node 
 stream concurrency, rate, byte limits, and timeouts are all finite and validated. Each route maps
 exactly one public listener to exactly one authenticated node tunnel.
 
-The server checks its TOML file on the configured interval. Added routes bind new listeners;
-disabled, removed, expired, or changed routes close their tunnel and active streams. Static server
-listener/TLS changes require restart. A malformed reload leaves the active configuration intact.
+The optional `[managed_routes]` table pins one relay ID and one controller Ed25519 public key. It
+also fixes the local public-listen IP, allowed public-port range, and operator ceilings for streams,
+bandwidth, per-connection bytes, and monthly bytes. Each directory entry must be a bounded strict
+`SignedRelayRoute` document. The relay verifies the closed schema/header, controller key ID and
+signature, relay binding, lifetime, port range, and ceilings before converting active grants to the
+runtime route model. Registration uses the generation-scoped `grantId`, so two generations of one
+logical `routeId` may coexist on different public ports during rotation.
+
+Controller publication uses exactly `<grantId>.relay-route.json`, and the filename must match the
+signed document. Hidden files, temporary files, other names, and symlinks fail the complete update.
+
+The server checks its TOML file and managed directory on the configured interval. Added routes bind
+new listeners; disabled, removed, expired, or changed routes close their tunnel and active streams.
+Static server, registry trust, listener, and TLS changes require restart. Directory fingerprints are
+SHA-256 over sorted names, exact bounded contents, and current time-activation bits. Crossing
+`notBefore` activates a grant and crossing `expiresAt` withdraws it even if file bytes do not change.
+Unknown files, partial JSON, symlinks, non-regular files, wrong owner/mode, oversized files, invalid
+signatures, or any inconsistent route keep the complete last-known-good route map; updates are never
+applied file by file.
+
+Managed routes also require a separate `quota_state_directory` owned by the relay process with mode
+`0700`. Relay persists an owner-only `monthly-quotas.json` ledger there. Upload and download bytes
+share the signed generation's finite `monthlyByteLimit`; Relay durably reserves each byte before
+forwarding it, rejects new member streams once exhausted, and forwards at most the exact remaining
+allowance. Counters use UTC calendar months, survive route reload and process restart, and never
+move back to an earlier month after a wall-clock rollback. Grant IDs keep rotation generations
+independent. Missing permissions, malformed state, an interrupted atomic write, or a persistence
+failure fails managed quota admission closed. Retired grant records remain for 62 days and the
+ledger has a hard eight-record-per-configured-route ceiling; capacity exhaustion rejects the new
+route instead of evicting a still-protected record.
 
 The connector retries relay TCP/TLS/registration loss with capped exponential backoff. Heartbeats
 run in both directions. A valid new tunnel replaces the stale tunnel for the same route.
@@ -140,12 +169,14 @@ certificates, payload bytes, VLESS UUIDs, REALITY keys, SNI, and destinations ar
 
 ## Current Integration Risks
 
-- Control does not yet issue signed relay grants or write this service's route config. Provisioning,
-  token/certificate rotation, and policy reconciliation remain mainline integration work.
-- Node Host does not yet instantiate `RelayNodeConnector`; the standalone `relay-node` runner and
-  library API are ready for that wiring.
-- Rate and per-connection byte limits are enforced in memory. Persistent calendar-month quota and
-  restart-safe accounting are not implemented in this isolated slice.
+- Relay accepts controller-signed managed route documents and converges add, rotation, expiry, and
+  revocation without operator route edits. End-to-end provisioning still depends on the Control
+  outbox and Node Host assignment paths being deployed with the same pinned controller identity.
+- Node Host instantiates `RelayNodeConnector` after an owner-managed assignment is installed and the
+  applied Xray/admission runtime is serving. The remaining gap is automatic controller-issued grant
+  provisioning; providers must not import that assignment in the completed product journey.
+- Rate and per-connection byte limits are enforced in memory; managed monthly byte limits are
+  enforced by the restart-safe UTC ledger described above.
 - Dedicated public route ports can be scanned or denial-of-service targeted even though attackers
   still cannot pass node Xray authentication. Production deployment needs host firewall limits and
   external abuse monitoring.

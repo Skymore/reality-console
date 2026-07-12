@@ -386,6 +386,20 @@ analytics, crash reports, support bundles, browser storage, or world-readable te
 Memory containing secrets SHOULD be zeroized when supported. Support exports use an allowlist and
 are scanned for known secret formats before creation.
 
+### Relay Provisioning Material
+
+Relay provisioning is disabled unless all `CONTROL_RELAY_*` inputs are valid; the relay identity,
+CA paths, managed directory, port range, and ceilings are local service configuration and never
+administrator request fields. Control records only assignment HPKE ciphertext, public metadata,
+and token/certificate digests. Raw route tokens and issued client keys are not persisted in SQLite,
+backups, logs, audit records, support bundles, or admin responses.
+
+The logical `routeId` is not a relay credential. Each generation's `grantId` is the only runtime
+registry/connector ID and names exactly `<grantId>.relay-route.json`. This prevents N/N+1 rotation
+from aliasing a live registry entry. File publication/removal is durable outbox work: a route must
+be observed before Control marks it published, and its absence must be observed before revocation
+completes; pending, revoking, revoked, and expired assignments are never returned to the node.
+
 ### Node-Local REALITY Keys
 
 Every node generates its REALITY private key locally using Xray or a reviewed compatible tool. The

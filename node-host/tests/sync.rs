@@ -146,6 +146,7 @@ struct MockState {
     desired: Arc<Mutex<Option<SignedDesiredState>>>,
     heartbeat_status: Arc<Mutex<Option<SignedNodeHeartbeatStatus>>>,
     reject_revision_results: Arc<AtomicBool>,
+    relay_failure_status: Arc<Mutex<StatusCode>>,
 }
 
 struct MockController {
@@ -154,6 +155,7 @@ struct MockController {
     desired: Arc<Mutex<Option<SignedDesiredState>>>,
     heartbeat_status: Arc<Mutex<Option<SignedNodeHeartbeatStatus>>>,
     reject_revision_results: Arc<AtomicBool>,
+    relay_failure_status: Arc<Mutex<StatusCode>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -167,12 +169,14 @@ impl MockController {
         let desired = Arc::new(Mutex::new(None));
         let heartbeat_status = Arc::new(Mutex::new(None));
         let reject_revision_results = Arc::new(AtomicBool::new(false));
+        let relay_failure_status = Arc::new(Mutex::new(StatusCode::SERVICE_UNAVAILABLE));
         let state = MockState {
             mode,
             requests: Arc::clone(&requests),
             desired: Arc::clone(&desired),
             heartbeat_status: Arc::clone(&heartbeat_status),
             reject_revision_results: Arc::clone(&reject_revision_results),
+            relay_failure_status: Arc::clone(&relay_failure_status),
         };
         let router = Router::new()
             .route("/v1/nodes/{node_id}/heartbeat", post(capture))
@@ -186,6 +190,10 @@ impl MockController {
                 "/v1/nodes/{node_id}/revisions/{revision}/result",
                 put(capture),
             )
+            .route(
+                "/v1/nodes/{node_id}/relay-assignment",
+                get(relay_unavailable).post(relay_unavailable),
+            )
             .with_state(state);
         let task = tokio::spawn(async move {
             axum::serve(listener, router)
@@ -198,6 +206,7 @@ impl MockController {
             desired,
             heartbeat_status,
             reject_revision_results,
+            relay_failure_status,
             task,
         }
     }
@@ -225,6 +234,39 @@ impl MockController {
     fn reject_revision_results(&self, reject: bool) {
         self.reject_revision_results.store(reject, Ordering::SeqCst);
     }
+
+    fn set_relay_failure_status(&self, status: StatusCode) {
+        *self.relay_failure_status.lock().unwrap() = status;
+    }
+}
+
+async fn relay_unavailable(
+    State(state): State<MockState>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    state.requests.lock().unwrap().push(CapturedRequest {
+        method,
+        path_and_query: uri.path().to_string(),
+        headers,
+        body: body.to_vec(),
+    });
+    let status = *state.relay_failure_status.lock().unwrap();
+    (
+        status,
+        axum::Json(json!({
+            "error": {
+                "code": "relay_unavailable",
+                "message": SECRET_RESPONSE_TEXT,
+                "requestId": RequestId::new(),
+                "retryable": status.is_server_error(),
+                "details": {"private": SECRET_RESPONSE_TEXT}
+            }
+        })),
+    )
+        .into_response()
 }
 
 async fn telemetry_cursor() -> axum::Json<TelemetryCursor> {
@@ -396,10 +438,14 @@ fn signed_desired_for_schema(
     revision: i64,
     schema_version: u16,
 ) -> SignedDesiredState {
-    let signing_seed: [u8; 32] = fs::read(data_dir.join("identity.ed25519.seed"))
-        .unwrap()
-        .try_into()
-        .unwrap();
+    let signing_seed: [u8; 32] = fs::read(
+        node_host::default_installation_identity_dir(data_dir)
+            .unwrap()
+            .join("identity.ed25519.seed"),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
     let signing_key = SigningKey::from_bytes(&signing_seed);
     let signing_public_key: Ed25519PublicKey = URL_SAFE_NO_PAD
         .encode(signing_key.verifying_key().to_bytes())
@@ -451,10 +497,14 @@ fn signed_controller_status(
     registration: Registration,
     heartbeat_generation: i64,
 ) -> SignedNodeHeartbeatStatus {
-    let signing_seed: [u8; 32] = fs::read(data_dir.join("identity.ed25519.seed"))
-        .unwrap()
-        .try_into()
-        .unwrap();
+    let signing_seed: [u8; 32] = fs::read(
+        node_host::default_installation_identity_dir(data_dir)
+            .unwrap()
+            .join("identity.ed25519.seed"),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
     let signing_key = SigningKey::from_bytes(&signing_seed);
     let signing_public_key: Ed25519PublicKey = URL_SAFE_NO_PAD
         .encode(signing_key.verifying_key().to_bytes())
@@ -491,10 +541,14 @@ fn signed_controller_status(
 }
 
 fn resign_controller_status(data_dir: &std::path::Path, status: &mut SignedNodeHeartbeatStatus) {
-    let signing_seed: [u8; 32] = fs::read(data_dir.join("identity.ed25519.seed"))
-        .unwrap()
-        .try_into()
-        .unwrap();
+    let signing_seed: [u8; 32] = fs::read(
+        node_host::default_installation_identity_dir(data_dir)
+            .unwrap()
+            .join("identity.ed25519.seed"),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
     let signing_key = SigningKey::from_bytes(&signing_seed);
     status.signature = URL_SAFE_NO_PAD
         .encode(
@@ -535,6 +589,7 @@ where
     assert_eq!(persisted, 0);
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     let controller = MockController::start(ResponseMode::NoDesiredState).await;
@@ -549,7 +604,7 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     assert!(synced.last_sync_at.is_some());
     assert!(synced.controller_status.is_none());
     assert_eq!(synced.desired_revision_cursor, 0);
-    assert_eq!(synced.schema_version, 15);
+    assert_eq!(synced.schema_version, 17);
 
     let captured = controller.captured();
     assert_eq!(captured.len(), 2);
@@ -641,8 +696,56 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     for value in transient_auth_values {
         assert!(!contains_bytes(&database, value.as_bytes()));
     }
-    let identity_seed = fs::read(data_dir.join("identity.ed25519.seed")).unwrap();
+    let identity_seed = fs::read(
+        node_host::default_installation_identity_dir(&data_dir)
+            .unwrap()
+            .join("identity.ed25519.seed"),
+    )
+    .unwrap();
     assert!(!contains_bytes(&database, &identity_seed));
+}
+
+#[tokio::test]
+async fn relay_404_and_5xx_do_not_block_heartbeat_desired_or_direct_control_state() {
+    let controller = MockController::start(ResponseMode::NoDesiredState).await;
+    let temp = tempfile::tempdir().unwrap();
+    let data_dir = temp.path().join("state");
+    let registration = install_registration(&data_dir, &controller.origin);
+    let public_key = status(&data_dir).unwrap().identity_public_key;
+    let connection = Connection::open(data_dir.join("node-host.sqlite3")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO relay_provider_consent(singleton, policy_version, accepted_at)
+             VALUES (1, '2026-07-11-relay-v1', ?1)",
+            [OffsetDateTime::now_utc().unix_timestamp()],
+        )
+        .unwrap();
+    drop(connection);
+
+    for failure in [StatusCode::NOT_FOUND, StatusCode::SERVICE_UNAVAILABLE] {
+        controller.set_relay_failure_status(failure);
+        controller.clear_captured();
+        let synced = sync_once(&data_dir).await.unwrap();
+        assert_eq!(synced.enrollment_state, EnrollmentState::Enrolled);
+        assert!(synced.last_heartbeat_at.is_some());
+        assert!(synced.last_sync_at.is_some());
+        assert!(synced.relay.endpoint_id.is_none());
+
+        let captured = controller.captured();
+        let relay = captured
+            .iter()
+            .find(|request| request.path_and_query.ends_with("/relay-assignment"))
+            .unwrap();
+        assert_eq!(relay.method, Method::GET);
+        verify_captured(relay, &public_key, registration);
+        assert!(captured
+            .iter()
+            .any(|request| request.path_and_query.ends_with("/heartbeat")));
+        assert!(captured
+            .iter()
+            .any(|request| request.path_and_query.contains("/desired?afterRevision=")));
+        assert!(!data_dir.join("relay-managed-state.json").exists());
+    }
 }
 
 #[tokio::test]

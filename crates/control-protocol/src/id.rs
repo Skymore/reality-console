@@ -132,6 +132,12 @@ typed_id!(/// Stable enrolled node-key identity.
     NodeKeyId);
 typed_id!(/// Stable node endpoint identity.
     EndpointId);
+typed_id!(/// Stable configured relay service identity.
+    RelayId);
+typed_id!(/// Stable logical relay route identity.
+    RelayRouteId);
+typed_id!(/// Stable controller-issued relay grant identity.
+    RelayGrantId);
 
 /// A positive, monotonically increasing desired-state revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -196,6 +202,42 @@ impl BundleGeneration {
 }
 
 impl<'de> Deserialize<'de> for BundleGeneration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = i64::deserialize(deserializer)?;
+        Self::new(value).map_err(de::Error::custom)
+    }
+}
+
+/// A positive, monotonically increasing relay-assignment generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RelayGeneration(i64);
+
+impl RelayGeneration {
+    /// Creates a positive relay generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidPositiveNumber`] when `value` is zero or negative.
+    pub const fn new(value: i64) -> Result<Self, InvalidPositiveNumber> {
+        if value > 0 {
+            Ok(Self(value))
+        } else {
+            Err(InvalidPositiveNumber)
+        }
+    }
+
+    /// Returns the wire value.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RelayGeneration {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,

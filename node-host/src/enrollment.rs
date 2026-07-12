@@ -78,7 +78,7 @@ pub(crate) async fn join_invitation(
     let mut connection = open_database(data_dir, true)?;
     migrate(&mut connection)?;
     configure_controller(&connection, &controller)?;
-    let identity = Identity::load_or_create(data_dir)?;
+    let identity = Identity::load_or_create_default(&connection, data_dir)?;
     if let Some(existing) = load_registration(&connection)? {
         if existing.invitation_id != invitation.invitation_id.to_string() {
             bail!("node host is already enrolled with a different invitation");

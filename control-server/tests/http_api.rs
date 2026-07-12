@@ -4,9 +4,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use control_protocol::account::{
     decode_member_setup_code, AccountNodeAssignmentStatus, AccountNodeProvisioningState,
-    AccountStatus, AccountSummary, ConsumeDeviceActivationRequest, CreateDeviceActivationRequest,
-    CreateDeviceSessionResponse, CreateSessionRequest, DeviceEnrollment, MemberSetupActivation,
-    RefreshSessionRequest, RefreshSessionResponse, SetAccountPasswordRequest, SignedProfileBundle,
+    AccountStatus, AccountSummary, ConsumeAccountResetTokenRequest,
+    ConsumeAccountResetTokenResponse, ConsumeDeviceActivationRequest,
+    CreateDeviceActivationRequest, CreateDeviceSessionResponse, CreateSessionRequest,
+    DeviceEnrollment, IssueAccountResetTokenRequest, IssueAccountResetTokenResponse,
+    MemberSetupActivation, RefreshSessionRequest, RefreshSessionResponse,
+    SetAccountPasswordRequest, SignedProfileBundle,
 };
 use control_protocol::account_crypto::{
     device_activation_proof_transcript, device_login_proof_transcript,
@@ -20,7 +23,7 @@ use control_protocol::enrollment::{
 };
 use control_protocol::error::ErrorCode;
 use control_protocol::id::{
-    ControllerInstanceId, DeviceId, EndpointId, NodeId, NodeKeyId, Revision, SequenceNumber,
+    ControllerInstanceId, Count, DeviceId, EndpointId, NodeId, NodeKeyId, Revision, SequenceNumber,
     Timestamp, UserId,
 };
 use control_protocol::idempotency::IDEMPOTENCY_KEY_HEADER;
@@ -28,12 +31,19 @@ use control_protocol::node::{
     decode_node_setup_code, CreateNodeInvitationRequest, CreateNodeInvitationResponse,
     DesiredXrayState, EndpointCandidate, EndpointMode, EndpointReadiness, EndpointSource,
     EnrollNodeRequest, EnrollNodeResponse, NodeCapability, NodeHeartbeat, NodeInitialConfiguration,
-    NodeLifecycleState, NodePublicMaterial, NodeRuntimeState, ProviderConsent, RevisionProgress,
-    RevisionResult, RevisionResultState, SignedDesiredState, SignedNodeHeartbeatStatus,
+    NodeLifecycleState, NodePublicMaterial, NodeRuntimeState, OperatorCohortRollbackRequest,
+    OperatorNodeRollbackRequest, OperatorRollbackReason, OperatorRollbackResponse,
+    OperatorRollbackTarget, ProviderConsent, RevisionProgress, RevisionResult, RevisionResultState,
+    SignedDesiredState, SignedNodeHeartbeatStatus,
 };
 use control_protocol::node_status::verify_node_heartbeat_status_signature;
 use control_protocol::request_auth::NodeRequestSigningInput;
 use control_protocol::secret::Secret;
+use control_protocol::telemetry::{
+    TelemetryBatch, TelemetryBatchAcknowledgement, TelemetryCursor, TelemetryEvent,
+    TelemetryEventKind, TELEMETRY_SCHEMA_VERSION,
+};
+use control_server::db::SCHEMA_VERSION;
 use control_server::probe::{
     TcpProbeCompletion, TcpProbeErrorCode, TcpProbeLoopOptions, TcpProbeResult,
 };
@@ -333,6 +343,29 @@ async fn admin_json_request(
                 .uri(uri)
                 .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
                 .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn admin_json_request_with_key(
+    app: &TestApp,
+    method: &str,
+    uri: &str,
+    body: Value,
+    idempotency_key: &str,
+) -> axum::response::Response {
+    app.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key)
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
         )
@@ -4101,7 +4134,7 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (13, 13, 1, 1, 1));
+    assert_eq!(durable, (SCHEMA_VERSION, SCHEMA_VERSION, 1, 1, 1));
 }
 
 fn unsigned_device(signing_key: &SigningKey, marker: u8) -> DeviceEnrollment {
@@ -4262,6 +4295,323 @@ async fn consume_activation_ok(
         .to_bytes()
         .to_vec();
     (serde_json::from_slice(&bytes).unwrap(), bytes)
+}
+
+async fn issue_reset_token(
+    app: &TestApp,
+    user_id: UserId,
+    idempotency_key: &str,
+) -> (IssueAccountResetTokenResponse, Bytes) {
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/v1/admin/accounts/{user_id}/reset-tokens"))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(IDEMPOTENCY_KEY_HEADER, idempotency_key)
+                .body(Body::from(
+                    serde_json::to_vec(&IssueAccountResetTokenRequest::default()).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (serde_json::from_slice(&bytes).unwrap(), bytes)
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn account_reset_token_is_hashed_single_use_and_concurrently_idempotent() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Recovery member").await;
+    let user_id = account.account.user_id;
+    let old_password = "old recovery password";
+    let new_password = "new recovery password";
+    set_password(&app, user_id, old_password).await;
+    let node = enroll_signed_node(&app).await;
+    let baseline = approve_configured_node(&app, &node).await;
+    assert_eq!(
+        replace_account_nodes(&app, user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let assigned = fetch_desired_ok(&app, &node, baseline.document.revision, 130).await;
+    report_applied_revision(&app, &node, assigned.document.revision, 80, [131, 132, 133]).await;
+
+    let first_login = signed_login_request(user_id, old_password, 40);
+    let first_session: CreateDeviceSessionResponse = serde_json::from_value(
+        json(
+            post_public_json_with_key(
+                &app,
+                "/v1/sessions",
+                &first_login,
+                &Uuid::new_v4().to_string(),
+            )
+            .await,
+        )
+        .await,
+    )
+    .unwrap();
+    let second_login = signed_login_request(user_id, old_password, 41);
+    let second_session: CreateDeviceSessionResponse = serde_json::from_value(
+        json(
+            post_public_json_with_key(
+                &app,
+                "/v1/sessions",
+                &second_login,
+                &Uuid::new_v4().to_string(),
+            )
+            .await,
+        )
+        .await,
+    )
+    .unwrap();
+
+    let issue_key = Uuid::new_v4().to_string();
+    let (issued, first_issue) = issue_reset_token(&app, user_id, &issue_key).await;
+    let (replayed_issue, second_issue) = issue_reset_token(&app, user_id, &issue_key).await;
+    assert_eq!(first_issue, second_issue);
+    assert_eq!(issued, replayed_issue);
+    assert!(issued.reset_token.expose_secret().starts_with("rcr1."));
+    let database_bytes = std::fs::read(app.database_path()).unwrap();
+    assert!(!database_bytes
+        .windows(issued.reset_token.expose_secret().len())
+        .any(|window| window == issued.reset_token.expose_secret().as_bytes()));
+
+    let consume = ConsumeAccountResetTokenRequest {
+        reset_token: issued.reset_token.clone(),
+        new_password: Secret::new(new_password.to_string()),
+    };
+    let consume_key = Uuid::new_v4().to_string();
+    let body = serde_json::to_vec(&consume).unwrap();
+    let request = || {
+        Request::post("/v1/account-reset-tokens/consume")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(IDEMPOTENCY_KEY_HEADER, &consume_key)
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+    let (first, second) = tokio::join!(
+        app.router.clone().oneshot(request()),
+        app.router.clone().oneshot(request()),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let first_bytes = first.into_body().collect().await.unwrap().to_bytes();
+    let second_bytes = second.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(first_bytes, second_bytes);
+    let reset: ConsumeAccountResetTokenResponse = serde_json::from_slice(&first_bytes).unwrap();
+    assert_eq!(reset.user_id, user_id);
+    assert_eq!(reset.revoked_sessions, 2);
+    assert_eq!(reset.published_revisions.len(), 1);
+    assert!(reset.published_revisions[0] > assigned.document.revision);
+
+    let replay = post_public_json_with_key(
+        &app,
+        "/v1/account-reset-tokens/consume",
+        &consume,
+        &consume_key,
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        replay.into_body().collect().await.unwrap().to_bytes(),
+        first_bytes
+    );
+    let consumed = post_public_json_with_key(
+        &app,
+        "/v1/account-reset-tokens/consume",
+        &consume,
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(consumed.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(consumed).await["error"]["code"],
+        "account_reset_consumed"
+    );
+
+    for session in [first_session, second_session] {
+        let refresh = post_public_json_with_key(
+            &app,
+            "/v1/sessions/refresh",
+            &RefreshSessionRequest {
+                refresh_credential: session.credentials.refresh_credential,
+            },
+            &Uuid::new_v4().to_string(),
+        )
+        .await;
+        assert_eq!(refresh.status(), StatusCode::UNAUTHORIZED);
+    }
+    let new_login = signed_login_request(user_id, new_password, 42);
+    assert_eq!(
+        post_public_json_with_key(
+            &app,
+            "/v1/sessions",
+            &new_login,
+            &Uuid::new_v4().to_string(),
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT length(secret_verifier) FROM account_reset_tokens),
+                (SELECT COUNT(*) FROM account_reset_tokens WHERE consumed_at IS NOT NULL),
+                (SELECT COUNT(*) FROM audit_events WHERE event_type = 'account.reset-token-issued'),
+                (SELECT COUNT(*) FROM audit_events WHERE event_type = 'account.reset-token-consumed')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (32, 1, 1, 1));
+}
+
+#[tokio::test]
+async fn account_reset_token_expiry_is_rejected_and_audited() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Expired recovery member").await;
+    let (issued, _) =
+        issue_reset_token(&app, account.account.user_id, &Uuid::new_v4().to_string()).await;
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE account_reset_tokens SET created_at = 0, expires_at = 1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let response = post_public_json_with_key(
+        &app,
+        "/v1/account-reset-tokens/consume",
+        &ConsumeAccountResetTokenRequest {
+            reset_token: issued.reset_token,
+            new_password: Secret::new("replacement password".to_string()),
+        },
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::GONE);
+    assert_eq!(
+        json(response).await["error"]["code"],
+        "account_reset_expired"
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM account_reset_tokens WHERE consumed_at IS NULL),
+                (SELECT COUNT(*) FROM audit_events
+                 WHERE event_type = 'account.reset-token-rejected'
+                   AND json_extract(details_json, '$.reason') = 'expired')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (1, 1));
+}
+
+#[tokio::test]
+async fn unknown_account_reset_tokens_do_not_create_persistent_audit_amplification() {
+    let app = TestApp::new();
+    let before = rusqlite::Connection::open(app.database_path())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM audit_events", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+
+    for index in 0..3 {
+        let response = post_public_json_with_key(
+            &app,
+            "/v1/account-reset-tokens/consume",
+            &ConsumeAccountResetTokenRequest {
+                reset_token: Secret::new(format!("unknown-reset-token-{index}")),
+                new_password: Secret::new("replacement password".to_string()),
+            },
+            &Uuid::new_v4().to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json(response).await["error"]["code"],
+            "account_reset_invalid"
+        );
+    }
+
+    let after = rusqlite::Connection::open(app.database_path())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM audit_events", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn admin_device_revoke_is_independent_across_multiple_devices() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Multi-device member").await;
+    let password = "multi device password";
+    set_password(&app, account.account.user_id, password).await;
+    let mut sessions = Vec::new();
+    for marker in [43, 44] {
+        let login = signed_login_request(account.account.user_id, password, marker);
+        let response =
+            post_public_json_with_key(&app, "/v1/sessions", &login, &Uuid::new_v4().to_string())
+                .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        sessions.push(
+            serde_json::from_value::<CreateDeviceSessionResponse>(json(response).await).unwrap(),
+        );
+    }
+    assert_eq!(
+        app.router
+            .clone()
+            .oneshot(
+                Request::post(format!(
+                    "/v1/admin/devices/{}/revoke",
+                    sessions[0].device_id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let revoked = post_public_json_with_key(
+        &app,
+        "/v1/sessions/refresh",
+        &RefreshSessionRequest {
+            refresh_credential: sessions[0].credentials.refresh_credential.clone(),
+        },
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+    let surviving = post_public_json_with_key(
+        &app,
+        "/v1/sessions/refresh",
+        &RefreshSessionRequest {
+            refresh_credential: sessions[1].credentials.refresh_credential.clone(),
+        },
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(surviving.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -4999,4 +5349,462 @@ async fn assert_device_revoke_rotates_assigned_credentials(
             .unwrap();
         assert_eq!(replacement_count, 1);
     }
+}
+
+fn rollback_configuration(listen_port: u16, public_port: u16, target: &str) -> Value {
+    serde_json::json!({
+        "minAgentVersion": "0.1.0",
+        "xray": {
+            "listenPort": listen_port,
+            "publicPort": public_port,
+            "serverNames": ["rollback.example.test"],
+            "target": target,
+        }
+    })
+}
+
+async fn report_rejected_revision(
+    app: &TestApp,
+    node: &SignedNode,
+    revision: Revision,
+    nonce_bytes: [u8; 2],
+) {
+    assert_eq!(
+        report_result(
+            app,
+            node,
+            revision,
+            &revision_result(RevisionResultState::Received, 0, None),
+            nonce_bytes[0],
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        report_result(
+            app,
+            node,
+            revision,
+            &revision_result(RevisionResultState::Rejected, 0, None),
+            nonce_bytes[1],
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn single_node_rollback_is_new_idempotent_revision_with_failure_summary_and_audit() {
+    let app = TestApp::new();
+    let node = enroll_signed_node(&app).await;
+    let source_configuration = rollback_configuration(10_440, 8_440, "source.example.test:443");
+    let source = approve_and_publish(&app, &node, &source_configuration).await;
+    report_applied_revision(&app, &node, source.document.revision, 81, [140, 141, 142]).await;
+    let failed = publish_and_fetch_desired(
+        &app,
+        &node,
+        &rollback_configuration(10_441, 8_441, "failed.example.test:443"),
+    )
+    .await;
+    report_rejected_revision(&app, &node, failed.document.revision, [143, 144]).await;
+
+    let nodes = json(admin_nodes(&app).await).await;
+    let last_failure = &nodes["nodes"][0]["lastFailure"];
+    assert_eq!(last_failure["revision"], failed.document.revision.get());
+    assert_eq!(last_failure["state"], "rejected");
+    assert_eq!(last_failure["errorCode"], "validation_failed");
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let source_artifact: String = connection
+        .query_row(
+            "SELECT artifact_json FROM config_revisions WHERE revision = ?1",
+            [source.document.revision.get()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    let rollback = OperatorNodeRollbackRequest {
+        source_revision: source.document.revision,
+        failed_revision: failed.document.revision,
+        reason: OperatorRollbackReason::ConfigurationFailure,
+    };
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE nodes SET agent_version = '0.0.9' WHERE node_id = ?1",
+            [node.node_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+    let incompatible = admin_json_request_with_key(
+        &app,
+        "POST",
+        &format!("/v1/admin/nodes/{}/rollback", node.node_id),
+        serde_json::to_value(&rollback).unwrap(),
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(incompatible.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(incompatible).await["error"]["code"],
+        "rollback_target_incompatible"
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    connection
+        .execute(
+            "UPDATE nodes SET agent_version = '0.1.0' WHERE node_id = ?1",
+            [node.node_id.to_string()],
+        )
+        .unwrap();
+    let revision_after_incompatible: i64 = connection
+        .query_row("SELECT last_revision FROM networks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(revision_after_incompatible, failed.document.revision.get());
+    drop(connection);
+    let key = Uuid::new_v4().to_string();
+    let first = admin_json_request_with_key(
+        &app,
+        "POST",
+        &format!("/v1/admin/nodes/{}/rollback", node.node_id),
+        serde_json::to_value(&rollback).unwrap(),
+        &key,
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_bytes = first.into_body().collect().await.unwrap().to_bytes();
+    let response: OperatorRollbackResponse = serde_json::from_slice(&first_bytes).unwrap();
+    assert_eq!(response.publications.len(), 1);
+    let publication = &response.publications[0];
+    assert_eq!(publication.node_id, node.node_id);
+    assert_eq!(publication.source_revision, source.document.revision);
+    assert_eq!(publication.failed_revision, failed.document.revision);
+    assert!(publication.revision > failed.document.revision);
+
+    let replay = admin_json_request_with_key(
+        &app,
+        "POST",
+        &format!("/v1/admin/nodes/{}/rollback", node.node_id),
+        serde_json::to_value(&rollback).unwrap(),
+        &key,
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        replay.into_body().collect().await.unwrap().to_bytes(),
+        first_bytes
+    );
+    let fetched = fetch_desired_ok(&app, &node, failed.document.revision, 145).await;
+    assert_eq!(fetched.document.revision, publication.revision);
+    assert_eq!(fetched.document.xray, source.document.xray);
+    assert_eq!(fetched.document.min_agent_version, "0.1.0");
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (String, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT artifact_json FROM config_revisions WHERE revision = ?1),
+                (SELECT COUNT(*) FROM audit_events WHERE event_type = 'node.revision-failed'),
+                (SELECT COUNT(*) FROM audit_events
+                 WHERE event_type = 'node.operator-rollback-published')",
+            [source.document.revision.get()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (source_artifact, 1, 1));
+    let rollback_details: String = connection
+        .query_row(
+            "SELECT details_json FROM audit_events
+             WHERE event_type = 'node.operator-rollback-published'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!rollback_details.contains("vlessUuid"));
+    assert!(!rollback_details.contains("artifact"));
+    drop(connection);
+
+    let invalid = OperatorNodeRollbackRequest {
+        source_revision: source.document.revision,
+        failed_revision: publication.revision,
+        reason: OperatorRollbackReason::Other,
+    };
+    let invalid_response = admin_json_request_with_key(
+        &app,
+        "POST",
+        &format!("/v1/admin/nodes/{}/rollback", node.node_id),
+        serde_json::to_value(invalid).unwrap(),
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(invalid_response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(invalid_response).await["error"]["code"],
+        "rollback_target_invalid"
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let rejected_audits: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events
+             WHERE event_type = 'node.operator-rollback-rejected'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected_audits, 2);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn explicit_cohort_rollback_is_atomic_monotonic_and_idempotent() {
+    let app = TestApp::new();
+    let first = enroll_signed_node(&app).await;
+    let second = enroll_signed_node(&app).await;
+    let first_source = approve_and_publish(
+        &app,
+        &first,
+        &rollback_configuration(10_450, 8_450, "first-source.example.test:443"),
+    )
+    .await;
+    let second_source = approve_and_publish(
+        &app,
+        &second,
+        &rollback_configuration(10_451, 8_451, "second-source.example.test:443"),
+    )
+    .await;
+    report_applied_revision(
+        &app,
+        &first,
+        first_source.document.revision,
+        82,
+        [150, 151, 152],
+    )
+    .await;
+    report_applied_revision(
+        &app,
+        &second,
+        second_source.document.revision,
+        83,
+        [153, 154, 155],
+    )
+    .await;
+    let first_failed = publish_and_fetch_desired(
+        &app,
+        &first,
+        &rollback_configuration(10_452, 8_452, "first-failed.example.test:443"),
+    )
+    .await;
+    let second_failed = publish_and_fetch_desired(
+        &app,
+        &second,
+        &rollback_configuration(10_453, 8_453, "second-failed.example.test:443"),
+    )
+    .await;
+    report_rejected_revision(&app, &first, first_failed.document.revision, [156, 157]).await;
+    report_rejected_revision(&app, &second, second_failed.document.revision, [158, 159]).await;
+
+    let invalid_cohort = OperatorCohortRollbackRequest {
+        targets: vec![
+            OperatorRollbackTarget {
+                node_id: first.node_id,
+                source_revision: first_source.document.revision,
+                failed_revision: first_failed.document.revision,
+            },
+            OperatorRollbackTarget {
+                node_id: second.node_id,
+                source_revision: first_source.document.revision,
+                failed_revision: second_failed.document.revision,
+            },
+        ],
+        reason: OperatorRollbackReason::FleetRecovery,
+    };
+    let invalid_response = admin_json_request_with_key(
+        &app,
+        "POST",
+        "/v1/admin/rollbacks",
+        serde_json::to_value(invalid_cohort).unwrap(),
+        &Uuid::new_v4().to_string(),
+    )
+    .await;
+    assert_eq!(invalid_response.status(), StatusCode::CONFLICT);
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let revision_after_rejection: i64 = connection
+        .query_row("SELECT last_revision FROM networks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        revision_after_rejection,
+        second_failed.document.revision.get()
+    );
+    drop(connection);
+
+    let request = OperatorCohortRollbackRequest {
+        targets: vec![
+            OperatorRollbackTarget {
+                node_id: second.node_id,
+                source_revision: second_source.document.revision,
+                failed_revision: second_failed.document.revision,
+            },
+            OperatorRollbackTarget {
+                node_id: first.node_id,
+                source_revision: first_source.document.revision,
+                failed_revision: first_failed.document.revision,
+            },
+        ],
+        reason: OperatorRollbackReason::FleetRecovery,
+    };
+    let key = Uuid::new_v4().to_string();
+    let first_response = admin_json_request_with_key(
+        &app,
+        "POST",
+        "/v1/admin/rollbacks",
+        serde_json::to_value(&request).unwrap(),
+        &key,
+    )
+    .await;
+    assert_eq!(first_response.status(), StatusCode::CREATED);
+    let first_bytes = first_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let response: OperatorRollbackResponse = serde_json::from_slice(&first_bytes).unwrap();
+    assert_eq!(response.publications.len(), 2);
+    assert!(response.publications[0].node_id < response.publications[1].node_id);
+    assert_eq!(
+        response.publications[1].revision.get(),
+        response.publications[0].revision.get() + 1
+    );
+    assert!(response
+        .publications
+        .iter()
+        .all(|publication| publication.revision > second_failed.document.revision));
+    let replay = admin_json_request_with_key(
+        &app,
+        "POST",
+        "/v1/admin/rollbacks",
+        serde_json::to_value(&request).unwrap(),
+        &key,
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(
+        replay.into_body().collect().await.unwrap().to_bytes(),
+        first_bytes
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let durable: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM config_revisions),
+                (SELECT COUNT(*) FROM audit_events
+                 WHERE event_type = 'node.operator-rollback-published'),
+                (SELECT COUNT(*) FROM idempotency_records
+                 WHERE route_id = 'v1.admin.rollbacks.create')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(durable, (6, 2, 1));
+}
+
+#[tokio::test]
+async fn signed_telemetry_upload_is_idempotent_and_rejects_sequence_gaps() {
+    let app = TestApp::new();
+    let account = create_account(&app, "Telemetry member").await;
+    let (node, _) = setup_applied_heartbeat(&app).await;
+    assert_eq!(
+        replace_account_nodes(&app, account.account.user_id, &[node.node_id])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let event = TelemetryEvent {
+        sequence: SequenceNumber::new(1).unwrap(),
+        occurred_at: Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        kind: TelemetryEventKind::TrafficDelta {
+            user_id: account.account.user_id,
+            bytes_up: Count::new(11).unwrap(),
+            bytes_down: Count::new(17).unwrap(),
+            connection_count: Count::new(1).unwrap(),
+        },
+    };
+    let batch = TelemetryBatch {
+        schema_version: TELEMETRY_SCHEMA_VERSION,
+        node_id: node.node_id,
+        first_sequence: event.sequence,
+        last_sequence: event.sequence,
+        events: vec![event],
+    };
+    let path = format!("/v1/nodes/{}/telemetry", node.node_id);
+    for _ in 0..2 {
+        let request = signed_node_request(
+            &node,
+            "PUT",
+            &path,
+            serde_json::to_vec(&batch).unwrap(),
+            Timestamp::from_datetime(OffsetDateTime::now_utc()),
+            &fresh_nonce(),
+        );
+        let response = app.router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let acknowledgement: TelemetryBatchAcknowledgement =
+            serde_json::from_value(json(response).await).unwrap();
+        assert_eq!(acknowledgement.acknowledged_sequence.get(), 1);
+        assert_eq!(acknowledgement.expected_sequence.get(), 2);
+    }
+
+    let mut gap = batch;
+    gap.first_sequence = SequenceNumber::new(3).unwrap();
+    gap.last_sequence = SequenceNumber::new(3).unwrap();
+    gap.events[0].sequence = SequenceNumber::new(3).unwrap();
+    let request = signed_node_request(
+        &node,
+        "PUT",
+        &path,
+        serde_json::to_vec(&gap).unwrap(),
+        Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        &fresh_nonce(),
+    );
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json(response).await["error"]["code"],
+        "telemetry_sequence_gap"
+    );
+
+    let cursor_path = format!("/v1/nodes/{}/telemetry/cursor", node.node_id);
+    let response = app
+        .router
+        .clone()
+        .oneshot(signed_node_request(
+            &node,
+            "GET",
+            &cursor_path,
+            Vec::new(),
+            Timestamp::from_datetime(OffsetDateTime::now_utc()),
+            &fresh_nonce(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cursor: TelemetryCursor = serde_json::from_value(json(response).await).unwrap();
+    assert_eq!(cursor.acknowledged_sequence.get(), 1);
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let totals: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT SUM(bytes_up), SUM(bytes_down), SUM(connection_count)
+             FROM traffic_hourly_aggregates WHERE node_id = ?1 AND user_id = ?2",
+            rusqlite::params![
+                node.node_id.to_string(),
+                account.account.user_id.to_string()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(totals, (11, 17, 1));
 }

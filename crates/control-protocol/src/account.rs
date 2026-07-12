@@ -3,7 +3,8 @@
 use crate::crypto::{Ed25519PublicKey, Ed25519Signature, Nonce, Sha256Digest, X25519PublicKey};
 use crate::id::{
     AssignmentId, BundleGeneration, BundleId, ControllerInstanceId, CredentialId,
-    DeviceActivationId, DeviceId, NetworkId, NodeId, SessionId, SigningKeyId, Timestamp, UserId,
+    DeviceActivationId, DeviceId, NetworkId, NodeId, Revision, SessionId, SigningKeyId, Timestamp,
+    UserId,
 };
 use crate::node::EndpointMode;
 use crate::secret::Secret;
@@ -386,6 +387,106 @@ impl SetAccountPasswordRequest {
         }
         Ok(())
     }
+}
+
+/// Administrator request to issue a short-lived one-time account reset token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IssueAccountResetTokenRequest {
+    /// Requested lifetime in seconds. Control enforces a narrow recovery window.
+    #[serde(default = "default_account_reset_lifetime_seconds")]
+    pub expires_in_seconds: u32,
+}
+
+const fn default_account_reset_lifetime_seconds() -> u32 {
+    15 * 60
+}
+
+impl Default for IssueAccountResetTokenRequest {
+    fn default() -> Self {
+        Self {
+            expires_in_seconds: default_account_reset_lifetime_seconds(),
+        }
+    }
+}
+
+impl IssueAccountResetTokenRequest {
+    /// Validates the bounded account recovery window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the requested lifetime is between one minute and one hour.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if !(60..=3_600).contains(&self.expires_in_seconds) {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "expiresInSeconds",
+                "account reset lifetime must be between 60 and 3600 seconds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One-time account recovery material returned only to the administrator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueAccountResetTokenResponse {
+    /// High-entropy bearer value. Control stores only a keyed verifier.
+    pub reset_token: Secret<String>,
+    /// Hard unauthenticated consumption deadline.
+    pub expires_at: Timestamp,
+}
+
+/// Unauthenticated request to consume a one-time reset token and replace the password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsumeAccountResetTokenRequest {
+    /// High-entropy single-use recovery bearer.
+    pub reset_token: Secret<String>,
+    /// Replacement write-only password.
+    pub new_password: Secret<String>,
+}
+
+impl ConsumeAccountResetTokenRequest {
+    /// Validates token presence and the existing password transport bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token is absent or the password is outside its bound.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        let token_length = self.reset_token.expose_secret().len();
+        if token_length == 0 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::MissingField,
+                "resetToken",
+                "account reset token is required",
+            ));
+        }
+        if token_length > 512 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "resetToken",
+                "account reset token exceeds the protocol bound",
+            ));
+        }
+        SetAccountPasswordRequest {
+            new_password: self.new_password.clone(),
+        }
+        .validate()
+    }
+}
+
+/// Safe result of consuming one account reset token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumeAccountResetTokenResponse {
+    /// Account whose password was replaced.
+    pub user_id: UserId,
+    /// Session families revoked by this recovery operation.
+    pub revoked_sessions: u32,
+    /// Newly published authorization-fence revisions, ordered by publication.
+    pub published_revisions: Vec<Revision>,
 }
 
 /// Safe result of an administrative account-session reset.

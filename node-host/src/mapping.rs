@@ -186,8 +186,11 @@ pub(crate) fn load_heartbeat_candidates(
     let Some(applied_revision) = applied_revision else {
         return Ok(Vec::new());
     };
+    let mut candidates = crate::policy::load_manual_candidate(connection, applied_revision)?
+        .into_iter()
+        .collect::<Vec<_>>();
     if !load_policy(connection)?.enabled {
-        return Ok(Vec::new());
+        return Ok(candidates);
     }
     let now = unix_timestamp()?;
     let mut statement = connection.prepare(
@@ -208,7 +211,6 @@ pub(crate) fn load_heartbeat_candidates(
             row.get::<_, i64>(6)?,
         ))
     })?;
-    let mut candidates = Vec::new();
     for row in rows {
         let (endpoint_id, source, address, port, revision, observed_at, expires_at) = row?;
         candidates.push(EndpointCandidate {

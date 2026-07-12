@@ -5,6 +5,7 @@ use crate::{
 use anyhow::{bail, Context as _, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use time::OffsetDateTime;
@@ -65,6 +66,38 @@ impl NodeSetupInstallRequest {
 struct PendingSetup {
     input: Zeroizing<String>,
     preview: NodeSetupPreview,
+}
+
+/// Checked-out setup material owned by a trusted desktop backend while a
+/// privileged local request is in flight.
+///
+/// This value has no serialization implementation and redacts formatting. Its
+/// invitation is zeroized when dropped or returned to the session store.
+pub struct PendingNodeSetup {
+    input: Zeroizing<String>,
+    preview: NodeSetupPreview,
+}
+
+impl PendingNodeSetup {
+    #[must_use]
+    pub fn setup_invitation(&self) -> &str {
+        &self.input
+    }
+
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.preview.expires_at.as_datetime() <= OffsetDateTime::now_utc()
+    }
+}
+
+impl fmt::Debug for PendingNodeSetup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingNodeSetup")
+            .field("input", &"[redacted]")
+            .field("preview", &self.preview)
+            .finish()
+    }
 }
 
 /// Process-local owner of pending Node Host setup bearer material.
@@ -141,6 +174,57 @@ impl NodeSetupSessionStore {
             .remove(&session_id)
             .is_some();
         Ok(removed)
+    }
+
+    /// Removes a pending invitation from the store for one privileged IPC
+    /// attempt. The renderer can provide only the random session ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is missing, expired, or already in
+    /// progress.
+    pub fn checkout(&self, session_id: Uuid) -> Result<PendingNodeSetup> {
+        let pending = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Node Host setup session lock is unavailable"))?
+            .remove(&session_id)
+            .context("Node Host setup session is missing or already in progress")?;
+        if pending.preview.expires_at.as_datetime() <= OffsetDateTime::now_utc() {
+            bail!("Node Host setup invitation has expired");
+        }
+        Ok(PendingNodeSetup {
+            input: pending.input,
+            preview: pending.preview,
+        })
+    }
+
+    /// Restores checked-out setup material after a retryable IPC or setup
+    /// failure. Expired material is dropped and zeroized instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session store is unavailable or the same
+    /// session ID has already been restored.
+    pub fn restore(&self, session_id: Uuid, pending: PendingNodeSetup) -> Result<bool> {
+        if pending.is_expired() {
+            return Ok(false);
+        }
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Node Host setup session lock is unavailable"))?;
+        if sessions.contains_key(&session_id) {
+            bail!("Node Host setup session is already pending");
+        }
+        sessions.insert(
+            session_id,
+            PendingSetup {
+                input: pending.input,
+                preview: pending.preview,
+            },
+        );
+        Ok(true)
     }
 
     /// Confirms a pending setup and installs the current-user background service.
@@ -255,5 +339,31 @@ mod tests {
         assert_eq!(store.pending_count(), 1);
         assert!(store.cancel(session.session_id).unwrap());
         assert_eq!(store.pending_count(), 0);
+    }
+
+    #[test]
+    fn privileged_checkout_is_retry_safe_and_redacts_debug_output() {
+        let invitation = CreateNodeInvitationResponse {
+            invitation_id: NodeInvitationId::new(),
+            purpose: PairingPurpose::NodeEnrollment,
+            expires_at: Timestamp::from_datetime(OffsetDateTime::now_utc() + Duration::minutes(5)),
+            invitation_secret: Secret::new(
+                "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY".to_string(),
+            ),
+            controller_origin: "https://control.example.test".to_string(),
+            controller_fingerprint: format!("sha256:{}", "a".repeat(64))
+                .parse::<Sha256Digest>()
+                .unwrap(),
+        };
+        let code = encode_node_setup_code("Retry node", &invitation).unwrap();
+        let store = NodeSetupSessionStore::new();
+        let session = store.begin(code.expose_secret()).unwrap();
+        let pending = store.checkout(session.session_id).unwrap();
+        assert_eq!(store.pending_count(), 0);
+        assert_eq!(pending.setup_invitation(), code.expose_secret());
+        assert!(!format!("{pending:?}").contains(code.expose_secret()));
+        assert!(store.restore(session.session_id, pending).unwrap());
+        assert_eq!(store.pending_count(), 1);
+        assert!(store.cancel(session.session_id).unwrap());
     }
 }

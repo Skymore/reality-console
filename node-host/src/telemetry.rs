@@ -1,4 +1,4 @@
-use crate::{migrate, open_database, unix_timestamp, DataDirLock};
+use crate::{migrate, open_database, timestamp_from_unix, unix_timestamp, DataDirLock};
 use anyhow::{bail, Context, Result};
 use control_protocol::crypto::Sha256Digest;
 use control_protocol::id::{Count, NodeId, Revision, SequenceNumber, Timestamp, UserId};
@@ -6,7 +6,7 @@ use control_protocol::telemetry::{
     TelemetryBatch, TelemetryBatchAcknowledgement, TelemetryEvent, TelemetryEventKind,
     MAX_TELEMETRY_BATCH_BYTES, TELEMETRY_SCHEMA_VERSION,
 };
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension as _, TransactionBehavior};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -292,6 +292,7 @@ fn apply_counter_snapshot(
         now,
     )?;
 
+    let mut provider_usage_delta = 0_i64;
     if previous_generation == Some(target.runtime_generation) {
         for (user_id, (uplink, downlink)) in snapshot {
             let Some(previous) = previous_counters.get(user_id) else {
@@ -305,21 +306,14 @@ fn apply_counter_snapshot(
             if bytes_up == 0 && bytes_down == 0 {
                 continue;
             }
-            enqueue_in_transaction(
-                &transaction,
-                TelemetryEventKind::TrafficDelta {
-                    user_id: *user_id,
-                    bytes_up: Count::new(bytes_up)?,
-                    bytes_down: Count::new(bytes_down)?,
-                    // Xray's cumulative byte counters do not expose an exact
-                    // new-connection count, so this collector does not infer one.
-                    connection_count: Count::new(0)?,
-                },
-                occurred_at,
-                now,
-            )?;
+            accumulate_pending_traffic(&transaction, *user_id, bytes_up, bytes_down, now)?;
+            provider_usage_delta = provider_usage_delta
+                .checked_add(bytes_up)
+                .and_then(|value| value.checked_add(bytes_down))
+                .context("provider usage delta overflow")?;
         }
     }
+    crate::policy::record_usage_delta_in_transaction(&transaction, provider_usage_delta, now)?;
 
     transaction.execute("DELETE FROM xray_user_traffic_counters", [])?;
     for (user_id, (uplink, downlink)) in snapshot {
@@ -342,6 +336,84 @@ fn apply_counter_snapshot(
          WHERE singleton = 1",
         params![target.runtime_generation, current_status, now],
     )?;
+    transaction.commit()?;
+    flush_pending_traffic(data_dir, occurred_at)
+}
+
+fn accumulate_pending_traffic(
+    connection: &Connection,
+    user_id: UserId,
+    bytes_up: i64,
+    bytes_down: i64,
+    observed_at: i64,
+) -> Result<()> {
+    let previous: Option<(i64, i64)> = connection
+        .query_row(
+            "SELECT bytes_up, bytes_down FROM provider_pending_traffic_delta WHERE user_id = ?1",
+            [user_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (previous_up, previous_down) = previous.unwrap_or_default();
+    let total_up = previous_up
+        .checked_add(bytes_up)
+        .context("pending provider upload delta overflow")?;
+    let total_down = previous_down
+        .checked_add(bytes_down)
+        .context("pending provider download delta overflow")?;
+    connection.execute(
+        "INSERT INTO provider_pending_traffic_delta(user_id, bytes_up, bytes_down, observed_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(user_id) DO UPDATE SET bytes_up = excluded.bytes_up,
+            bytes_down = excluded.bytes_down, observed_at = excluded.observed_at",
+        params![user_id.to_string(), total_up, total_down, observed_at],
+    )?;
+    Ok(())
+}
+
+fn flush_pending_traffic(data_dir: &Path, fallback_occurred_at: Timestamp) -> Result<()> {
+    let mut connection = open_database(data_dir, false)?;
+    migrate(&mut connection)?;
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    purge_acknowledged(&transaction, now)?;
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT user_id, bytes_up, bytes_down, observed_at
+             FROM provider_pending_traffic_delta ORDER BY user_id LIMIT 64",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (user_id, bytes_up, bytes_down, observed_at) in rows {
+        let user_id: UserId = user_id
+            .parse()
+            .context("pending traffic user ID is invalid")?;
+        let occurred_at = timestamp_from_unix(observed_at).unwrap_or(fallback_occurred_at);
+        let event = TelemetryEventKind::TrafficDelta {
+            user_id,
+            bytes_up: Count::new(bytes_up)?,
+            bytes_down: Count::new(bytes_down)?,
+            // Xray's cumulative counters do not expose connection boundaries.
+            connection_count: Count::new(0)?,
+        };
+        if enqueue_in_transaction(&transaction, event, occurred_at, now).is_err() {
+            break;
+        }
+        transaction.execute(
+            "DELETE FROM provider_pending_traffic_delta WHERE user_id = ?1",
+            [user_id.to_string()],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -824,6 +896,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(traffic, [(50, 60, 0), (5, 5, 0), (2, 2, 0), (10, 10, 0)]);
+        let provider = crate::policy::provider_policy_status(directory.path()).unwrap();
+        assert_eq!(provider.month_usage.observed_bytes, 144);
+        assert_eq!(provider.month_usage.coverage, "xrayObservedLowerBound");
 
         let statuses = events
             .iter()

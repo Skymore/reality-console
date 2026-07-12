@@ -81,7 +81,7 @@ pub async fn configure_xray(
         )
         .context("node host is not initialized")?;
     let controller = parse_controller(&controller_value)?;
-    let identity = Identity::load(data_dir)?;
+    let identity = Identity::load(&connection, data_dir)?;
 
     let digest = RuntimeSha256Digest::from_hex(expected_sha256)
         .context("expected Xray SHA-256 must contain 64 hexadecimal characters")?;

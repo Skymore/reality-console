@@ -14,6 +14,9 @@ use control_protocol::node::{
     EndpointCandidate, NodeHeartbeat, NodeRuntimeState, RevisionProgress, RevisionResult,
     RevisionResultState, SignedDesiredState,
 };
+use control_protocol::relay::{
+    AcknowledgeRelayAssignmentRequest, EnsureRelayAssignmentRequest, SignedRelayAssignment,
+};
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
 use control_protocol::telemetry::{TelemetryBatchAcknowledgement, TelemetryCursor};
 use rand_core::{OsRng, RngCore as _};
@@ -104,9 +107,28 @@ where
         )
         .context("node host is not initialized")?;
     let controller = parse_controller(&controller_value)?;
-    let identity = Identity::load(data_dir)?;
+    let identity = Identity::load(&connection, data_dir)?;
     let registration = load_sync_registration(&connection)?;
     let client = control_http_client().context("failed to initialize sync HTTP client")?;
+
+    let mut suppress_relay_candidate = false;
+    if synchronize_relay_assignment(
+        data_dir,
+        &client,
+        &controller,
+        &mut connection,
+        &registration,
+        &identity,
+        &mut suppress_relay_candidate,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            error_code = "relay_assignment_sync_failed",
+            "relay assignment reconciliation failed independently; continuing control sync"
+        );
+    }
 
     resume_local_state(
         data_dir,
@@ -128,7 +150,10 @@ where
     let sync_state = crate::load_sync_status(&connection)?;
     // Observe the managed child immediately before constructing the heartbeat;
     // earlier network/report work may have taken long enough for it to exit.
-    let runtime = runtime_probe()?;
+    let mut runtime = runtime_probe()?;
+    if suppress_relay_candidate {
+        runtime.relay_candidate = None;
+    }
     send_heartbeat(
         &client,
         &controller,
@@ -152,6 +177,231 @@ where
 
     persist_sync_success(&connection)?;
     build_status(&connection, data_dir, controller, &identity)
+}
+
+async fn synchronize_relay_assignment(
+    data_dir: &Path,
+    client: &reqwest::Client,
+    controller: &Url,
+    connection: &mut Connection,
+    registration: &SyncRegistration,
+    identity: &Identity,
+    suppress_relay_candidate: &mut bool,
+) -> Result<()> {
+    let consent_at = relay_local_state(
+        crate::relay::provider_relay_consent_for_data_dir(data_dir, connection),
+        suppress_relay_candidate,
+    )?;
+    let Some(consent_at) = consent_at else {
+        *suppress_relay_candidate = true;
+        return Ok(());
+    };
+    if !relay_local_state(
+        crate::policy::allows_advertising(connection),
+        suppress_relay_candidate,
+    )? {
+        *suppress_relay_candidate = true;
+        return Ok(());
+    }
+
+    let target = format!("/v1/nodes/{}/relay-assignment", registration.node);
+    let response = send_signed_request(
+        client,
+        controller,
+        Method::GET,
+        &target,
+        Vec::new(),
+        registration,
+        identity,
+    )
+    .await
+    .context("controller relay-assignment fetch failed")?;
+    let status = response.status();
+    let is_json = response_is_json(&response);
+    let body = read_bounded_response(response).await?;
+    match status {
+        StatusCode::OK if is_json => {
+            install_relay_response(data_dir, connection, registration, identity, &body).await?;
+        }
+        StatusCode::OK => bail!("controller relay-assignment response is not JSON"),
+        StatusCode::NO_CONTENT if body.is_empty() => {
+            if relay_local_state(
+                crate::relay::has_managed_assignment(data_dir),
+                suppress_relay_candidate,
+            )? {
+                *suppress_relay_candidate = true;
+                crate::relay::controller_withdrew_assignment(data_dir, connection, consent_at)?;
+                return Ok(());
+            }
+        }
+        StatusCode::NO_CONTENT => {
+            bail!("controller returned a body with no relay assignment");
+        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            *suppress_relay_candidate = true;
+            crate::relay::controller_withdrew_assignment(data_dir, connection, consent_at)?;
+            return Err(controller_error("relay-assignment", status, &body));
+        }
+        status if !status.is_success() => {
+            return Err(controller_error("relay-assignment", status, &body));
+        }
+        _ => bail!("controller returned unexpected relay-assignment status {status}"),
+    }
+
+    if !relay_local_state(
+        crate::relay::managed_ensure_allowed(data_dir, consent_at),
+        suppress_relay_candidate,
+    )? {
+        return Ok(());
+    }
+    ensure_relay_assignment(
+        data_dir,
+        client,
+        controller,
+        connection,
+        registration,
+        identity,
+        suppress_relay_candidate,
+        &target,
+        consent_at,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_relay_assignment(
+    data_dir: &Path,
+    client: &reqwest::Client,
+    controller: &Url,
+    connection: &mut Connection,
+    registration: &SyncRegistration,
+    identity: &Identity,
+    suppress_relay_candidate: &mut bool,
+    target: &str,
+    consent_at: i64,
+) -> Result<()> {
+    let ensure = EnsureRelayAssignmentRequest {
+        provider_limits: relay_local_state(
+            crate::relay::provider_relay_limits(connection),
+            suppress_relay_candidate,
+        )?,
+    };
+    ensure
+        .validate()
+        .context("generated relay ensure request is invalid")?;
+    let body = serde_json::to_vec(&ensure).context("failed to encode relay ensure request")?;
+    let response = send_signed_request(
+        client,
+        controller,
+        Method::POST,
+        target,
+        body,
+        registration,
+        identity,
+    )
+    .await
+    .context("controller relay-assignment ensure failed")?;
+    let status = response.status();
+    let is_json = response_is_json(&response);
+    let body = read_bounded_response(response).await?;
+    match status {
+        StatusCode::OK if is_json => {
+            install_relay_response(data_dir, connection, registration, identity, &body).await?;
+        }
+        StatusCode::OK => bail!("controller relay ensure response is not JSON"),
+        StatusCode::ACCEPTED if body.is_empty() => {}
+        StatusCode::ACCEPTED => bail!("controller returned a body with pending relay assignment"),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            *suppress_relay_candidate = true;
+            crate::relay::controller_withdrew_assignment(data_dir, connection, consent_at)?;
+            return Err(controller_error("relay ensure", status, &body));
+        }
+        status if !status.is_success() => {
+            return Err(controller_error("relay ensure", status, &body));
+        }
+        _ => bail!("controller returned unexpected relay ensure status {status}"),
+    }
+    Ok(())
+}
+
+fn relay_local_state<T>(result: Result<T>, suppress_relay_candidate: &mut bool) -> Result<T> {
+    result.inspect_err(|_| *suppress_relay_candidate = true)
+}
+
+async fn install_relay_response(
+    data_dir: &Path,
+    connection: &mut Connection,
+    registration: &SyncRegistration,
+    identity: &Identity,
+    body: &[u8],
+) -> Result<()> {
+    let assignment: SignedRelayAssignment = serde_json::from_slice(body)
+        .context("controller returned invalid relay-assignment JSON")?;
+    crate::relay::install_controller_assignment(
+        data_dir,
+        connection,
+        registration,
+        identity,
+        &assignment,
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn acknowledge_relay_assignment(
+    data_dir: &Path,
+    acknowledgement: AcknowledgeRelayAssignmentRequest,
+) -> Result<()> {
+    acknowledgement
+        .validate()
+        .context("relay acknowledgement is invalid")?;
+    let mut connection = open_database(data_dir, false)?;
+    migrate(&mut connection)?;
+    let controller_value: String = connection
+        .query_row(
+            "SELECT controller_url FROM host_config WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("node host is not initialized")?;
+    let controller = parse_controller(&controller_value)?;
+    let identity = Identity::load(&connection, data_dir)?;
+    let registration = load_sync_registration(&connection)?;
+    let client = control_http_client().context("failed to initialize sync HTTP client")?;
+    let target = format!(
+        "/v1/nodes/{}/relay-assignment/acknowledge",
+        registration.node
+    );
+    let body =
+        serde_json::to_vec(&acknowledgement).context("failed to encode relay acknowledgement")?;
+    let response = send_signed_request(
+        &client,
+        &controller,
+        Method::POST,
+        &target,
+        body,
+        &registration,
+        &identity,
+    )
+    .await
+    .context("controller relay acknowledgement failed")?;
+    let status = response.status();
+    let body = read_bounded_response(response).await?;
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        if let Some(consent_at) =
+            crate::relay::provider_relay_consent_for_data_dir(data_dir, &connection)?
+        {
+            crate::relay::controller_withdrew_assignment(data_dir, &connection, consent_at)?;
+        }
+        return Err(controller_error("relay acknowledgement", status, &body));
+    }
+    if status != StatusCode::NO_CONTENT || !body.is_empty() {
+        if !status.is_success() {
+            return Err(controller_error("relay acknowledgement", status, &body));
+        }
+        bail!("controller returned unexpected relay acknowledgement response");
+    }
+    Ok(())
 }
 
 async fn resume_local_state(
@@ -364,6 +614,14 @@ fn current_heartbeat_with_relay(
     heartbeat_generation: SequenceNumber,
     relay_candidate: Option<EndpointCandidate>,
 ) -> Result<NodeHeartbeat> {
+    // This is deliberately at the heartbeat boundary as well as in the
+    // service loop: a one-shot sync or a schedule/quota race must never
+    // advertise a stale direct, relay, or manual endpoint.
+    let runtime_state = if crate::policy::allows_advertising(connection)? {
+        runtime_state
+    } else {
+        NodeRuntimeState::ProviderPaused
+    };
     let (received_revision_value, validated_revision_value): (i64, i64) = connection.query_row(
         "SELECT
             COALESCE(MAX(revision), 0),
@@ -412,7 +670,7 @@ fn current_heartbeat_with_relay(
             validated_revision,
             applied_revision,
         },
-        provider_paused: false,
+        provider_paused: runtime_state == NodeRuntimeState::ProviderPaused,
         endpoints,
         telemetry_cursor: crate::telemetry::highest_sequence(connection)?,
     };
@@ -945,14 +1203,306 @@ fn controller_error(operation: &str, status: StatusCode, body: &[u8]) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::{
-        current_heartbeat, current_heartbeat_with_relay, load_unreported_results, ReportScope,
+        acknowledge_relay_assignment, current_heartbeat, current_heartbeat_with_relay,
+        load_unreported_results, synchronize_relay_assignment, ReportScope,
         MAX_PENDING_REPORTS_PER_SYNC,
     };
-    use control_protocol::id::{EndpointId, Revision, SequenceNumber, Timestamp};
+    use axum::body::Bytes;
+    use axum::extract::{OriginalUri, State};
+    use axum::http::{HeaderMap, Method, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use control_protocol::id::{
+        ControllerInstanceId, EndpointId, NetworkId, NodeId, NodeInvitationId, NodeKeyId,
+        RelayGeneration, RelayGrantId, Revision, SequenceNumber, Timestamp,
+    };
     use control_protocol::node::{
         EndpointCandidate, EndpointMode, EndpointSource, NodeRuntimeState,
     };
+    use control_protocol::relay::AcknowledgeRelayAssignmentRequest;
+    use control_protocol::relay::EnsureRelayAssignmentRequest;
+    use control_protocol::request_auth::{
+        verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
+    };
     use rusqlite::{params, Connection};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct AckCapture(Arc<Mutex<Option<CapturedAck>>>);
+
+    struct CapturedAck {
+        method: Method,
+        target: String,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    }
+
+    #[derive(Clone)]
+    struct RelayHttpCapture(Arc<Mutex<Vec<CapturedAck>>>);
+
+    async fn capture_acknowledgement(
+        State(capture): State<AckCapture>,
+        OriginalUri(uri): OriginalUri,
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> StatusCode {
+        *capture.0.lock().unwrap() = Some(CapturedAck {
+            method,
+            target: uri.path().to_string(),
+            headers,
+            body: body.to_vec(),
+        });
+        StatusCode::NO_CONTENT
+    }
+
+    async fn capture_relay_fetch(
+        State(capture): State<RelayHttpCapture>,
+        OriginalUri(uri): OriginalUri,
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> StatusCode {
+        capture.0.lock().unwrap().push(CapturedAck {
+            method,
+            target: uri.path().to_string(),
+            headers,
+            body: body.to_vec(),
+        });
+        StatusCode::NO_CONTENT
+    }
+
+    async fn capture_relay_ensure(
+        State(capture): State<RelayHttpCapture>,
+        OriginalUri(uri): OriginalUri,
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> StatusCode {
+        capture.0.lock().unwrap().push(CapturedAck {
+            method,
+            target: uri.path().to_string(),
+            headers,
+            body: body.to_vec(),
+        });
+        StatusCode::ACCEPTED
+    }
+
+    #[tokio::test]
+    async fn relay_acknowledgement_uses_the_exact_signed_http_contract() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let capture = AckCapture(Arc::new(Mutex::new(None)));
+        let router = Router::new()
+            .route(
+                "/v1/nodes/{node_id}/relay-assignment/acknowledge",
+                post(capture_acknowledgement),
+            )
+            .with_state(capture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("state");
+        let initialized = crate::initialize(&data_dir, &origin).unwrap();
+        let network = NetworkId::new();
+        let node = NodeId::new();
+        let key = NodeKeyId::new();
+        let controller_instance = ControllerInstanceId::new();
+        let connection = crate::open_database(&data_dir, false).unwrap();
+        connection
+            .execute(
+                "INSERT INTO enrollment_registration(
+                    singleton, invitation_id, network_id, node_id, controller_instance_id,
+                    controller_fingerprint, controller_signing_public_key, credential_key_id,
+                    credential_mode, credential_expires_at, enrolled_at
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'signedRequest', ?8, ?9)",
+                params![
+                    NodeInvitationId::new().to_string(),
+                    network.to_string(),
+                    node.to_string(),
+                    controller_instance.to_string(),
+                    format!("sha256:{}", "2".repeat(64)),
+                    initialized.identity_public_key.as_str(),
+                    key.to_string(),
+                    Timestamp::from_datetime(
+                        time::OffsetDateTime::now_utc() + time::Duration::hours(1)
+                    )
+                    .to_string(),
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let acknowledgement = AcknowledgeRelayAssignmentRequest {
+            grant_id: RelayGrantId::new(),
+            generation: RelayGeneration::new(7).unwrap(),
+        };
+        acknowledge_relay_assignment(&data_dir, acknowledgement)
+            .await
+            .unwrap();
+        let captured = capture.0.lock().unwrap().take().unwrap();
+        assert_eq!(captured.method, Method::POST);
+        assert_eq!(
+            captured.target,
+            format!("/v1/nodes/{node}/relay-assignment/acknowledge")
+        );
+        assert_eq!(
+            serde_json::from_slice::<AcknowledgeRelayAssignmentRequest>(&captured.body).unwrap(),
+            acknowledgement
+        );
+        let header = |name: &str| captured.headers.get(name).unwrap().to_str().unwrap();
+        let auth = NodeRequestAuthHeaders::parse(
+            header("X-Node-Id"),
+            header("X-Node-Key-Id"),
+            header("X-Node-Timestamp"),
+            header("X-Node-Nonce"),
+            header("X-Node-Signature"),
+        )
+        .unwrap();
+        assert_eq!(auth.node_id(), node);
+        assert_eq!(auth.key_id(), key);
+        let input =
+            NodeRequestSigningInput::from_body("POST", &captured.target, &captured.body).unwrap();
+        verify_node_request_signature(
+            &initialized.identity_public_key,
+            &auth,
+            &input,
+            controller_instance,
+        )
+        .unwrap();
+        server.abort();
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn relay_sync_requires_consent_then_sends_signed_fetch_and_provider_limits() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let capture = RelayHttpCapture(Arc::new(Mutex::new(Vec::new())));
+        let router = Router::new()
+            .route(
+                "/v1/nodes/{node_id}/relay-assignment",
+                axum::routing::get(capture_relay_fetch).post(capture_relay_ensure),
+            )
+            .with_state(capture.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let data_dir = directory.path().join("state");
+        let initialized = crate::initialize(&data_dir, &origin).unwrap();
+        let network = NetworkId::new();
+        let node = NodeId::new();
+        let key = NodeKeyId::new();
+        let controller_instance = ControllerInstanceId::new();
+        let mut connection = crate::open_database(&data_dir, false).unwrap();
+        connection
+            .execute(
+                "INSERT INTO enrollment_registration(
+                    singleton, invitation_id, network_id, node_id, controller_instance_id,
+                    controller_fingerprint, controller_signing_public_key, credential_key_id,
+                    credential_mode, credential_expires_at, enrolled_at
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'signedRequest', ?8, ?9)",
+                params![
+                    NodeInvitationId::new().to_string(),
+                    network.to_string(),
+                    node.to_string(),
+                    controller_instance.to_string(),
+                    format!("sha256:{}", "3".repeat(64)),
+                    initialized.identity_public_key.as_str(),
+                    key.to_string(),
+                    Timestamp::from_datetime(
+                        time::OffsetDateTime::now_utc() + time::Duration::hours(1)
+                    )
+                    .to_string(),
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                ],
+            )
+            .unwrap();
+        let controller = crate::parse_controller(&origin).unwrap();
+        let registration = crate::load_sync_registration(&connection).unwrap();
+        let identity = crate::Identity::load(&connection, &data_dir).unwrap();
+        let client = crate::enrollment::control_http_client().unwrap();
+
+        let mut suppress_relay_candidate = false;
+        synchronize_relay_assignment(
+            &data_dir,
+            &client,
+            &controller,
+            &mut connection,
+            &registration,
+            &identity,
+            &mut suppress_relay_candidate,
+        )
+        .await
+        .unwrap();
+        assert!(capture.0.lock().unwrap().is_empty());
+        assert!(suppress_relay_candidate);
+
+        connection
+            .execute(
+                "INSERT INTO relay_provider_consent(singleton, policy_version, accepted_at)
+                 VALUES (1, '2026-07-11-relay-v1', ?1)",
+                [time::OffsetDateTime::now_utc().unix_timestamp()],
+            )
+            .unwrap();
+        suppress_relay_candidate = false;
+        synchronize_relay_assignment(
+            &data_dir,
+            &client,
+            &controller,
+            &mut connection,
+            &registration,
+            &identity,
+            &mut suppress_relay_candidate,
+        )
+        .await
+        .unwrap();
+        assert!(!suppress_relay_candidate);
+
+        let captured = capture.0.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].method, Method::GET);
+        assert_eq!(captured[1].method, Method::POST);
+        let ensure: EnsureRelayAssignmentRequest =
+            serde_json::from_slice(&captured[1].body).unwrap();
+        assert_eq!(ensure.provider_limits.max_concurrent_streams, 16);
+        assert_eq!(ensure.provider_limits.max_bytes_per_second, 2_500_000);
+        assert_eq!(
+            ensure.provider_limits.monthly_byte_limit,
+            100 * 1024 * 1024 * 1024
+        );
+        for request in captured.iter() {
+            let header = |name: &str| request.headers.get(name).unwrap().to_str().unwrap();
+            let auth = NodeRequestAuthHeaders::parse(
+                header("X-Node-Id"),
+                header("X-Node-Key-Id"),
+                header("X-Node-Timestamp"),
+                header("X-Node-Nonce"),
+                header("X-Node-Signature"),
+            )
+            .unwrap();
+            let input = NodeRequestSigningInput::from_body(
+                request.method.as_str(),
+                &request.target,
+                &request.body,
+            )
+            .unwrap();
+            verify_node_request_signature(
+                &initialized.identity_public_key,
+                &auth,
+                &input,
+                controller_instance,
+            )
+            .unwrap();
+        }
+        drop(captured);
+        server.abort();
+    }
 
     #[test]
     fn current_revision_scope_bypasses_the_global_backlog_limit() {
@@ -1085,6 +1635,48 @@ mod tests {
         assert!(idle.endpoints.is_empty());
 
         assert_direct_and_relay_fail_independently(&connection, endpoint_id, now);
+    }
+
+    #[test]
+    fn provider_pause_forces_an_empty_heartbeat_even_with_a_relay_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::initialize(directory.path(), "https://controller.example").unwrap();
+        let connection = crate::open_database(directory.path(), false).unwrap();
+        let policy = crate::ProviderPolicy {
+            paused: true,
+            ..crate::ProviderPolicy::default()
+        };
+        connection
+            .execute(
+                "UPDATE provider_policy SET policy_json = ?1 WHERE singleton = 1",
+                [serde_json::to_string(&policy).unwrap()],
+            )
+            .unwrap();
+        let relay_candidate = EndpointCandidate {
+            endpoint_id: EndpointId::new(),
+            mode: EndpointMode::Relay,
+            source: EndpointSource::Relay,
+            address: "relay.example".to_owned(),
+            port: 8443,
+            applied_revision: Revision::new(1).unwrap(),
+            observed_at: Timestamp::from_datetime(time::OffsetDateTime::now_utc()),
+            expires_at: Some(Timestamp::from_datetime(
+                time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            )),
+        };
+
+        let heartbeat = current_heartbeat_with_relay(
+            &connection,
+            0,
+            NodeRuntimeState::Serving,
+            SequenceNumber::new(1).unwrap(),
+            Some(relay_candidate),
+        )
+        .unwrap();
+
+        assert_eq!(heartbeat.state, NodeRuntimeState::ProviderPaused);
+        assert!(heartbeat.provider_paused);
+        assert!(heartbeat.endpoints.is_empty());
     }
 
     fn assert_direct_and_relay_fail_independently(

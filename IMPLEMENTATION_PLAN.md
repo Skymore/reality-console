@@ -62,11 +62,13 @@ Deliverables:
 
 ## Stage 5: Packaging, Operations, And Release
 
-Status: implementation complete; signed release acceptance pending.
+Status: foundation complete; product and release acceptance are incomplete.
 
-The production code, package definitions, and release gates are implemented. Promotion remains
-blocked until the platform-specific signed evidence in `docs/RELEASE_ACCEPTANCE.md` exists for one
-immutable candidate. An unsigned local package or a cross-compile check cannot close that gate.
+This stage established the production canary, telemetry, relay data path, system-proxy recovery,
+backup/restore, package definitions, and signed-manifest primitives. A requirement-by-requirement
+audit found that these foundations do not yet form an acceptable release: provider policy,
+packaged Node Host setup, controller-driven recovery operations, complete evidence aggregation,
+and real package lifecycle gates remain open. See `docs/COMPLETION_AUDIT.md`.
 
 Deliverables:
 
@@ -76,6 +78,44 @@ Deliverables:
   redacted support bundles;
 - credential/runtime rotation, side-by-side upgrades, rollback, backup/restore, and uninstall;
 - macOS/Windows packaging plus direct/relay/offline/sleep/restart/upgrade end-to-end release matrix.
+
+## Stage 6: Core Requirement Closure
+
+Status: complete.
+
+This is one product-sized implementation stage and one final stage commit. It is not split into
+endpoint-sized commits.
+
+Deliverables:
+
+- provider-local pause, schedule, monthly transfer cap, concurrent-session/bandwidth policy, and
+  manual direct-endpoint configuration, enforced without Control Service availability;
+- a packaged Node Host setup confirmation path that crosses the macOS privilege boundary without
+  putting invitation or identity secrets in renderer state, process arguments, or world-readable
+  files;
+- controller-issued relay assignments and rotation/revocation convergence so a provider never
+  imports relay JSON, certificates, route tokens, ports, or hashes;
+- single-use account reset tokens, explicit node/cohort rollback operations, failed-revision
+  visibility, and complete recovery/audit events;
+- anti-clone installation binding outside the copyable Node Host state directory;
+- missing multi-device, cross-node disable, telemetry reconciliation, non-empty offline bundle,
+  direct/relay topology, and bad-revision end-to-end tests;
+- full component CI gates, real package lifecycle jobs, installed-binary signature checks, release
+  evidence aggregation, and a fail-closed publish gate.
+
+Stage acceptance is backed by the local component suites, strict lint and documentation builds,
+downstream desktop builds, package-state rollback tests, and fail-closed release evidence tests.
+Signed artifact and real-platform evidence intentionally remain outside this stage.
+
+## Stage 7: Signed Candidate Acceptance
+
+Status: pending.
+
+One immutable candidate must satisfy every row in `docs/RELEASE_ACCEPTANCE.md` on the required real
+platforms. This stage supplies production trust roots and signing identities, runs the direct and
+relay topology, installs signed artifacts on clean macOS/Windows hosts, records the complete
+evidence matrix, and publishes only an `accepted` candidate. Unsigned or simulated artifacts cannot
+complete this stage.
 
 ## Engineering Gates
 

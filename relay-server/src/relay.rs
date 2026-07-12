@@ -23,11 +23,13 @@ use tracing::{info, warn};
 use zeroize::Zeroize;
 
 use crate::{
-    config::{RelayConfig, RouteConfig, ServerConfig},
+    config::{ManagedRoutesConfig, RelayConfig, RouteConfig, ServerConfig},
     error::{ErrorCode, RelayError, Result},
     flow::{Credit, RateLimiter},
     frame::{Frame, FrameKind},
     metrics::{bind_metrics, serve_metrics, Metrics, RouteMetrics},
+    quota::{QuotaStore, RouteQuota},
+    registry::load_effective_routes,
     tls::{build_acceptor, certificate_sha256},
 };
 
@@ -43,10 +45,15 @@ pub struct RelayHandle {
 
 struct ServerState {
     server_config: ServerConfig,
+    managed_routes: Option<ManagedRoutesConfig>,
+    static_routes: RwLock<Vec<RouteConfig>>,
+    managed_fingerprint: Mutex<Option<[u8; 32]>>,
     configured_routes: RwLock<HashMap<String, RouteConfig>>,
     active_routes: RwLock<HashMap<String, Arc<RouteRuntime>>>,
+    route_update: tokio::sync::Mutex<()>,
     tls_acceptor: TlsAcceptor,
     metrics: Metrics,
+    quota_store: Option<QuotaStore>,
     shutdown: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     node_address: SocketAddr,
@@ -61,6 +68,7 @@ struct RouteRuntime {
     stream_slots: Arc<Semaphore>,
     next_stream_id: AtomicU64,
     rate_limiter: Arc<RateLimiter>,
+    quota: Option<RouteQuota>,
     metrics: Arc<RouteMetrics>,
     cancel: CancellationToken,
 }
@@ -102,6 +110,19 @@ impl RelayServer {
     /// cannot be bound. No background service is returned after a startup error.
     pub async fn start(config: RelayConfig) -> Result<RelayHandle> {
         config.validate()?;
+        let (effective_routes, managed_fingerprint) =
+            load_effective_routes(&config, OffsetDateTime::now_utc()).await?;
+        let quota_store = match &config.managed_routes {
+            Some(managed) => Some(
+                QuotaStore::open(
+                    managed.quota_state_directory.clone(),
+                    config.server.max_routes,
+                    OffsetDateTime::now_utc(),
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let tls_acceptor = build_acceptor(&config.server)?;
         let node_listener = TcpListener::bind(config.server.node_listen).await?;
         let metrics_listener = bind_metrics(config.server.metrics_listen).await?;
@@ -109,18 +130,26 @@ impl RelayServer {
         let metrics_address = metrics_listener.local_addr()?;
         let state = Arc::new(ServerState {
             server_config: config.server.clone(),
+            managed_routes: config.managed_routes.clone(),
+            static_routes: RwLock::new(config.routes),
+            managed_fingerprint: Mutex::new(managed_fingerprint),
             configured_routes: RwLock::new(HashMap::new()),
             active_routes: RwLock::new(HashMap::new()),
+            route_update: tokio::sync::Mutex::new(()),
             tls_acceptor,
             metrics: Metrics::default(),
+            quota_store,
             shutdown: CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
             node_address,
             metrics_address,
         });
-        state.apply_routes(config.routes).await?;
+        state.apply_routes(effective_routes).await?;
 
         state.spawn(run_node_listener(state.clone(), node_listener));
+        if state.managed_routes.is_some() {
+            state.spawn(run_managed_routes_watcher(state.clone()));
+        }
         let metrics_state = state.clone();
         state.spawn(async move {
             if let Err(error) = serve_metrics(
@@ -171,12 +200,23 @@ impl RelayHandle {
     /// route listener cannot be bound.
     pub async fn reload(&self, config: RelayConfig) -> Result<()> {
         config.validate()?;
-        if config.server != self.state.server_config {
+        if config.server != self.state.server_config
+            || config.managed_routes != self.state.managed_routes
+        {
             return Err(RelayError::Config(
                 "server settings changed; restart is required".to_owned(),
             ));
         }
-        self.state.apply_routes(config.routes).await
+        let (effective_routes, managed_fingerprint) =
+            load_effective_routes(&config, OffsetDateTime::now_utc()).await?;
+        self.state.apply_routes(effective_routes).await?;
+        *self.state.static_routes.write().await = config.routes;
+        *self
+            .state
+            .managed_fingerprint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = managed_fingerprint;
+        Ok(())
     }
 
     /// Watches one configuration file. Invalid reloads preserve the last-known-good routes.
@@ -193,15 +233,7 @@ impl RelayHandle {
                 }
                 let current = file_fingerprint(&path).await;
                 if current.is_some() && current != last {
-                    match RelayConfig::load(&path).await.and_then(|config| {
-                        if config.server == task_state.server_config {
-                            Ok(config)
-                        } else {
-                            Err(RelayError::Config(
-                                "server settings changed; restart is required".to_owned(),
-                            ))
-                        }
-                    }) {
+                    match RelayConfig::load(&path).await {
                         Ok(config) => match handle.reload(config).await {
                             Ok(()) => {
                                 last = current;
@@ -273,6 +305,25 @@ impl ServerState {
     }
 
     async fn apply_routes(self: &Arc<Self>, routes: Vec<RouteConfig>) -> Result<()> {
+        let _update = self.route_update.lock().await;
+        let quota_routes: Vec<String> = routes
+            .iter()
+            .filter(|route| route.monthly_byte_limit.is_some())
+            .map(|route| route.route_id.clone())
+            .collect();
+        match (&self.quota_store, quota_routes.is_empty()) {
+            (Some(store), _) => {
+                store
+                    .reconcile(quota_routes, OffsetDateTime::now_utc())
+                    .await?;
+            }
+            (None, false) => {
+                return Err(RelayError::Config(
+                    "finite monthly route limits require managed quota state".to_owned(),
+                ));
+            }
+            (None, true) => {}
+        }
         let next: HashMap<_, _> = routes
             .into_iter()
             .map(|route| (route.route_id.clone(), route))
@@ -319,10 +370,24 @@ impl ServerState {
     async fn start_route(self: &Arc<Self>, config: RouteConfig) -> Result<Arc<RouteRuntime>> {
         let listener = bind_with_short_retry(config.public_listen).await?;
         let public_address = listener.local_addr()?;
+        let quota = match config.monthly_byte_limit {
+            Some(limit) => Some(
+                self.quota_store
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RelayError::Config(
+                            "finite monthly route limits require managed quota state".to_owned(),
+                        )
+                    })?
+                    .route(config.route_id.clone(), limit),
+            ),
+            None => None,
+        };
         let runtime = Arc::new(RouteRuntime {
             stream_slots: Arc::new(Semaphore::new(config.max_concurrent_streams)),
             next_stream_id: AtomicU64::new(1),
             rate_limiter: RateLimiter::new(config.max_bytes_per_second),
+            quota,
             metrics: self.metrics.route(&config.route_id),
             cancel: self.shutdown.child_token(),
             public_address,
@@ -342,6 +407,59 @@ impl ServerState {
         });
         info!(route_id = %runtime.config.route_id, %public_address, "relay route active");
         Ok(runtime)
+    }
+}
+
+async fn run_managed_routes_watcher(state: Arc<ServerState>) {
+    let interval = state.server_config.reload_interval();
+    loop {
+        tokio::select! {
+            () = state.shutdown.cancelled() => return,
+            () = tokio::time::sleep(interval) => {}
+        }
+        let config = RelayConfig {
+            server: state.server_config.clone(),
+            managed_routes: state.managed_routes.clone(),
+            routes: state.static_routes.read().await.clone(),
+        };
+        match load_effective_routes(&config, OffsetDateTime::now_utc()).await {
+            Ok((routes, fingerprint)) => {
+                let unchanged = *state
+                    .managed_fingerprint
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    == fingerprint;
+                if unchanged {
+                    continue;
+                }
+                match state.apply_routes(routes).await {
+                    Ok(()) => {
+                        *state
+                            .managed_fingerprint
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = fingerprint;
+                        info!(
+                            code = "managed_routes_reloaded",
+                            "managed relay routes reloaded"
+                        );
+                    }
+                    Err(error) => {
+                        state.metrics.record_reload_failure();
+                        warn!(
+                            code = error.operational_code(),
+                            "managed relay route reload failed"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                state.metrics.record_reload_failure();
+                warn!(
+                    code = error.operational_code(),
+                    "managed relay route registry invalid"
+                );
+            }
+        }
     }
 }
 
@@ -899,6 +1017,15 @@ async fn handle_member(
             "route grant expired",
         ));
     }
+    if let Some(quota) = &runtime.quota {
+        if !quota.permits_new_stream(OffsetDateTime::now_utc()).await? {
+            socket.shutdown().await?;
+            return Err(RelayError::stable(
+                ErrorCode::LimitReached,
+                "route monthly byte limit reached",
+            ));
+        }
+    }
     let tunnel = runtime.current_tunnel().ok_or_else(|| {
         RelayError::stable(ErrorCode::RouteUnavailable, "node tunnel is unavailable")
     })?;
@@ -999,20 +1126,39 @@ async fn pump_member_to_node(
             return Ok(());
         }
         account_connection_bytes(&runtime, &connection_bytes, read)?;
-        runtime.rate_limiter.acquire(read, &dispatch.cancel).await?;
-        dispatch.send_credit.consume(read, &dispatch.cancel).await?;
+        let granted = reserve_route_bytes(&runtime, read).await?;
+        if granted == 0 {
+            return Err(RelayError::stable(
+                ErrorCode::LimitReached,
+                "route monthly byte limit reached",
+            ));
+        }
+        runtime
+            .rate_limiter
+            .acquire(granted, &dispatch.cancel)
+            .await?;
+        dispatch
+            .send_credit
+            .consume(granted, &dispatch.cancel)
+            .await?;
         tunnel
             .send(Frame::new(
                 FrameKind::Data,
                 stream_id,
-                buffer[..read].to_vec(),
+                buffer[..granted].to_vec(),
             ))
             .await?;
-        record_activity(&activity, read);
-        runtime
-            .metrics
-            .bytes_member_to_node
-            .fetch_add(u64::try_from(read).unwrap_or(u64::MAX), Ordering::Relaxed);
+        record_activity(&activity, granted);
+        runtime.metrics.bytes_member_to_node.fetch_add(
+            u64::try_from(granted).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if granted < read {
+            return Err(RelayError::stable(
+                ErrorCode::LimitReached,
+                "route monthly byte limit reached",
+            ));
+        }
     }
 }
 
@@ -1037,12 +1183,19 @@ async fn pump_node_to_member(
         match inbound {
             Inbound::Data(bytes) => {
                 account_connection_bytes(&runtime, &connection_bytes, bytes.len())?;
+                let granted = reserve_route_bytes(&runtime, bytes.len()).await?;
+                if granted == 0 {
+                    return Err(RelayError::stable(
+                        ErrorCode::LimitReached,
+                        "route monthly byte limit reached",
+                    ));
+                }
                 runtime
                     .rate_limiter
-                    .acquire(bytes.len(), &dispatch.cancel)
+                    .acquire(granted, &dispatch.cancel)
                     .await?;
-                writer.write_all(&bytes).await?;
-                let amount = u32::try_from(bytes.len()).map_err(|_| {
+                writer.write_all(&bytes[..granted]).await?;
+                let amount = u32::try_from(granted).map_err(|_| {
                     RelayError::stable(
                         ErrorCode::FrameTooLarge,
                         "payload cannot update flow window",
@@ -1059,6 +1212,12 @@ async fn pump_node_to_member(
                     .metrics
                     .bytes_node_to_member
                     .fetch_add(u64::from(amount), Ordering::Relaxed);
+                if granted < bytes.len() {
+                    return Err(RelayError::stable(
+                        ErrorCode::LimitReached,
+                        "route monthly byte limit reached",
+                    ));
+                }
             }
             Inbound::Fin => {
                 writer.shutdown().await?;
@@ -1128,6 +1287,13 @@ fn account_connection_bytes(
         })
         .map(|_| ())
         .map_err(|_| RelayError::stable(ErrorCode::LimitReached, "connection byte limit reached"))
+}
+
+async fn reserve_route_bytes(runtime: &RouteRuntime, requested: usize) -> Result<usize> {
+    match &runtime.quota {
+        Some(quota) => quota.reserve(requested, OffsetDateTime::now_utc()).await,
+        None => Ok(requested),
+    }
 }
 
 fn record_activity(activity: &Activity, amount: usize) {
@@ -1203,6 +1369,7 @@ mod tests {
                 max_concurrent_streams: 1,
                 max_bytes_per_second: 1_024,
                 max_bytes_per_connection: 1_024,
+                monthly_byte_limit: None,
             },
             public_address: "127.0.0.1:1".parse().unwrap(),
             server_config: test_server_config(),
@@ -1210,6 +1377,7 @@ mod tests {
             stream_slots: Arc::new(Semaphore::new(1)),
             next_stream_id: AtomicU64::new(1),
             rate_limiter: RateLimiter::new(1_024),
+            quota: None,
             metrics: Arc::new(RouteMetrics::default()),
             cancel: CancellationToken::new(),
         };

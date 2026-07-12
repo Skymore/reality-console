@@ -249,6 +249,11 @@ explicitly narrows the scope. `metadata_only` revisions cannot be rolled back.
 - **Affected-fleet rollback** targets every node targeted by the failed change for which a compatible
   source exists.
 
+The implemented admin surfaces are `POST /v1/admin/nodes/{nodeId}/rollback` for one node and
+`POST /v1/admin/rollbacks` for an explicit affected cohort. A cohort contains at most 100 unique
+node/source/failure tuples. Control validates the entire canonicalized cohort before allocating a
+revision, so one invalid or incompatible tuple publishes none of them.
+
 Rollback restores operational configuration inputs from the selected source, then overlays current
 hard denies and local provider restrictions. It does not restore old member sessions, consumed
 invitations, revoked credentials, endpoint verification, or deleted identities.

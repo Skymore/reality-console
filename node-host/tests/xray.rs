@@ -56,7 +56,7 @@ async fn configures_a_pinned_runtime_and_keeps_reality_identity_out_of_sqlite() 
     let configured = configure_xray(&data_dir, &fake.path, &fake.digest, false)
         .await
         .unwrap();
-    assert_eq!(configured.schema_version, 15);
+    assert_eq!(configured.schema_version, 17);
     assert!(configured.xray_configured);
     assert_eq!(
         configured.xray_binary_path.as_deref(),

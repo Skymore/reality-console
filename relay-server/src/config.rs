@@ -1,10 +1,11 @@
 use std::{
     collections::HashSet,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use control_protocol::{crypto::Ed25519PublicKey, id::RelayId};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
@@ -15,13 +16,33 @@ const MIN_FRAME_BYTES: usize = 1_024;
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MIN_ROUTE_ID_LEN: usize = 16;
 const MAX_ROUTE_ID_LEN: usize = 128;
+const MAX_MANAGED_ROUTES: usize = 8_192;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RelayConfig {
     pub server: ServerConfig,
     #[serde(default)]
+    pub managed_routes: Option<ManagedRoutesConfig>,
+    #[serde(default)]
     pub routes: Vec<RouteConfig>,
+}
+
+/// Immutable controller-managed route registry settings.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRoutesConfig {
+    pub relay_id: RelayId,
+    pub managed_routes_directory: PathBuf,
+    pub quota_state_directory: PathBuf,
+    pub controller_public_key: Ed25519PublicKey,
+    pub public_listen_ip: IpAddr,
+    pub public_port_start: u16,
+    pub public_port_end: u16,
+    pub max_concurrent_streams: u16,
+    pub max_bytes_per_second: u64,
+    pub max_bytes_per_connection: u64,
+    pub monthly_byte_limit: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -107,6 +128,9 @@ pub struct RouteConfig {
     pub max_bytes_per_second: u64,
     #[serde(default = "default_max_bytes_per_connection")]
     pub max_bytes_per_connection: u64,
+    /// Finite UTC calendar-month allowance. Controller-managed routes always set this.
+    #[serde(default)]
+    pub monthly_byte_limit: Option<u64>,
 }
 
 impl RouteConfig {
@@ -155,6 +179,14 @@ impl RelayConfig {
         ] {
             if candidate.is_relative() {
                 *candidate = base.join(&*candidate);
+            }
+        }
+        if let Some(managed) = &mut config.managed_routes {
+            if managed.managed_routes_directory.is_relative() {
+                managed.managed_routes_directory = base.join(&managed.managed_routes_directory);
+            }
+            if managed.quota_state_directory.is_relative() {
+                managed.quota_state_directory = base.join(&managed.quota_state_directory);
             }
         }
         config.validate()?;
@@ -211,9 +243,64 @@ impl RelayConfig {
             ));
         }
 
+        if let Some(managed) = &self.managed_routes {
+            if server.max_routes > MAX_MANAGED_ROUTES {
+                return Err(RelayError::Config(format!(
+                    "managed max_routes must not exceed {MAX_MANAGED_ROUTES}"
+                )));
+            }
+            if managed.public_port_start == 0
+                || managed.public_port_start > managed.public_port_end
+                || managed.max_concurrent_streams == 0
+                || managed.max_bytes_per_second < u64::from(server.initial_window_bytes)
+                || managed.max_bytes_per_connection < u64::from(server.initial_window_bytes)
+                || managed.monthly_byte_limit < u64::from(server.initial_window_bytes)
+            {
+                return Err(RelayError::Config(
+                    "managed route bounds are inconsistent".to_owned(),
+                ));
+            }
+            if managed.managed_routes_directory == managed.quota_state_directory {
+                return Err(RelayError::Config(
+                    "managed route registry and quota state directories must be distinct"
+                        .to_owned(),
+                ));
+            }
+            for address in [server.node_listen, server.metrics_listen] {
+                if address.ip() == managed.public_listen_ip
+                    && (managed.public_port_start..=managed.public_port_end)
+                        .contains(&address.port())
+                {
+                    return Err(RelayError::Config(
+                        "managed public port range conflicts with a service listener".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        if self.managed_routes.is_none()
+            && self
+                .routes
+                .iter()
+                .any(|route| route.monthly_byte_limit.is_some())
+        {
+            return Err(RelayError::Config(
+                "finite monthly route limits require managed quota state".to_owned(),
+            ));
+        }
+
+        self.validate_routes(&self.routes)
+    }
+
+    pub(crate) fn validate_routes(&self, routes: &[RouteConfig]) -> Result<()> {
+        if routes.len() > self.server.max_routes {
+            return Err(RelayError::Config(
+                "route count exceeds max_routes".to_owned(),
+            ));
+        }
         let mut route_ids = HashSet::new();
         let mut public_addresses = HashSet::new();
-        for route in &self.routes {
+        for route in routes {
             validate_route_id(&route.route_id)?;
             validate_digest("node_token_sha256", &route.node_token_sha256)?;
             validate_digest("node_cert_sha256", &route.node_cert_sha256)?;
@@ -224,16 +311,19 @@ impl RelayConfig {
                 return Err(RelayError::Config("duplicate public_listen".to_owned()));
             }
             if route.public_listen.port() != 0
-                && (route.public_listen == server.node_listen
-                    || route.public_listen == server.metrics_listen)
+                && (route.public_listen == self.server.node_listen
+                    || route.public_listen == self.server.metrics_listen)
             {
                 return Err(RelayError::Config(
                     "public listener conflicts with a service listener".to_owned(),
                 ));
             }
             if route.max_concurrent_streams == 0
-                || route.max_bytes_per_second < u64::from(server.initial_window_bytes)
-                || route.max_bytes_per_connection < u64::from(server.initial_window_bytes)
+                || route.max_bytes_per_second < u64::from(self.server.initial_window_bytes)
+                || route.max_bytes_per_connection < u64::from(self.server.initial_window_bytes)
+                || route
+                    .monthly_byte_limit
+                    .is_some_and(|limit| limit < u64::from(self.server.initial_window_bytes))
             {
                 return Err(RelayError::Config(
                     "route limits must be non-zero and at least initial_window_bytes".to_owned(),
@@ -340,6 +430,7 @@ mod tests {
                 max_routes: 16,
                 max_node_connections: 16,
             },
+            managed_routes: None,
             routes: vec![RouteConfig {
                 route_id: "route_0123456789abcdef".to_owned(),
                 public_listen: "0.0.0.0:24443".parse().unwrap(),
@@ -350,6 +441,7 @@ mod tests {
                 max_concurrent_streams: 16,
                 max_bytes_per_second: 2_500_000,
                 max_bytes_per_connection: 10 * 1024 * 1024 * 1024,
+                monthly_byte_limit: None,
             }],
         }
     }
@@ -376,6 +468,13 @@ mod tests {
         assert!(route.token_matches(&[0x11; 32]));
         assert!(!route.token_matches(&[0x12; 32]));
         assert!(route.cert_matches(&[0x22; 32]));
+    }
+
+    #[test]
+    fn finite_monthly_limits_require_managed_quota_state() {
+        let mut config = valid_config();
+        config.routes[0].monthly_byte_limit = Some(1_000_000);
+        assert!(config.validate().is_err());
     }
 
     #[test]

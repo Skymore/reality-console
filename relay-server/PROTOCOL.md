@@ -4,16 +4,60 @@
 is not VLESS, SOCKS, HTTP CONNECT, a generic reverse proxy, or a destination-selection protocol.
 Payloads are opaque VLESS + REALITY bytes; TLS/VLESS/REALITY still terminate only at node Xray.
 
+## Controller-Managed Route Registry
+
+The optional managed registry consumes exactly the shared protocol `SignedRelayRoute` JSON schema.
+It does not accept unsigned route fragments or derive trust from filenames. One static relay config
+pins the relay ID, controller Ed25519 public key, local public-listen IP, public-port range, and route
+ceilings. A document is accepted only when all of these checks succeed:
+
+- the JSON has no unknown fields and the shared schema/header validation succeeds;
+- `signingKeyId` matches the pinned key and the controller signature verifies;
+- the relay ID matches this relay; valid but not-yet-active or expired documents remain in the
+  authenticated snapshot but do not create a listener;
+- the public port is in the configured range and all signed limits are at or below local ceilings;
+- grant/generation identities and public ports are unique across the active managed plus static
+  route set.
+
+The route directory and every file are bounded and owner-only. Filenames are exactly
+`<grantId>.relay-route.json` and must match the signed `grantId`; symlinks, other file names/types,
+owner or mode mismatches, empty/oversized files, and files changed while opening are rejected. The
+directory fingerprint hashes sorted names, exact file bytes, and each document's current active bit,
+so it changes at `notBefore` and `expiresAt` without requiring a file mutation.
+
+Startup fails closed if the complete directory is invalid. During polling, parsing and validation
+are transactional: one invalid, partial, conflicting, or unverifiable entry preserves the entire
+last-known-good map. A valid removal or replacement updates the complete map and cancels the exact
+old listener, tunnel, and streams before the replacement becomes authoritative.
+
 ## Transport And Authentication
 
 - Node Host connects outbound to the configured relay TCP address using TLS 1.2 or newer.
 - ALPN is exactly `pn-relay-v1`.
 - Relay verifies the client certificate against its configured CA and then binds the leaf
   certificate SHA-256 fingerprint to one route.
-- The first application frame supplies the same opaque route ID plus a high-entropy route token.
+- The first application frame supplies the generation-scoped opaque `grantId` plus a high-entropy
+  route token. Logical `routeId` remains stable, while predecessor and successor grants can coexist
+  during rotation.
   Relay stores only the token SHA-256 and compares both digests in constant time.
 - A route grant has a fixed public listener, expiry, concurrency, rate, and per-connection byte
   limit. A valid reconnect replaces the prior tunnel for that route.
+
+## Managed Monthly Quota
+
+Each controller-managed grant carries a finite `monthlyByteLimit`. Relay counts opaque payload bytes
+in both directions against that generation-scoped grant ID. Before forwarding a payload chunk, it
+atomically reserves up to the remaining allowance in an owner-only crash-safe local ledger. A
+partial final chunk is truncated to the exact remaining allowance and then the stream closes with
+`relay_limit_reached`; subsequent member streams are refused before `OPEN`.
+
+The accounting period is the UTC calendar month. A persisted clock high-watermark prevents a wall
+clock rollback from returning a route to an earlier month's allowance. Route reloads reuse the same
+record, restarts reload it, and N/N+1 grant IDs have independent records. Retired records are kept
+for 62 days, then removed subject to a fixed hard record ceiling. Invalid permissions, malformed or
+oversized JSON, a leftover interrupted-write file, record-capacity exhaustion, or a persistence
+error fails managed quota admission closed. The ledger contains only opaque grant IDs, month,
+aggregate bytes, and retirement time; no token, certificate, member, destination, or payload data.
 
 The public member listener does not add a relay handshake because doing so would modify bytes seen
 by Xray. Possession of a profile selects the dedicated route endpoint; the node's VLESS inbound

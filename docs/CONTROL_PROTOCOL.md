@@ -305,8 +305,9 @@ approves a pending node, and revision, heartbeat, plus telemetry cursors cannot 
 All operator endpoints require administrator authentication:
 
 - `GET /v1/admin/nodes` returns node identity, status, consent, version, runtime, revision, and
-  telemetry summaries. It never returns node public keys, credential identifiers, or secret
-  material.
+  telemetry summaries. `lastFailure` contains only the latest `rejected` or `rolledBack` revision,
+  terminal state, stable Node Host `errorCode`, optional restored revision, and completion time. It
+  never returns node public keys, credential identifiers, artifact bodies, or secret material.
 - `POST /v1/admin/nodes/{nodeId}/approve` changes `pending` to `active`; approving an already
   active node is idempotent.
 - `POST /v1/admin/nodes/{nodeId}/disable` changes `pending` or `active` to `disabled`; disabling an
@@ -357,6 +358,29 @@ returns `200 OK` with the same redacted revision when the latest target already 
 terminally failed. It publishes and returns `201 Created` only after `rejected`/`rolledBack` or when
 the immutable member snapshot differs. Repeating a successful retry before another state change is
 therefore naturally idempotent.
+
+### Operator rollback
+
+`POST /v1/admin/nodes/{nodeId}/rollback` accepts one `sourceRevision`, later `failedRevision`, and
+the enum `reason`. `POST /v1/admin/rollbacks` accepts an explicit duplicate-free cohort of at most
+100 `{nodeId, sourceRevision, failedRevision}` tuples plus one enum reason. Both routes require a
+bounded `Idempotency-Key`; exact retries return the original `201` response and changed reuse
+returns `idempotency_key_conflict`.
+
+Control validates every selected node before publishing any target. The failed revision must be
+that node's current desired revision with a terminal `rejected` or `rolledBack` result. The earlier
+source must target the same node, retain a valid signed artifact, and have both `validated` and
+`applied` evidence. Its schema, Xray capability, and minimum agent version must remain compatible
+with the current node. `rollback_target_invalid` and `rollback_target_incompatible` are stable,
+non-retryable `409` codes.
+
+Rollback never edits or reissues the source artifact. Control copies only its verified non-secret
+configuration inputs, recompiles the current account/credential safety floor, creates a newly
+signed globally increasing revision per selected node, and commits the complete explicit cohort or
+none of it. The response lists `{nodeId, sourceRevision, failedRevision, revision}` in canonical
+node order. Revision failure and rollback publication/rejection audit records contain stable IDs,
+revision numbers, enum reason/error codes, and an idempotency-key hash, never artifact content or
+member credentials.
 
 ### Fetch
 
@@ -474,6 +498,22 @@ proof. It returns account metadata, device ID, short-lived access token, and rot
 credential. An exact retry with the same device request reconstructs the same response after a lost
 HTTP response; changed device material after consumption is rejected.
 
+### Recover account password
+
+`POST /v1/admin/accounts/{userId}/reset-tokens` requires administrator authentication and a bounded
+`Idempotency-Key`. The body contains only `expiresInSeconds` from 60 through 3600, defaulting to 900.
+An exact issue retry reconstructs the same `rcr1` bearer from the controller identity; SQLite stores
+only its keyed 32-byte verifier, request/key digests, account binding, and expiry.
+
+`POST /v1/account-reset-tokens/consume` is unauthenticated but requires an `Idempotency-Key`, the
+reset bearer, and a 12-to-1024-byte replacement password. In one `BEGIN IMMEDIATE` transaction it
+verifies expiry and single use, replaces the Argon2id verifier, revokes all refresh families,
+rotates current per-node account credentials, publishes authorization-fence revisions, marks the
+token consumed, and writes a secret-free audit event. The same key and exact request replay the safe
+result; another consume returns `account_reset_consumed`. Invalid and expired bearers return
+`account_reset_invalid` and `account_reset_expired` without account enumeration. Reset does not
+revoke device identities; `POST /v1/admin/devices/{deviceId}/revoke` remains independently scoped.
+
 ### Login
 
 `POST /v1/sessions` accepts account credentials when password login is enabled and requires an
@@ -570,8 +610,33 @@ success remains non-publishable. A checksum-pinned Xray client must then complet
 and a SOCKS destination connect for the same current candidate. The same gate applies to direct and
 registered relay listeners before an `applied` assignment can enter a Connect bundle.
 
-Node Host migrations 13-15 add the bounded seven-day replay spool, owner-managed relay assignment
-generations, and restart-safe Xray cumulative-counter normalization. Signed requests upload a
+Node Host migrations 13-17 add the bounded seven-day replay spool, manual relay compatibility
+state, restart-safe Xray cumulative-counter normalization, provider hard limits, and
+installation-bound identity. Signed requests upload a
 bounded batch only after local durability; Control acknowledges only after its cursor, event rows,
 and aggregates commit together. Detailed connection events disabled by policy are represented by
 a sequence-preserving dropped-policy row instead of blocking the node cursor.
+
+## 11. Relay Assignment Provisioning
+
+With a complete operator-owned `CONTROL_RELAY_*` profile, a node uses its existing signed-request
+credential for `POST` and `GET /v1/nodes/{nodeId}/relay-assignment`. `POST` is the provider's
+current action consent and ensures a generation; issuance additionally requires an active node,
+the `relay-tcp` capability, and the recorded provider disclosure consent. The signed request carries
+finite `providerLimits`; the node never supplies hostnames, ports, lifetime, or route IDs, and
+Control applies the field-wise lower operator/provider ceilings. `GET` returns only a controller-signed, HPKE-to-that-node assignment in state `published`
+and before expiry. Neither endpoint exposes assignment data to admin, member, support, audit, or
+list APIs.
+
+Node Host verifies the complete assignment with the pinned controller key and exact key ID, checks
+network/node/time/generation binding, decrypts with its installation X25519 seed, and installs it as
+a private successor without replacing the current generation. It sends
+`AcknowledgeRelayAssignmentRequest { grantId, generation }` to
+`POST /v1/nodes/{nodeId}/relay-assignment/acknowledge` only after the successor connector reports
+`Registered`. Exact acknowledgement retries are idempotent. A predecessor remains locally active
+until acknowledgement succeeds; a restart must register the successor again before retrying.
+
+`routeId` is a stable logical rotation family identifier. The wire route-registration ID is exactly
+`grantId.toString()` for every Node Host connector and Relay registry request. This keeps N and N+1
+distinct during cutover. The corresponding managed document name is exactly
+`<grantId>.relay-route.json`; `routeId` MUST NOT be used as a registry key or filename.

@@ -99,6 +99,14 @@ impl RelayError {
             Self::Io(_) | Self::Tls(_) | Self::Config(_) => ErrorCode::Internal,
         }
     }
+
+    #[must_use]
+    pub fn operational_code(&self) -> &str {
+        match self {
+            Self::Config(message) if message.starts_with("managed_route") => message,
+            _ => self.code().as_str(),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, RelayError>;

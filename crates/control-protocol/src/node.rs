@@ -1241,6 +1241,154 @@ pub enum RevisionResultState {
     RolledBack,
 }
 
+/// Stable operator intent for a secret-free rollback audit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OperatorRollbackReason {
+    /// The selected desired state failed validation or activation.
+    ConfigurationFailure,
+    /// The selected desired state is incompatible with the current host.
+    CompatibilityFailure,
+    /// A bounded set of affected nodes must return to known-good configuration.
+    FleetRecovery,
+    /// Another operator-reviewed recovery reason without free-form audit text.
+    Other,
+}
+
+/// One explicit node/source/failure tuple in an operator rollback cohort.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperatorRollbackTarget {
+    /// Node receiving the newly signed rollback revision.
+    pub node_id: NodeId,
+    /// Earlier revision that reached validated and applied for this node.
+    pub source_revision: Revision,
+    /// Later failed or rejected revision being recovered from.
+    pub failed_revision: Revision,
+}
+
+impl OperatorRollbackTarget {
+    fn validate(&self, field: &'static str) -> Result<(), ProtocolValidationError> {
+        if self.source_revision >= self.failed_revision {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                field,
+                "rollback source revision must precede the failed revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Administrator request to rollback one node addressed by the HTTP path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperatorNodeRollbackRequest {
+    /// Earlier known-good revision for the addressed node.
+    pub source_revision: Revision,
+    /// Later failed or rejected revision being recovered from.
+    pub failed_revision: Revision,
+    /// Stable secret-free recovery reason.
+    pub reason: OperatorRollbackReason,
+}
+
+impl OperatorNodeRollbackRequest {
+    /// Validates revision ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the source precedes the failed revision.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.source_revision >= self.failed_revision {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::InconsistentState,
+                "sourceRevision",
+                "rollback source revision must precede the failed revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Administrator request to rollback an explicit bounded affected cohort.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperatorCohortRollbackRequest {
+    /// Explicit affected nodes and their per-node source/failure revisions.
+    pub targets: Vec<OperatorRollbackTarget>,
+    /// Stable secret-free recovery reason shared by the cohort.
+    pub reason: OperatorRollbackReason,
+}
+
+impl OperatorCohortRollbackRequest {
+    /// Validates a non-empty bounded duplicate-free cohort and revision ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty cohort, more than 100 targets, duplicate nodes,
+    /// or a source that does not precede its failed revision.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if self.targets.is_empty() || self.targets.len() > 100 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "targets",
+                "rollback cohort must contain between 1 and 100 nodes",
+            ));
+        }
+        let mut nodes = HashSet::with_capacity(self.targets.len());
+        for target in &self.targets {
+            target.validate("targets.sourceRevision")?;
+            if !nodes.insert(target.node_id) {
+                return Err(ProtocolValidationError::new(
+                    ValidationCode::DuplicateIdentity,
+                    "targets.nodeId",
+                    "rollback cohort node IDs must be unique",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Safe publication metadata for one newly signed rollback target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorRollbackPublication {
+    /// Node receiving the rollback candidate.
+    pub node_id: NodeId,
+    /// Prior known-good source used only as immutable input.
+    pub source_revision: Revision,
+    /// Failed revision recovered by this operation.
+    pub failed_revision: Revision,
+    /// Newly allocated globally monotonic revision.
+    pub revision: Revision,
+}
+
+/// Idempotent result for a single-node or explicit-cohort rollback request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorRollbackResponse {
+    /// Newly published targets ordered by revision allocation.
+    pub publications: Vec<OperatorRollbackPublication>,
+}
+
+/// Latest terminal failed desired-state result exposed in an admin node summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeRevisionFailureSummary {
+    /// Failed or rejected desired-state revision.
+    pub revision: Revision,
+    /// Terminal result class.
+    pub state: RevisionResultState,
+    /// Stable bounded error code reported by Node Host.
+    pub error_code: ErrorCode,
+    /// Earlier local revision restored by an automatic rollback, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_revision: Option<Revision>,
+    /// Node-reported terminal completion time.
+    pub completed_at: Timestamp,
+}
+
 impl RevisionResultState {
     const fn rank(self) -> u8 {
         match self {

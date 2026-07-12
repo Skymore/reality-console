@@ -147,6 +147,61 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn account_reset_invalid(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::Unknown("account_reset_invalid".to_string()),
+            "The account reset token is invalid.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn account_reset_expired(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::GONE,
+            ErrorCode::Unknown("account_reset_expired".to_string()),
+            "The account reset token has expired.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn account_reset_consumed(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Unknown("account_reset_consumed".to_string()),
+            "The account reset token was already consumed.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn rollback_target_invalid(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Unknown("rollback_target_invalid".to_string()),
+            "The rollback source or failed revision is not eligible.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
+    pub fn rollback_target_incompatible(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Unknown("rollback_target_incompatible".to_string()),
+            "The rollback source is incompatible with the current node.",
+            request_id,
+            false,
+        )
+    }
+
+    #[must_use]
     pub fn account_disabled(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::FORBIDDEN,

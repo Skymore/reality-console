@@ -286,7 +286,11 @@ impl Drop for SocketPathGuard {
 mod tests {
     use super::*;
     use crate::local_api::{LocalServicePhase, NodeSetupPhase, LOCAL_API_SOCKET_FILE};
-    use crate::{RelayAssignmentState, RelayAssignmentStatus, RelayRuntimeState};
+    use crate::{
+        AdmissionCounters, ManualEndpointStatus, ProviderAvailability, ProviderMonthUsage,
+        ProviderPolicy, ProviderPolicyStatus, RelayAssignmentState, RelayAssignmentStatus,
+        RelayRuntimeState,
+    };
     use crate::{RouterMappingState, RouterMappingStatus};
     use control_protocol::id::{
         ControllerInstanceId, EndpointId, NodeId, Revision, SequenceNumber, SigningKeyId, Timestamp,
@@ -301,10 +305,11 @@ mod tests {
 
     fn fixture_status() -> LocalServiceStatus {
         let node_id = NodeId::new();
+        let observed_at = Timestamp::from_datetime(OffsetDateTime::now_utc());
         LocalServiceStatus {
             schema_version: LOCAL_API_SCHEMA_VERSION,
             service_instance_id: Uuid::new_v4(),
-            observed_at: Timestamp::from_datetime(OffsetDateTime::now_utc()),
+            observed_at,
             phase: LocalServicePhase::Idle,
             node_id,
             runtime_state: NodeRuntimeState::Idle,
@@ -333,6 +338,27 @@ mod tests {
                 lease_expires_at: None,
                 last_error_code: None,
             },
+            provider_policy: ProviderPolicyStatus {
+                policy: ProviderPolicy::default(),
+                generation: 1,
+                updated_at: observed_at,
+                availability: ProviderAvailability::Available,
+                month_usage: ProviderMonthUsage {
+                    utc_month: "2026-07".to_string(),
+                    observed_bytes: 0,
+                    cap_bytes: Some(100 * 1024 * 1024 * 1024),
+                    remaining_bytes: Some(100 * 1024 * 1024 * 1024),
+                    coverage: "xrayObservedLowerBound".to_string(),
+                    last_observed_at: None,
+                },
+                manual_endpoint: ManualEndpointStatus {
+                    configured: false,
+                    current: false,
+                    applied_revision: None,
+                    expires_at: None,
+                },
+            },
+            admission: AdmissionCounters::default(),
             relay_assignment: RelayAssignmentStatus {
                 state: RelayAssignmentState::NotConfigured,
                 endpoint_id: None,

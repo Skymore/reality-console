@@ -1,4 +1,4 @@
-use crate::admission::{AdmissionGate, AdmissionOptions};
+use crate::admission::{AdmissionCounters, AdmissionGate, AdmissionOptions};
 use crate::xray::{insert_revision_result, load_validated_candidate, ValidatedXrayCandidate};
 use crate::{migrate, open_database, unix_timestamp};
 use anyhow::{bail, Context, Result};
@@ -65,6 +65,7 @@ pub(crate) struct XraySupervisor {
     running_revision: Option<Revision>,
     running_public_port: Option<u16>,
     last_admission_probe: Option<Instant>,
+    last_admission_counters: AdmissionCounters,
     options: ActivationOptions,
 }
 
@@ -120,8 +121,33 @@ impl XraySupervisor {
             running_revision: None,
             running_public_port: None,
             last_admission_probe: None,
+            last_admission_counters: AdmissionCounters::default(),
             options: options.validate()?,
         })
+    }
+
+    pub(crate) async fn configure_admission_limits(
+        &mut self,
+        max_connections: u16,
+        bandwidth_limit_bps: Option<u64>,
+    ) -> Result<()> {
+        let mut admission = self.options.admission;
+        admission.max_connections = usize::from(max_connections);
+        admission.bandwidth_limit_bps = bandwidth_limit_bps;
+        admission.validate()?;
+        if admission != self.options.admission {
+            self.options.admission = admission;
+            if self.child.is_some() || self.admission.is_some() {
+                self.stop_runtime().await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admission_counters(&self) -> AdmissionCounters {
+        self.admission
+            .as_ref()
+            .map_or(self.last_admission_counters, AdmissionGate::counters)
     }
 
     pub(crate) async fn recover(&mut self, data_dir: &Path) -> Result<()> {
@@ -497,6 +523,7 @@ impl XraySupervisor {
                 ActivationFailure::from_error(ErrorCode::AdmissionBindFailed, error)
             })?;
         debug_assert!(self.admission.is_none());
+        self.last_admission_counters = AdmissionCounters::default();
         self.admission = Some(gate);
         self.admission
             .as_ref()
@@ -667,6 +694,7 @@ impl XraySupervisor {
     async fn stop_runtime(&mut self) -> Result<()> {
         self.clear_running_marker();
         let admission_error = if let Some(admission) = self.admission.as_mut() {
+            self.last_admission_counters = admission.counters();
             admission.shutdown().await.err()
         } else {
             None
@@ -1378,6 +1406,7 @@ mod tests {
             probe_interval: Duration::from_millis(25),
             admission: AdmissionOptions {
                 max_connections: 4,
+                bandwidth_limit_bps: None,
                 connect_timeout: Duration::from_millis(250),
                 canary_timeout: Duration::from_secs(1),
                 probe_interval: Duration::from_millis(25),

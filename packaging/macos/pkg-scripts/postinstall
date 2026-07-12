@@ -2,30 +2,158 @@
 set -eu
 
 BASE="/Library/Application Support/Private Network Node"
-STATE="$BASE/state"
+SERVICE_STATE="$BASE/service-state"
+STATE="$SERVICE_STATE/state"
+IDENTITY="$SERVICE_STATE/identity"
+LEGACY_STATE="$BASE/state"
+LEGACY_IDENTITY="$BASE/identity"
+LEGACY_DEFAULT_IDENTITY="$BASE/.state.installation-identity"
+RUNTIME="/var/run/private-network-node"
 LOGS="/Library/Logs/Private Network Node"
 PLIST="/Library/LaunchDaemons/com.sky.realitynode.agent.plist"
+PREVIOUS="$BASE/.previous-release"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+ROLLBACK_HELPER="$SCRIPT_DIR/service-state-rollback"
+SNAPSHOT_READY=0
 
-if ! /usr/bin/dscl . -read /Users/_privnetnode >/dev/null 2>&1; then
+restore_previous_on_failure() {
+  status=$?
+  trap - EXIT INT TERM
+  /bin/launchctl bootout system/com.sky.realitynode.agent >/dev/null 2>&1 || true
+  if [ "$SNAPSHOT_READY" -eq 1 ]; then
+    "$ROLLBACK_HELPER" restore
+  else
+    echo "state snapshot was not completed; previous service will remain stopped" >&2
+    exit "$status"
+  fi
+  if [ "$status" -ne 0 ] && [ -f "$PREVIOUS" ]; then
+    previous=$(/bin/cat "$PREVIOUS")
+    case "$previous" in
+      releases/*)
+        if [ -d "$BASE/$previous" ]; then
+          temporary="$BASE/.current-rollback.$$"
+          /bin/rm -f "$temporary"
+          /bin/ln -s "$previous" "$temporary"
+          /bin/rm -f "$BASE/current"
+          /bin/mv "$temporary" "$BASE/current"
+          # Restart only the restored target; the failed candidate must not remain loaded.
+          /usr/bin/codesign --verify --strict --verbose=2 "$BASE/current/node-host"
+          /usr/bin/codesign --verify --strict --verbose=2 "$BASE/current/xray"
+          /bin/launchctl bootstrap system "$PLIST"
+        fi
+        ;;
+    esac
+  fi
+  exit "$status"
+}
+trap restore_previous_on_failure EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+/bin/launchctl bootout system/com.sky.realitynode.agent >/dev/null 2>&1 || true
+"$ROLLBACK_HELPER" snapshot
+SNAPSHOT_READY=1
+
+if ! /usr/bin/dscl . -read /Groups/_privnetnode >/dev/null 2>&1; then
   uid=399
-  while /usr/bin/dscl . -search /Users UniqueID "$uid" | /usr/bin/grep -q .; do uid=$((uid + 1)); done
+  while /usr/bin/dscl . -search /Groups PrimaryGroupID "$uid" | /usr/bin/grep -q . || \
+        /usr/bin/dscl . -search /Users UniqueID "$uid" | /usr/bin/grep -q .; do uid=$((uid + 1)); done
+  [ "$uid" -lt 500 ] || { echo "no safe system account ID is available" >&2; exit 70; }
   /usr/bin/dscl . -create /Groups/_privnetnode
   /usr/bin/dscl . -create /Groups/_privnetnode PrimaryGroupID "$uid"
+fi
+group_id=$(/usr/bin/dscl . -read /Groups/_privnetnode PrimaryGroupID | /usr/bin/awk '{print $2}')
+case "$group_id" in *[!0-9]*|'') echo "_privnetnode group ID is invalid" >&2; exit 70 ;; esac
+[ "$group_id" -gt 0 ] && [ "$group_id" -lt 500 ] || { echo "_privnetnode group is not a system group" >&2; exit 70; }
+if ! /usr/bin/dscl . -read /Users/_privnetnode >/dev/null 2>&1; then
+  existing_user=$(/usr/bin/dscl . -search /Users UniqueID "$group_id" | /usr/bin/awk 'NR == 1 {print $1}')
+  [ -z "$existing_user" ] || { echo "_privnetnode user ID is already assigned" >&2; exit 70; }
   /usr/bin/dscl . -create /Users/_privnetnode
-  /usr/bin/dscl . -create /Users/_privnetnode UniqueID "$uid"
-  /usr/bin/dscl . -create /Users/_privnetnode PrimaryGroupID "$uid"
+  /usr/bin/dscl . -create /Users/_privnetnode UniqueID "$group_id"
+  /usr/bin/dscl . -create /Users/_privnetnode PrimaryGroupID "$group_id"
   /usr/bin/dscl . -create /Users/_privnetnode UserShell /usr/bin/false
   /usr/bin/dscl . -create /Users/_privnetnode NFSHomeDirectory /var/empty
+  /usr/bin/dscl . -create /Users/_privnetnode IsHidden 1
 fi
+user_group_id=$(/usr/bin/dscl . -read /Users/_privnetnode PrimaryGroupID | /usr/bin/awk '{print $2}')
+[ "$user_group_id" = "$group_id" ] || { echo "_privnetnode account has an unsafe primary group" >&2; exit 70; }
+service_uid=$(/usr/bin/dscl . -read /Users/_privnetnode UniqueID | /usr/bin/awk '{print $2}')
+case "$service_uid" in *[!0-9]*|'') echo "_privnetnode user ID is invalid" >&2; exit 70 ;; esac
+[ "$service_uid" -gt 0 ] && [ "$service_uid" -lt 500 ] || { echo "_privnetnode user is not a system account" >&2; exit 70; }
+/usr/bin/dscl . -create /Users/_privnetnode UserShell /usr/bin/false
+/usr/bin/dscl . -create /Users/_privnetnode NFSHomeDirectory /var/empty
+/usr/bin/dscl . -create /Users/_privnetnode IsHidden 1
 
-/bin/mkdir -p "$STATE" "$LOGS"
-/usr/sbin/chown -R _privnetnode:_privnetnode "$STATE" "$LOGS"
-/bin/chmod 700 "$STATE"
+for directory in "$SERVICE_STATE" "$LEGACY_STATE" "$LEGACY_IDENTITY" \
+                 "$LEGACY_DEFAULT_IDENTITY" "$RUNTIME" "$LOGS"; do
+  [ ! -L "$directory" ] || { echo "unsafe symlink at $directory" >&2; exit 70; }
+done
+
+/bin/mkdir -p "$SERVICE_STATE" "$RUNTIME" "$LOGS"
+/usr/sbin/chown _privnetnode:_privnetnode "$SERVICE_STATE" "$LOGS"
+/bin/chmod 700 "$SERVICE_STATE" "$LOGS"
+
+# One-time migration from the pre-unpair system layout. launchd is already
+# stopped, and only fixed package paths can be moved.
+if [ -e "$LEGACY_STATE" ]; then
+  [ -d "$LEGACY_STATE" ] && [ ! -e "$STATE" ] || { echo "legacy state migration is unsafe" >&2; exit 70; }
+  if [ -d "$LEGACY_STATE/active" ] && [ ! -L "$LEGACY_STATE/active" ]; then
+    /bin/mv "$LEGACY_STATE/active" "$STATE"
+    if [ -f "$LEGACY_STATE/last-unpair.json" ] && [ ! -L "$LEGACY_STATE/last-unpair.json" ]; then
+      /bin/mv "$LEGACY_STATE/last-unpair.json" "$SERVICE_STATE/last-unpair.json"
+    fi
+    [ -z "$(/usr/bin/find "$LEGACY_STATE" -xdev -mindepth 1 -maxdepth 1 -print -quit)" ] \
+      || { echo "legacy state directory contains unexpected entries" >&2; exit 70; }
+    /bin/rmdir "$LEGACY_STATE"
+  else
+    /bin/mv "$LEGACY_STATE" "$STATE"
+  fi
+fi
+legacy_identity=
+if [ -e "$LEGACY_IDENTITY" ]; then legacy_identity="$LEGACY_IDENTITY"; fi
+if [ -e "$LEGACY_DEFAULT_IDENTITY" ]; then
+  [ -z "$legacy_identity" ] || { echo "multiple legacy identity directories exist" >&2; exit 70; }
+  legacy_identity="$LEGACY_DEFAULT_IDENTITY"
+fi
+if [ -n "$legacy_identity" ]; then
+  [ -d "$legacy_identity" ] && [ ! -e "$IDENTITY" ] || { echo "legacy identity migration is unsafe" >&2; exit 70; }
+  if [ -d "$legacy_identity/active" ] && [ ! -L "$legacy_identity/active" ]; then
+    /bin/mv "$legacy_identity/active" "$IDENTITY"
+    [ -z "$(/usr/bin/find "$legacy_identity" -xdev -mindepth 1 -maxdepth 1 -print -quit)" ] \
+      || { echo "legacy identity directory contains unexpected entries" >&2; exit 70; }
+    /bin/rmdir "$legacy_identity"
+  else
+    /bin/mv "$legacy_identity" "$IDENTITY"
+  fi
+fi
+/bin/mkdir -p "$STATE" "$IDENTITY"
+/usr/sbin/chown -R -h _privnetnode:_privnetnode "$STATE" "$IDENTITY"
+/bin/chmod 700 "$STATE" "$IDENTITY"
+
+# Verify installed nested code before invoking the fixed-path migration entry.
+/usr/bin/codesign --verify --deep --strict --verbose=2 "/Applications/Private Network Node.app"
+/usr/bin/codesign --verify --strict --verbose=2 "$BASE/current/node-host"
+/usr/bin/codesign --verify --strict --verbose=2 "$BASE/current/xray"
+/usr/bin/test -f "$BASE/current/sidecars.json"
+/usr/bin/sudo -u _privnetnode "$BASE/current/node-host" migrate-system-layout
+/usr/sbin/chown root:_privnetnode "$RUNTIME"
+/bin/chmod 775 "$RUNTIME"
+if [ -e "$RUNTIME/control.sock" ] || [ -L "$RUNTIME/control.sock" ]; then
+  [ -S "$RUNTIME/control.sock" ] || { echo "unsafe existing control socket" >&2; exit 70; }
+  socket_uid=$(/usr/bin/stat -f '%u' "$RUNTIME/control.sock")
+  [ "$socket_uid" = "$service_uid" ] || { echo "control socket has an unsafe owner" >&2; exit 70; }
+  /bin/rm -f "$RUNTIME/control.sock"
+fi
 /bin/chmod 755 "$BASE" "$BASE/bin" "$BASE/releases"
 /bin/chmod 644 "$PLIST"
 /usr/sbin/chown root:wheel "$PLIST"
 /usr/sbin/chown -R root:wheel "$BASE/bin" "$BASE/releases"
+/usr/sbin/chown -h root:wheel "$BASE/current"
 
 /bin/launchctl bootstrap system "$PLIST"
 /bin/launchctl enable system/com.sky.realitynode.agent
+"$ROLLBACK_HELPER" commit
+SNAPSHOT_READY=0
+/bin/rm -f "$PREVIOUS"
+trap - EXIT INT TERM
 exit 0

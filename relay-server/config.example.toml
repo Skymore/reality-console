@@ -19,6 +19,26 @@ reload_interval_secs = 2
 max_routes = 1024
 max_node_connections = 1024
 
+# Optional controller-managed registry. Uncomment the complete table only when Control publishes
+# strict SignedRelayRoute JSON into this owner-only directory. The directory and every .json file
+# must be owned by the relay process effective UID (normally root) with modes 0700 and 0600.
+# [managed_routes]
+# relay_id = "00000000-0000-4000-8000-000000000001"
+# managed_routes_directory = "/var/lib/reality-console/relay-routes"
+# Durable monthly usage ledger. Keep this separate from the signed route registry directory.
+# quota_state_directory = "/var/lib/reality-console/relay-quota"
+# Pinned Ed25519 controller public key: exactly 32 bytes as unpadded base64url.
+# controller_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+# Managed public listeners bind this local IP; signed documents select only a port in this range.
+# public_listen_ip = "0.0.0.0"
+# public_port_start = 25000
+# public_port_end = 25999
+# Signed limits above any ceiling reject the entire directory update.
+# max_concurrent_streams = 64
+# max_bytes_per_second = 10000000
+# max_bytes_per_connection = 10737418240
+# monthly_byte_limit = 1099511627776
+
 [[routes]]
 # Opaque control-plane identity. Do not use a person, account, or hostname label.
 route_id = "route_replace_with_opaque_id"

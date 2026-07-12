@@ -531,6 +531,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "rand_core 0.6.4",
+ "relay-provisioning",
  "reqwest",
  "rusqlite",
  "serde",
@@ -2115,15 +2116,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "relay-provisioning"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "control-protocol",
+ "rand_core 0.6.4",
+ "rcgen",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "time",
+]
+
+[[package]]
 name = "relay-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "control-protocol",
  "hex",
+ "libc",
+ "rustix",
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "thiserror 2.0.18",

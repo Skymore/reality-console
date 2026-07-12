@@ -1,0 +1,28 @@
+[package]
+name = "relay-provisioning"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Controller-side relay certificate issuance and atomic route publication"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22"
+control-protocol = { path = "../control-protocol" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = "0.3"
+
+[dev-dependencies]
+ed25519-dalek = "2"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

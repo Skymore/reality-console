@@ -34,17 +34,24 @@ PKG_SCRIPTS="$WORK/scripts"
 BASE="$PAYLOAD/Library/Application Support/Private Network Node"
 NODE_VERSION=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("'"$ROOT"'/node-host/Cargo.toml").read_text())["package"]["version"])')
 python3 "$ROOT/scripts/release/verify-sidecars.py" --target "$TARGET" --xray "$XRAY" --node-host "$AGENT" --node-host-version "$NODE_VERSION" --output "$WORK/sidecars.json"
+if [ "${REQUIRE_SIGNING:-0}" = 1 ]; then
+  /usr/bin/codesign --verify --strict --verbose=2 "$APP"
+  /usr/bin/codesign --verify --strict --verbose=2 "$AGENT"
+  /usr/bin/codesign --verify --strict --verbose=2 "$XRAY"
+fi
 mkdir -p "$PAYLOAD/Applications" "$BASE/bin" "$BASE/releases/$VERSION" "$PAYLOAD/Library/LaunchDaemons" "$PKG_SCRIPTS" "$OUTPUT"
 cp -R "$APP" "$PAYLOAD/Applications/Private Network Node.app"
 install -m 755 "$AGENT" "$BASE/releases/$VERSION/node-host"
 install -m 755 "$XRAY" "$BASE/releases/$VERSION/xray"
+install -m 644 "$WORK/sidecars.json" "$BASE/releases/$VERSION/sidecars.json"
 install -m 755 "$ROOT/packaging/macos/reality-node-service" "$BASE/bin/reality-node-service"
 ln -s "releases/$VERSION" "$BASE/current"
 install -m 644 "$ROOT/packaging/macos/com.sky.realitynode.agent.plist" "$PAYLOAD/Library/LaunchDaemons/com.sky.realitynode.agent.plist"
 # Copy script bytes instead of metadata so Finder/provenance xattrs cannot become AppleDouble files.
 /bin/cat "$ROOT/packaging/macos/pkg-scripts/preinstall" > "$PKG_SCRIPTS/preinstall"
 /bin/cat "$ROOT/packaging/macos/pkg-scripts/postinstall" > "$PKG_SCRIPTS/postinstall"
-/bin/chmod 755 "$PKG_SCRIPTS/preinstall" "$PKG_SCRIPTS/postinstall"
+/bin/cat "$ROOT/packaging/macos/pkg-scripts/service-state-rollback" > "$PKG_SCRIPTS/service-state-rollback"
+/bin/chmod 755 "$PKG_SCRIPTS/preinstall" "$PKG_SCRIPTS/postinstall" "$PKG_SCRIPTS/service-state-rollback"
 
 PKG="$OUTPUT/private-network-node-$VERSION-$TARGET-unsigned-validation.pkg"
 /usr/bin/pkgbuild \

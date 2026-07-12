@@ -13,11 +13,15 @@ mod local_api;
 mod local_api_macos;
 mod mapping;
 mod operations;
+mod policy;
 mod relay;
 mod router_protocol;
 mod service;
 mod setup_session;
 mod sync;
+mod system_setup;
+#[cfg(target_os = "macos")]
+mod system_setup_macos;
 mod telemetry;
 #[cfg(test)]
 mod test_support;
@@ -45,7 +49,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use x25519_dalek::{PublicKey as X25519DalekPublicKey, StaticSecret};
@@ -57,7 +61,7 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 15;
+const CURRENT_SCHEMA_VERSION: i64 = 17;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
@@ -74,6 +78,8 @@ const MIGRATION_12_NAME: &str = "provider_consent_receipt";
 const MIGRATION_13_NAME: &str = "bounded_telemetry_spool";
 const MIGRATION_14_NAME: &str = "owner_managed_relay_assignment";
 const MIGRATION_15_NAME: &str = "xray_traffic_collection";
+const MIGRATION_16_NAME: &str = "provider_local_policy";
+const MIGRATION_17_NAME: &str = "installation_identity_binding";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -538,13 +544,84 @@ const MIGRATION_15: &str = "
     ) STRICT;
 ";
 
+const MIGRATION_16: &str = r#"
+    CREATE TABLE provider_policy (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        policy_json TEXT NOT NULL CHECK (json_valid(policy_json)),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        updated_at INTEGER NOT NULL
+    ) STRICT;
+
+    INSERT INTO provider_policy(singleton, schema_version, policy_json, generation, updated_at)
+    VALUES (
+        1,
+        1,
+        '{"schemaVersion":1,"paused":false,"weeklySchedule":[],"monthlyTransferCapBytes":107374182400,"maxConcurrentSessions":16,"bandwidthLimitBps":20000000}',
+        1,
+        unixepoch()
+    );
+
+    CREATE TABLE provider_month_usage (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        utc_month TEXT NOT NULL CHECK (utc_month = '' OR length(utc_month) = 7),
+        observed_bytes INTEGER NOT NULL CHECK (observed_bytes >= 0),
+        clock_high_watermark INTEGER NOT NULL CHECK (clock_high_watermark >= 0),
+        last_observed_at INTEGER,
+        coverage TEXT NOT NULL CHECK (coverage = 'xrayObservedLowerBound')
+    ) STRICT;
+
+    INSERT INTO provider_month_usage(
+        singleton, utc_month, observed_bytes, clock_high_watermark, last_observed_at, coverage
+    ) VALUES (1, '', 0, 0, NULL, 'xrayObservedLowerBound');
+
+    CREATE TABLE provider_manual_endpoint (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        endpoint_id TEXT NOT NULL CHECK (length(endpoint_id) = 36),
+        address TEXT NOT NULL CHECK (length(address) BETWEEN 1 AND 253),
+        public_port INTEGER NOT NULL CHECK (public_port BETWEEN 1 AND 65535),
+        forwarded_local_port INTEGER NOT NULL CHECK (forwarded_local_port BETWEEN 1 AND 65535),
+        applied_revision INTEGER NOT NULL REFERENCES desired_state_artifacts(revision) ON DELETE RESTRICT,
+        observed_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL CHECK (expires_at > observed_at),
+        configured_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE provider_pending_traffic_delta (
+        user_id TEXT PRIMARY KEY CHECK (length(user_id) = 36),
+        bytes_up INTEGER NOT NULL CHECK (bytes_up >= 0),
+        bytes_down INTEGER NOT NULL CHECK (bytes_down >= 0),
+        observed_at INTEGER NOT NULL
+    ) STRICT;
+"#;
+
+const MIGRATION_17: &str = "
+    CREATE TABLE installation_identity_binding (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        identity_path TEXT NOT NULL UNIQUE CHECK (length(identity_path) BETWEEN 1 AND 4096),
+        public_fingerprint TEXT NOT NULL UNIQUE CHECK (
+            length(public_fingerprint) = 71
+            AND substr(public_fingerprint, 1, 7) = 'sha256:'
+            AND substr(public_fingerprint, 8) NOT GLOB '*[^0-9a-f]*'
+        ),
+        bound_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TRIGGER installation_identity_binding_no_update
+    BEFORE UPDATE ON installation_identity_binding
+    BEGIN
+        SELECT RAISE(ABORT, 'installation identity binding is immutable');
+    END;
+";
+
+pub use admission::AdmissionCounters;
 pub use background::{
     install_user_service, remove_user_service, user_service_status, BackgroundServiceStatus,
     UserServiceInstallRequest, USER_SERVICE_LABEL,
 };
 pub use bootstrap::{
-    bootstrap, bootstrap_and_install_user_service, inspect_setup_code, BootstrapRequest,
-    BootstrapServiceOutcome, NodeSetupPreview,
+    bootstrap, bootstrap_and_install_user_service, bootstrap_with_identity_dir, inspect_setup_code,
+    BootstrapRequest, BootstrapServiceOutcome, NodeSetupPreview,
 };
 pub use enrollment::join;
 pub use local_api::{
@@ -553,9 +630,28 @@ pub use local_api::{
 };
 pub use mapping::{RouterMappingState, RouterMappingStatus};
 pub use operations::{support_bundle, uninstall_local};
+pub use policy::{
+    clear_manual_endpoint, configure_manual_endpoint, configure_provider_policy, pause_provider,
+    provider_policy_status, resume_provider, ManualEndpointInput, ManualEndpointStatus,
+    ProviderAvailability, ProviderMonthUsage, ProviderPolicy, ProviderPolicyStatus,
+    WeeklyScheduleWindow, PROVIDER_POLICY_SCHEMA_VERSION,
+};
 pub use service::{run, run_until, SyncLoopOptions};
-pub use setup_session::{NodeSetupInstallRequest, NodeSetupSession, NodeSetupSessionStore};
+pub use setup_session::{
+    NodeSetupInstallRequest, NodeSetupSession, NodeSetupSessionStore, PendingNodeSetup,
+};
 pub use sync::sync_once;
+pub use system_setup::{
+    provider_relay_consent, SetupInvitation, SystemServicePhase, SystemServiceStatus,
+    SystemSetupError, SystemSetupErrorCode, SystemSetupOperation, SystemSetupOutcome,
+    SystemSetupRequest, SystemSetupResponse, SystemSetupResult,
+};
+#[cfg(target_os = "macos")]
+pub use system_setup_macos::{
+    migrate_system_layout_binding, run_system_service, SystemServiceClient, SystemServicePaths,
+    SYSTEM_CURRENT_PATH, SYSTEM_IDENTITY_PATH, SYSTEM_RELEASES_PATH, SYSTEM_SERVICE_ACCOUNT,
+    SYSTEM_SERVICE_STATE_ROOT_PATH, SYSTEM_SIDECAR_MANIFEST, SYSTEM_SOCKET_PATH, SYSTEM_STATE_PATH,
+};
 pub use telemetry::record_telemetry_event;
 pub use xray::configure_xray;
 
@@ -623,6 +719,8 @@ pub struct HostStatus {
     pub router_mapping: RouterMappingStatus,
     /// Controller-assigned relay metadata without credential material.
     pub relay: RelayAssignmentStatus,
+    /// Provider-local hard limits and redacted reachability/usage state.
+    pub provider_policy: ProviderPolicyStatus,
 }
 
 /// A seed whose formatting can never reveal its bytes.
@@ -647,13 +745,54 @@ impl Drop for SecretSeed {
 /// Returns an error if the directory cannot be locked, persisted state is
 /// invalid, migrations fail, or an existing controller differs.
 pub fn initialize(data_dir: &Path, controller: &str) -> Result<HostStatus> {
+    let identity_dir = default_installation_identity_dir(data_dir)?;
+    initialize_with_identity_dir(data_dir, &identity_dir, controller)
+}
+
+/// Initializes a data directory with an explicit installation-owned identity
+/// directory outside the copyable state tree.
+///
+/// Production callers must pass their fixed package path. This explicit form
+/// also lets isolated development and tests inject a unique identity root.
+///
+/// # Errors
+///
+/// Returns an error if either path is unsafe, an immutable identity binding
+/// already points elsewhere, identity material is missing or inconsistent, or
+/// normal initialization fails.
+pub fn initialize_with_identity_dir(
+    data_dir: &Path,
+    identity_dir: &Path,
+    controller: &str,
+) -> Result<HostStatus> {
     let controller = parse_controller(controller)?;
     let _lock = DataDirLock::acquire(data_dir, true)?;
     let mut connection = open_database(data_dir, true)?;
     migrate(&mut connection)?;
     configure_controller(&connection, &controller)?;
-    let identity = Identity::load_or_create(data_dir)?;
+    let identity = Identity::load_or_create(&connection, data_dir, identity_dir)?;
     build_status(&connection, data_dir, controller, &identity)
+}
+
+/// Returns the default development identity directory next to, never inside,
+/// the copyable state directory.
+///
+/// # Errors
+///
+/// Returns an error when the data directory has no safe absolute parent/name.
+pub fn default_installation_identity_dir(data_dir: &Path) -> Result<PathBuf> {
+    validate_absolute_path(data_dir, "node data directory")?;
+    let parent = data_dir
+        .parent()
+        .context("node data directory has no parent")?;
+    let name = data_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("node data directory name is invalid")?;
+    if name.is_empty() || name == "." || name == ".." {
+        bail!("node data directory name is invalid");
+    }
+    Ok(parent.join(format!(".{name}.installation-identity")))
 }
 
 /// Reads initialized state while holding the data-directory lock.
@@ -679,7 +818,7 @@ fn status_locked(data_dir: &Path) -> Result<HostStatus> {
         )
         .context("node host is not initialized")?;
     let controller = parse_controller(&controller_value)?;
-    let identity = Identity::load(data_dir)?;
+    let identity = Identity::load(&connection, data_dir)?;
     build_status(&connection, data_dir, controller, &identity)
 }
 
@@ -759,6 +898,8 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 13, MIGRATION_13_NAME, MIGRATION_13)?;
     apply_migration(&transaction, 14, MIGRATION_14_NAME, MIGRATION_14)?;
     apply_migration(&transaction, 15, MIGRATION_15_NAME, MIGRATION_15)?;
+    apply_migration(&transaction, 16, MIGRATION_16_NAME, MIGRATION_16)?;
+    apply_migration(&transaction, 17, MIGRATION_17_NAME, MIGRATION_17)?;
     transaction.commit()?;
     ensure_stats_api_port(connection)?;
     Ok(())
@@ -863,6 +1004,8 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (13, MIGRATION_13_NAME, MIGRATION_13),
         (14, MIGRATION_14_NAME, MIGRATION_14),
         (15, MIGRATION_15_NAME, MIGRATION_15),
+        (16, MIGRATION_16_NAME, MIGRATION_16),
+        (17, MIGRATION_17_NAME, MIGRATION_17),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");
@@ -943,6 +1086,7 @@ fn build_status(
     let activation_status = activation::load_activation_status(connection)?;
     let router_mapping = mapping::load_status(connection)?;
     let relay = relay::load_status(connection)?;
+    let provider_policy = policy::load_status_readonly(connection)?;
     let xray_status = xray::load_xray_runtime_status(connection, data_dir)?;
     let (
         xray_binary_path,
@@ -985,6 +1129,7 @@ fn build_status(
         reality_short_id,
         router_mapping,
         relay,
+        provider_policy,
     })
 }
 
@@ -1219,18 +1364,66 @@ struct Identity {
 }
 
 impl Identity {
-    fn load_or_create(data_dir: &Path) -> Result<Self> {
-        Ok(Self {
-            signing: load_or_create_seed(&data_dir.join(ED25519_SEED_FILE))?,
-            encryption: load_or_create_seed(&data_dir.join(X25519_SEED_FILE))?,
-        })
+    fn load_or_create_default(connection: &Connection, data_dir: &Path) -> Result<Self> {
+        if load_identity_binding(connection)?.is_some() {
+            return Self::load(connection, data_dir);
+        }
+        let identity_dir = default_installation_identity_dir(data_dir)?;
+        Self::load_or_create(connection, data_dir, &identity_dir)
     }
 
-    fn load(data_dir: &Path) -> Result<Self> {
-        Ok(Self {
-            signing: load_seed(&data_dir.join(ED25519_SEED_FILE))?,
-            encryption: load_seed(&data_dir.join(X25519_SEED_FILE))?,
-        })
+    fn load_or_create(
+        connection: &Connection,
+        data_dir: &Path,
+        requested_identity_dir: &Path,
+    ) -> Result<Self> {
+        validate_identity_dir_path(data_dir, requested_identity_dir)?;
+        if let Some((stored_path, fingerprint)) = load_identity_binding(connection)? {
+            if stored_path != requested_identity_dir {
+                bail!("installation identity is already bound to a different path");
+            }
+            return Self::load_bound(requested_identity_dir, &fingerprint);
+        }
+        prepare_identity_directory(requested_identity_dir)?;
+        migrate_legacy_identity(data_dir, requested_identity_dir)?;
+        let identity = Self {
+            signing: load_or_create_seed(&requested_identity_dir.join(ED25519_SEED_FILE))?,
+            encryption: load_or_create_seed(&requested_identity_dir.join(X25519_SEED_FILE))?,
+        };
+        bind_identity(connection, requested_identity_dir, &identity)?;
+        Ok(identity)
+    }
+
+    fn load(connection: &Connection, data_dir: &Path) -> Result<Self> {
+        if let Some((identity_dir, fingerprint)) = load_identity_binding(connection)? {
+            validate_identity_dir_path(data_dir, &identity_dir)?;
+            return Self::load_bound(&identity_dir, &fingerprint);
+        }
+
+        // Upgrade an initialized pre-binding installation without allowing a
+        // missing identity to be silently recreated during ordinary reads.
+        let identity_dir = default_installation_identity_dir(data_dir)?;
+        validate_identity_dir_path(data_dir, &identity_dir)?;
+        prepare_identity_directory(&identity_dir)?;
+        migrate_legacy_identity(data_dir, &identity_dir)?;
+        let identity = Self {
+            signing: load_seed(&identity_dir.join(ED25519_SEED_FILE))?,
+            encryption: load_seed(&identity_dir.join(X25519_SEED_FILE))?,
+        };
+        bind_identity(connection, &identity_dir, &identity)?;
+        Ok(identity)
+    }
+
+    fn load_bound(identity_dir: &Path, expected_fingerprint: &str) -> Result<Self> {
+        inspect_identity_directory(identity_dir)?;
+        let identity = Self {
+            signing: load_seed(&identity_dir.join(ED25519_SEED_FILE))?,
+            encryption: load_seed(&identity_dir.join(X25519_SEED_FILE))?,
+        };
+        if identity.public_fingerprint()? != expected_fingerprint {
+            bail!("installation identity fingerprint does not match its immutable binding");
+        }
+        Ok(identity)
     }
 
     fn ed25519_public(&self) -> Result<Ed25519PublicKey> {
@@ -1262,6 +1455,125 @@ impl Identity {
             .parse()
             .context("generated invalid Ed25519 signature")
     }
+
+    fn public_fingerprint(&self) -> Result<String> {
+        let signing = self.ed25519_public()?;
+        let encryption = self.x25519_public()?;
+        let mut digest = Sha256::new();
+        digest.update(b"private-network-node-installation-identity-v1\0");
+        digest.update(signing.as_str().as_bytes());
+        digest.update([0]);
+        digest.update(encryption.as_str().as_bytes());
+        let mut fingerprint = String::from("sha256:");
+        for byte in digest.finalize() {
+            write!(&mut fingerprint, "{byte:02x}")?;
+        }
+        Ok(fingerprint)
+    }
+}
+
+fn load_identity_binding(connection: &Connection) -> Result<Option<(PathBuf, String)>> {
+    connection
+        .query_row(
+            "SELECT identity_path, public_fingerprint
+             FROM installation_identity_binding WHERE singleton = 1",
+            [],
+            |row| Ok((PathBuf::from(row.get::<_, String>(0)?), row.get(1)?)),
+        )
+        .optional()
+        .context("failed to load installation identity binding")
+}
+
+fn bind_identity(connection: &Connection, identity_dir: &Path, identity: &Identity) -> Result<()> {
+    let identity_path = identity_dir
+        .to_str()
+        .context("installation identity path is not UTF-8")?;
+    let fingerprint = identity.public_fingerprint()?;
+    connection
+        .execute(
+            "INSERT INTO installation_identity_binding(
+                singleton, identity_path, public_fingerprint, bound_at
+             ) VALUES (1, ?1, ?2, ?3)",
+            params![identity_path, fingerprint, unix_timestamp()?],
+        )
+        .context("failed to bind installation identity")?;
+    Ok(())
+}
+
+fn validate_identity_dir_path(data_dir: &Path, identity_dir: &Path) -> Result<()> {
+    validate_absolute_path(identity_dir, "installation identity directory")?;
+    if identity_dir == data_dir || identity_dir.starts_with(data_dir) {
+        bail!("installation identity directory must be outside node state");
+    }
+    Ok(())
+}
+
+fn validate_absolute_path(path: &Path, label: &str) -> Result<()> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        bail!("{label} must be an absolute normalized path");
+    }
+    Ok(())
+}
+
+fn prepare_identity_directory(path: &Path) -> Result<()> {
+    if path.exists() {
+        return inspect_identity_directory(path);
+    }
+    fs::create_dir(path).with_context(|| {
+        format!(
+            "failed to create installation identity directory {}",
+            path.display()
+        )
+    })?;
+    set_directory_owner_only(path)?;
+    File::open(path)?.sync_all()?;
+    inspect_identity_directory(path)
+}
+
+fn inspect_identity_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect installation identity directory {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("installation identity path must be a non-symlink directory");
+    }
+    ensure_directory_owner_only(path)
+}
+
+fn migrate_legacy_identity(data_dir: &Path, identity_dir: &Path) -> Result<()> {
+    for name in [ED25519_SEED_FILE, X25519_SEED_FILE] {
+        let legacy = data_dir.join(name);
+        let target = identity_dir.join(name);
+        let legacy_exists = legacy.try_exists()?;
+        let target_exists = target.try_exists()?;
+        if legacy_exists && target_exists {
+            bail!("legacy and installation identity both contain {name}");
+        }
+        if legacy_exists {
+            let metadata = fs::symlink_metadata(&legacy)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("legacy installation identity is unsafe");
+            }
+            ensure_owner_only(&legacy)?;
+        }
+    }
+    for name in [ED25519_SEED_FILE, X25519_SEED_FILE] {
+        let legacy = data_dir.join(name);
+        if legacy.try_exists()? {
+            fs::rename(&legacy, identity_dir.join(name))
+                .with_context(|| format!("failed to move legacy installation identity {name}"))?;
+        }
+    }
+    File::open(identity_dir)?.sync_all()?;
+    File::open(data_dir)?.sync_all()?;
+    Ok(())
 }
 
 fn load_or_create_seed(path: &Path) -> Result<SecretSeed> {
@@ -1387,6 +1699,21 @@ fn set_directory_owner_only(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_directory_owner_only(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_directory_owner_only(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        bail!("{} must have permissions 0700", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_directory_owner_only(_path: &Path) -> Result<()> {
     Ok(())
 }
 

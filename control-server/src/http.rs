@@ -6,6 +6,7 @@ use crate::db::{
 use crate::desired::DesiredStateConfigurationDraft;
 use crate::error::{ApiError, REQUEST_ID_HEADER};
 use crate::protocol::RequestId;
+use crate::relay::{RelayProvisioner, RelayProvisioningError};
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
@@ -14,18 +15,22 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use control_protocol::account::{
-    encode_member_setup_code, AccountSummary, ConsumeDeviceActivationRequest, CreateAccountRequest,
+    encode_member_setup_code, AccountSummary, ConsumeAccountResetTokenRequest,
+    ConsumeAccountResetTokenResponse, ConsumeDeviceActivationRequest, CreateAccountRequest,
     CreateDeviceActivationRequest, CreateDeviceSessionResponse, CreateSessionRequest,
-    RefreshSessionRequest, RefreshSessionResponse, ReplaceAccountNodesRequest,
-    ResetAccountSessionsResponse, SetAccountPasswordRequest, SetAccountStatusRequest,
-    SignedProfileBundle,
+    IssueAccountResetTokenRequest, IssueAccountResetTokenResponse, RefreshSessionRequest,
+    RefreshSessionResponse, ReplaceAccountNodesRequest, ResetAccountSessionsResponse,
+    SetAccountPasswordRequest, SetAccountStatusRequest, SignedProfileBundle,
 };
-use control_protocol::id::{DeviceId, NodeId, Revision, Timestamp, UserId};
+use control_protocol::id::{DeviceId, NodeId, RelayGrantId, Revision, Timestamp, UserId};
 use control_protocol::idempotency::{IdempotencyKey, IDEMPOTENCY_KEY_HEADER};
 use control_protocol::node::{
     encode_node_setup_code, CreateNodeInvitationRequest, EnrollNodeRequest, EnrollNodeResponse,
-    NodeCapability, NodeHeartbeat, RevisionResult, SignedDesiredState, SignedNodeHeartbeatStatus,
+    NodeCapability, NodeHeartbeat, NodeRevisionFailureSummary, OperatorCohortRollbackRequest,
+    OperatorNodeRollbackRequest, OperatorRollbackResponse, RevisionResult, SignedDesiredState,
+    SignedNodeHeartbeatStatus,
 };
+use control_protocol::relay::{AcknowledgeRelayAssignmentRequest, EnsureRelayAssignmentRequest};
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
 use control_protocol::secret::Secret;
 use control_protocol::telemetry::{
@@ -50,6 +55,7 @@ pub struct AppState {
     bootstrap_token: BootstrapTokenVerifier,
     controller_origin: String,
     request_timeout: Duration,
+    relay: Option<RelayProvisioner>,
 }
 
 impl AppState {
@@ -65,10 +71,18 @@ impl AppState {
             bootstrap_token,
             controller_origin,
             request_timeout,
+            relay: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_relay(mut self, relay: RelayProvisioner) -> Self {
+        self.relay = Some(relay);
+        self
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/v1/admin/network", get(get_network))
@@ -95,6 +109,10 @@ pub fn build_router(state: AppState) -> Router {
             post(reset_account_sessions),
         )
         .route(
+            "/v1/admin/accounts/{user_id}/reset-tokens",
+            post(issue_account_reset_token),
+        )
+        .route(
             "/v1/admin/devices/{device_id}/revoke",
             post(revoke_member_device),
         )
@@ -102,6 +120,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/admin/nodes/{node_id}/approve", post(approve_node))
         .route("/v1/admin/nodes/{node_id}/disable", post(disable_node))
         .route("/v1/admin/nodes/{node_id}/revoke", post(revoke_node))
+        .route(
+            "/v1/admin/relay-grants/{grant_id}/revoke",
+            post(revoke_relay_grant),
+        )
         .route(
             "/v1/admin/nodes/{node_id}/protocol-canary/rotate",
             post(rotate_protocol_canary),
@@ -114,6 +136,8 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/admin/nodes/{node_id}/desired-state",
             post(publish_desired_state),
         )
+        .route("/v1/admin/nodes/{node_id}/rollback", post(rollback_node))
+        .route("/v1/admin/rollbacks", post(rollback_cohort))
         .route("/v1/admin/telemetry/usage", get(get_traffic_usage))
         .route(
             "/v1/admin/telemetry/retention/run",
@@ -124,6 +148,14 @@ pub fn build_router(state: AppState) -> Router {
     let authenticated_node_routes = Router::new()
         .route("/v1/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route("/v1/nodes/{node_id}/desired", get(fetch_desired_state))
+        .route(
+            "/v1/nodes/{node_id}/relay-assignment",
+            get(fetch_relay_assignment).post(ensure_relay_assignment),
+        )
+        .route(
+            "/v1/nodes/{node_id}/relay-assignment/acknowledge",
+            post(acknowledge_relay_assignment),
+        )
         .route(
             "/v1/nodes/{node_id}/revisions/{revision}/result",
             put(report_revision_result),
@@ -152,6 +184,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/v1/device-activations/consume",
             post(consume_device_activation),
+        )
+        .route(
+            "/v1/account-reset-tokens/consume",
+            post(consume_account_reset_token),
         )
         .route("/v1/sessions", post(create_member_session))
         .route("/v1/sessions/refresh", post(refresh_member_session))
@@ -292,6 +328,105 @@ async fn fetch_desired_state(
         Some(desired) => Json(desired).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
     })
+}
+
+async fn fetch_relay_assignment(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(authenticated): Extension<AuthenticatedNode>,
+) -> Result<Response, ApiError> {
+    require_matching_node(&path_node_id, authenticated.node_id, request_id)?;
+    let relay = relay_provisioner(&state, request_id)?;
+    relay
+        .reconcile()
+        .await
+        .map_err(|error| relay_api_error(error, request_id))?;
+    let assignment = state
+        .database
+        .relay_assignment(authenticated.node_id)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(assignment.map_or_else(
+        || StatusCode::NO_CONTENT.into_response(),
+        |value| Json(value).into_response(),
+    ))
+}
+
+async fn ensure_relay_assignment(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(authenticated): Extension<AuthenticatedNode>,
+    Extension(body): Extension<SignedBody>,
+) -> Result<Response, ApiError> {
+    require_matching_node(&path_node_id, authenticated.node_id, request_id)?;
+    let request: EnsureRelayAssignmentRequest =
+        serde_json::from_slice(&body.0).map_err(|_| ApiError::validation_failed(request_id))?;
+    request
+        .validate()
+        .map_err(|_| ApiError::validation_failed(request_id))?;
+    let relay = relay_provisioner(&state, request_id)?;
+    let assignment = relay
+        .ensure_assignment(authenticated.node_id, request)
+        .await
+        .map_err(|error| relay_api_error(error, request_id))?;
+    Ok(assignment.map_or_else(
+        || StatusCode::ACCEPTED.into_response(),
+        |value| Json(value).into_response(),
+    ))
+}
+
+async fn acknowledge_relay_assignment(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(authenticated): Extension<AuthenticatedNode>,
+    Extension(body): Extension<SignedBody>,
+) -> Result<StatusCode, ApiError> {
+    require_matching_node(&path_node_id, authenticated.node_id, request_id)?;
+    let acknowledgement: AcknowledgeRelayAssignmentRequest =
+        serde_json::from_slice(&body.0).map_err(|_| ApiError::validation_failed(request_id))?;
+    acknowledgement
+        .validate()
+        .map_err(|_| ApiError::validation_failed(request_id))?;
+    relay_provisioner(&state, request_id)?
+        .acknowledge_assignment(authenticated.node_id, acknowledgement)
+        .await
+        .map_err(|error| relay_api_error(error, request_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn revoke_relay_grant(
+    State(state): State<AppState>,
+    Path(path_grant_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<StatusCode, ApiError> {
+    let grant_id = path_grant_id
+        .parse::<RelayGrantId>()
+        .map_err(|_| ApiError::not_found(request_id))?;
+    relay_provisioner(&state, request_id)?
+        .revoke(grant_id)
+        .await
+        .map_err(|error| relay_api_error(error, request_id))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn relay_provisioner(
+    state: &AppState,
+    request_id: RequestId,
+) -> Result<RelayProvisioner, ApiError> {
+    state
+        .relay
+        .clone()
+        .ok_or_else(|| ApiError::not_found(request_id))
+}
+
+fn relay_api_error(error: RelayProvisioningError, request_id: RequestId) -> ApiError {
+    match error {
+        RelayProvisioningError::Database(error) => database_api_error(error, request_id),
+        _ => ApiError::internal(request_id),
+    }
 }
 
 fn parse_after_revision(query: Option<&str>) -> Option<i64> {
@@ -525,7 +660,8 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         | DatabaseError::TelemetryUserNotAssigned
         | DatabaseError::DetailedTelemetryDisabled
         | DatabaseError::TelemetryClockSkew
-        | DatabaseError::InvalidTelemetryQuery => ApiError::validation_failed(request_id),
+        | DatabaseError::InvalidTelemetryQuery
+        | DatabaseError::RelayNotEligible => ApiError::validation_failed(request_id),
         DatabaseError::InvitationInvalid => ApiError::invitation_invalid(request_id),
         DatabaseError::InvitationExpired => ApiError::invitation_expired(request_id),
         DatabaseError::InvitationConsumed => ApiError::invitation_consumed(request_id),
@@ -533,6 +669,9 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::ActivationInvalid => ApiError::activation_invalid(request_id),
         DatabaseError::ActivationExpired => ApiError::activation_expired(request_id),
         DatabaseError::ActivationConsumed => ApiError::activation_consumed(request_id),
+        DatabaseError::AccountResetTokenInvalid => ApiError::account_reset_invalid(request_id),
+        DatabaseError::AccountResetTokenExpired => ApiError::account_reset_expired(request_id),
+        DatabaseError::AccountResetTokenConsumed => ApiError::account_reset_consumed(request_id),
         DatabaseError::InvalidEnrollmentProof | DatabaseError::InvalidNodeRequestSignature => {
             ApiError::signature_invalid(request_id)
         }
@@ -560,15 +699,24 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         DatabaseError::NodeNotFound
         | DatabaseError::RevisionTargetNotFound
         | DatabaseError::AccountNotFound
-        | DatabaseError::DeviceNotFound => ApiError::not_found(request_id),
+        | DatabaseError::DeviceNotFound
+        | DatabaseError::RelayGrantNotFound => ApiError::not_found(request_id),
         DatabaseError::InvalidDeviceProof => ApiError::signature_invalid(request_id),
         DatabaseError::IdempotencyKeyConflict => ApiError::idempotency_key_conflict(request_id),
         DatabaseError::RevisionResultConflict => ApiError::invalid_state_transition(request_id),
+        DatabaseError::RollbackTargetInvalid => ApiError::rollback_target_invalid(request_id),
+        DatabaseError::RollbackTargetIncompatible => {
+            ApiError::rollback_target_incompatible(request_id)
+        }
         DatabaseError::NodeLifecycleConflict { .. }
         | DatabaseError::AccountLifecycleConflict { .. }
         | DatabaseError::NodeUnavailableForAssignment { .. }
         | DatabaseError::AccountAssignmentConflict { .. }
-        | DatabaseError::NodeConfigurationMissing => ApiError::conflict(request_id),
+        | DatabaseError::NodeConfigurationMissing
+        | DatabaseError::RelayPortExhausted
+        | DatabaseError::RelayGrantNotPending
+        | DatabaseError::RelayAcknowledgementConflict
+        | DatabaseError::RelayGrantMismatch => ApiError::conflict(request_id),
         other => {
             tracing::error!(request_id = %request_id, error = %other, "database request failed");
             ApiError::internal(request_id)
@@ -705,6 +853,7 @@ struct NodeSummaryResponse {
     runtime_state: Option<String>,
     provider_paused: bool,
     revisions: NodeRevisionResponse,
+    last_failure: Option<NodeRevisionFailureSummary>,
     telemetry_cursor: i64,
     created_at: String,
     updated_at: String,
@@ -763,6 +912,7 @@ impl TryFrom<NodeSummaryRecord> for NodeSummaryResponse {
                 validated: record.validated_revision,
                 applied: record.applied_revision,
             },
+            last_failure: record.last_failure,
             telemetry_cursor: record.telemetry_cursor,
             created_at: format_timestamp(record.created_at)?,
             updated_at: format_timestamp(record.updated_at)?,
@@ -975,6 +1125,23 @@ async fn reset_account_sessions(
         .map_err(|error| database_api_error(error, request_id))
 }
 
+async fn issue_account_reset_token(
+    State(state): State<AppState>,
+    Path(path_user_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(StatusCode, Json<IssueAccountResetTokenResponse>), ApiError> {
+    let user_id = parse_user_id(&path_user_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
+    let request: IssueAccountResetTokenRequest = parse_bounded_json(request, request_id).await?;
+    let response = state
+        .database
+        .issue_account_reset_token(user_id, request, idempotency_key)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
 async fn revoke_member_device(
     State(state): State<AppState>,
     Path(path_device_id): Path<String>,
@@ -1002,6 +1169,21 @@ async fn consume_device_activation(
         .await
         .map_err(|error| database_api_error(error, request_id))?;
     Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn consume_account_reset_token(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<Json<ConsumeAccountResetTokenResponse>, ApiError> {
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
+    let request: ConsumeAccountResetTokenRequest = parse_bounded_json(request, request_id).await?;
+    state
+        .database
+        .consume_account_reset_token(request, idempotency_key)
+        .await
+        .map(Json)
+        .map_err(|error| database_api_error(error, request_id))
 }
 
 async fn create_member_session(
@@ -1099,6 +1281,38 @@ async fn publish_desired_state(
         .await
         .map_err(|error| database_api_error(error, request_id))?;
     let response = DesiredStatePublicationResponse::from_desired(&desired, true);
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn rollback_node(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(StatusCode, Json<OperatorRollbackResponse>), ApiError> {
+    let node_id = parse_node_id(&path_node_id).ok_or_else(|| ApiError::not_found(request_id))?;
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
+    let request: OperatorNodeRollbackRequest = parse_bounded_json(request, request_id).await?;
+    let response = state
+        .database
+        .rollback_node(node_id, request, idempotency_key)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn rollback_cohort(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    request: Request,
+) -> Result<(StatusCode, Json<OperatorRollbackResponse>), ApiError> {
+    let idempotency_key = parse_idempotency_key(request.headers(), request_id)?;
+    let request: OperatorCohortRollbackRequest = parse_bounded_json(request, request_id).await?;
+    let response = state
+        .database
+        .rollback_cohort(request, idempotency_key)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
     Ok((StatusCode::CREATED, Json(response)))
 }
 

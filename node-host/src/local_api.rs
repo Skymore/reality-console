@@ -1,5 +1,6 @@
 use crate::{
-    HostStatus, RelayAssignmentState, RelayAssignmentStatus, RelayRuntimeState, RouterMappingStatus,
+    AdmissionCounters, HostStatus, ProviderPolicyStatus, RelayAssignmentState,
+    RelayAssignmentStatus, RelayRuntimeState, RouterMappingStatus,
 };
 use anyhow::{Context as _, Result};
 #[cfg(target_os = "macos")]
@@ -14,7 +15,7 @@ use std::path::Path;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub(crate) const LOCAL_API_SCHEMA_VERSION: u16 = 3;
+pub(crate) const LOCAL_API_SCHEMA_VERSION: u16 = 4;
 #[cfg(target_os = "macos")]
 pub(crate) const LOCAL_API_REQUEST_MAX_BYTES: usize = 4 * 1024;
 #[cfg(target_os = "macos")]
@@ -202,6 +203,10 @@ pub struct LocalServiceStatus {
     pub xray_configured: bool,
     /// Current provider-owned router mapping state.
     pub router_mapping: RouterMappingStatus,
+    /// Provider-local policy, usage lower bound, and redacted manual endpoint state.
+    pub provider_policy: ProviderPolicyStatus,
+    /// Bounded counters for the current or most recent admission-gate lifetime.
+    pub admission: AdmissionCounters,
     /// Current safe relay assignment metadata.
     pub relay_assignment: RelayAssignmentStatus,
     /// Live relay connector lifecycle owned by this service process.
@@ -259,6 +264,7 @@ impl LocalServiceStatus {
         phase: LocalServicePhase,
         runtime_state: NodeRuntimeState,
         relay_runtime: RelayRuntimeState,
+        admission: AdmissionCounters,
         last_error: Option<LocalServiceError>,
     ) -> Result<Self> {
         let status = Self {
@@ -277,7 +283,9 @@ impl LocalServiceStatus {
             applied_revision: host.applied_revision,
             activation_phase: host.xray_activation_phase.clone(),
             xray_configured: host.xray_configured,
-            router_mapping: host.router_mapping.clone(),
+            router_mapping: redacted_mapping_status(&host.router_mapping),
+            provider_policy: host.provider_policy.clone(),
+            admission,
             relay_assignment: host.relay.clone(),
             relay_runtime,
             last_error,
@@ -296,6 +304,7 @@ impl LocalServiceStatus {
         if self.service_instance_id.is_nil() {
             anyhow::bail!("local service instance identity cannot be nil");
         }
+        self.provider_policy.validate()?;
         if let Some(controller_status) = &self.controller_status {
             controller_status
                 .validate_for(
@@ -358,6 +367,12 @@ impl LocalServiceStatus {
         }
         Ok(())
     }
+}
+
+fn redacted_mapping_status(status: &RouterMappingStatus) -> RouterMappingStatus {
+    let mut redacted = status.clone();
+    redacted.external_address = None;
+    redacted
 }
 
 /// Safe provider-facing setup status returned by the desktop backend.

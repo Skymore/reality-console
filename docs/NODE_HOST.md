@@ -133,19 +133,21 @@ reachability probe are data-plane surfaces and do not violate the outbound-only 
 
 ### 5.3 Current Executable Operations Slice
 
-Node Host migrations 13-15 implement the bounded telemetry spool, owner-managed relay assignment,
-and Xray Stats normalization described below. The managed service queries the checksum-verified
+Node Host migrations 13-17 implement the bounded telemetry spool, relay compatibility state,
+Xray Stats normalization, provider hard limits, and installation-bound identity described below.
+The managed service queries the checksum-verified
 Xray binary through a loopback-only Stats API, turns cumulative per-user counters into restart-safe
 deltas, and never fabricates connection counts. Upload resumes from the controller cursor after an
 outage.
 
-Relay configuration is an explicit provider action. `configure-relay` validates an owner-only
-assignment and mTLS material, copies secrets into a private generation, and records consent before
-the service can connect. The connector multiplexes only to the active loopback admission gate; an
-assignment cannot name an arbitrary local target. Heartbeat advertises the relay endpoint only
-while the connector is registered. Control then applies the same external TCP and VLESS/REALITY
-canary required for direct publication. `revoke-relay` requires the exact endpoint ID, retires the
-assignment, and removes its local credential generation.
+Relay use is an explicit provider setup choice, but assignment is automatic. With consent present,
+the service fetches or ensures a controller-signed assignment, verifies its pinned controller and
+node/network binding, decrypts it with the installation X25519 identity, and atomically installs an
+owner-only generation. N remains connected while N+1 is validated and registered; only then does
+the node acknowledge N+1 and allow Control to revoke N. The connector can target only the active
+loopback admission gate. Heartbeat rechecks durable assignment state and advertises only a current,
+unexpired, registered generation. `configure-relay` and `revoke-relay` remain explicit manual
+development/recovery compatibility commands, not the provider journey.
 
 The dedicated `node-host-app/` and system-service package assets exist, but signed/notarized
 clean-machine installation is still governed by `docs/RELEASE_ACCEPTANCE.md`; a local unsigned
@@ -534,7 +536,7 @@ urgent signed removal is processed before ordinary later snapshots.
 ### 9.1 Binary Supply And Validation
 
 - Agent releases pin an approved Xray version and SHA-256 checksum per OS/architecture.
-- Release packaging embeds Xray or downloads it only from the signed Reality Node update manifest,
+- Release packaging embeds Xray or downloads it only from the signed Private Network Node update manifest,
   verifies checksum and publisher signature, and stages it without executing from a temporary
   user-writable path.
 - The controller may require a minimum approved version but cannot provide an arbitrary binary or
@@ -898,13 +900,14 @@ claiming logout-independent or unattended operation.
 
 - Distribute a notarized universal `.pkg` containing a signed app for setup/status and a signed
   agent/Xray payload.
-- Install the agent under `/Library/Application Support/Reality Node/` and register a root-owned
+- Install the agent under `/Library/Application Support/Private Network Node/` and register a root-owned
   `LaunchDaemon`. The UI remains in `/Applications` and communicates through a root-owned Unix
   socket.
-- Run Xray as a dedicated `_realitynode` user where installer support permits. The agent retains
+- Run Xray as the dedicated `_privnetnode` user. The agent retains
   only privileges required to manage that child and approved firewall/service state.
 - Store node private credentials in the System Keychain with service-only ACLs. Store SQLite and
-  logs under `/Library/Application Support/Reality Node/` and `/Library/Logs/Reality Node/` with
+  logs under `/Library/Application Support/Private Network Node/` and
+  `/Library/Logs/Private Network Node/` with
   restrictive ownership.
 - Use a signed privileged helper or installer-managed rules for firewall changes; never invoke an
   arbitrary command supplied by the UI.
@@ -914,8 +917,8 @@ claiming logout-independent or unattended operation.
 
 - Distribute a signed x64/arm64 MSI or signed bootstrapper with explicit install scope and upgrade
   code.
-- Install under `%ProgramFiles%\Reality Node\`; store mutable state under
-  `%ProgramData%\Reality Node\`.
+- Install under `%ProgramFiles%\Private Network Node\`; store mutable state under
+  `%ProgramData%\Private Network Node\`.
 - Register `RealityNodeAgent` with the Service Control Manager using a virtual service account or
   least-privilege dedicated account. Do not run the status UI as `LocalSystem`.
 - Protect private keys with machine-scope DPAPI and ACL them to the service SID and

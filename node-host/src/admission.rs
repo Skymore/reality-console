@@ -1,11 +1,12 @@
 use anyhow::{bail, Context as _, Result};
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::copy_bidirectional;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{oneshot, Mutex, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout, Instant};
 
@@ -18,9 +19,10 @@ const MAX_CONNECTIONS: usize = 4_096;
 const MAX_GATE_DELAY: Duration = Duration::from_secs(60);
 const LISTEN_BACKLOG: u32 = 128;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdmissionOptions {
     pub max_connections: usize,
+    pub bandwidth_limit_bps: Option<u64>,
     pub connect_timeout: Duration,
     pub canary_timeout: Duration,
     pub probe_interval: Duration,
@@ -31,6 +33,7 @@ impl Default for AdmissionOptions {
     fn default() -> Self {
         Self {
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            bandwidth_limit_bps: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             canary_timeout: DEFAULT_CANARY_TIMEOUT,
             probe_interval: DEFAULT_PROBE_INTERVAL,
@@ -43,6 +46,9 @@ impl AdmissionOptions {
     pub(crate) fn validate(self) -> Result<Self> {
         if self.max_connections == 0 || self.max_connections > MAX_CONNECTIONS {
             bail!("admission connection limit must be between 1 and {MAX_CONNECTIONS}");
+        }
+        if self.bandwidth_limit_bps.is_some_and(|value| value < 8_000) {
+            bail!("admission bandwidth limit must be at least 8000 bits per second");
         }
         for (name, value) in [
             ("connect timeout", self.connect_timeout),
@@ -61,12 +67,49 @@ impl AdmissionOptions {
     }
 }
 
+/// Bounded process-local admission counters. Byte counters are exact for bytes
+/// copied by this gate lifetime, but are not presented as durable quota usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionCounters {
+    pub active_sessions: u64,
+    pub accepted_sessions: u64,
+    pub rejected_session_limit: u64,
+    pub throttled_chunks: u64,
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+}
+
+#[derive(Debug, Default)]
+struct SharedCounters {
+    active_sessions: AtomicU64,
+    accepted_sessions: AtomicU64,
+    rejected_session_limit: AtomicU64,
+    throttled_chunks: AtomicU64,
+    bytes_up: AtomicU64,
+    bytes_down: AtomicU64,
+}
+
+impl SharedCounters {
+    fn snapshot(&self) -> AdmissionCounters {
+        AdmissionCounters {
+            active_sessions: self.active_sessions.load(Ordering::Acquire),
+            accepted_sessions: self.accepted_sessions.load(Ordering::Acquire),
+            rejected_session_limit: self.rejected_session_limit.load(Ordering::Acquire),
+            throttled_chunks: self.throttled_chunks.load(Ordering::Acquire),
+            bytes_up: self.bytes_up.load(Ordering::Acquire),
+            bytes_down: self.bytes_down.load(Ordering::Acquire),
+        }
+    }
+}
+
 /// Owns the byte-transparent public TCP listener for one applied revision.
 #[derive(Debug)]
 pub(crate) struct AdmissionGate {
     public_port: u16,
     backend: SocketAddr,
     successful_loopback_connections: Arc<AtomicU64>,
+    counters: Arc<SharedCounters>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<()>>>,
     options: AdmissionOptions,
@@ -99,18 +142,21 @@ impl AdmissionGate {
             .context("public admission socket could not begin listening")?;
         let backend = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port);
         let successful_loopback_connections = Arc::new(AtomicU64::new(0));
+        let counters = Arc::new(SharedCounters::default());
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let task = tokio::spawn(run_gate(
             listener,
             backend,
             options,
             Arc::clone(&successful_loopback_connections),
+            Arc::clone(&counters),
             shutdown_receiver,
         ));
         Ok(Self {
             public_port,
             backend,
             successful_loopback_connections,
+            counters,
             shutdown: Some(shutdown),
             task: Some(task),
             options,
@@ -119,6 +165,10 @@ impl AdmissionGate {
 
     pub(crate) fn is_running(&self) -> bool {
         self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    pub(crate) fn counters(&self) -> AdmissionCounters {
+        self.counters.snapshot()
     }
 
     /// Checks the active loopback backend without consuming a provider stream
@@ -195,9 +245,11 @@ async fn run_gate(
     backend: SocketAddr,
     options: AdmissionOptions,
     successful_loopback_connections: Arc<AtomicU64>,
+    counters: Arc<SharedCounters>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     let permits = Arc::new(Semaphore::new(options.max_connections));
+    let limiter = Arc::new(BandwidthLimiter::new(options.bandwidth_limit_bps));
     let mut connections = JoinSet::new();
 
     loop {
@@ -211,14 +263,20 @@ async fn run_gate(
                 match accepted {
                     Ok((client, peer)) => {
                         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                            saturating_increment(&counters.rejected_session_limit, 1);
                             tracing::debug!(peer = %peer, "admission connection limit reached");
                             continue;
                         };
                         let successes = Arc::clone(&successful_loopback_connections);
+                        let counters = Arc::clone(&counters);
+                        let limiter = Arc::clone(&limiter);
                         connections.spawn(async move {
                             let _permit = permit;
+                            saturating_increment(&counters.accepted_sessions, 1);
+                            saturating_increment(&counters.active_sessions, 1);
+                            let _active = ActiveSessionGuard(&counters.active_sessions);
                             client.set_nodelay(true).context("admission client socket setup failed")?;
-                            let mut backend_stream = timeout(
+                            let backend_stream = timeout(
                                 options.connect_timeout,
                                 TcpStream::connect(backend),
                             )
@@ -231,10 +289,24 @@ async fn run_gate(
                             if peer.ip().is_loopback() {
                                 successes.fetch_add(1, Ordering::Release);
                             }
-                            let mut client = client;
-                            copy_bidirectional(&mut client, &mut backend_stream)
-                                .await
-                                .context("admission byte stream failed")?;
+                            let (client_read, client_write) = client.into_split();
+                            let (backend_read, backend_write) = backend_stream.into_split();
+                            tokio::try_join!(
+                                transfer(
+                                    client_read,
+                                    backend_write,
+                                    Arc::clone(&limiter),
+                                    &counters.bytes_up,
+                                    &counters.throttled_chunks,
+                                ),
+                                transfer(
+                                    backend_read,
+                                    client_write,
+                                    Arc::clone(&limiter),
+                                    &counters.bytes_down,
+                                    &counters.throttled_chunks,
+                                )
+                            )?;
                             Ok::<(), anyhow::Error>(())
                         });
                     }
@@ -263,6 +335,87 @@ async fn run_gate(
     Ok(())
 }
 
+struct ActiveSessionGuard<'a>(&'a AtomicU64);
+
+impl Drop for ActiveSessionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+struct BandwidthLimiter {
+    bytes_per_second: Option<u64>,
+    bucket: Mutex<TokenBucket>,
+}
+
+#[derive(Debug)]
+struct TokenBucket {
+    next_available: Instant,
+}
+
+impl BandwidthLimiter {
+    fn new(bits_per_second: Option<u64>) -> Self {
+        let bytes_per_second = bits_per_second.map(|value| value / 8);
+        Self {
+            bytes_per_second,
+            bucket: Mutex::new(TokenBucket {
+                next_available: Instant::now(),
+            }),
+        }
+    }
+
+    async fn acquire(&self, bytes: usize, throttled: &AtomicU64) {
+        let Some(rate) = self.bytes_per_second else {
+            return;
+        };
+        let wait = {
+            let mut bucket = self.bucket.lock().await;
+            let now = Instant::now();
+            let start = bucket.next_available.max(now);
+            let numerator = (bytes as u128) * 1_000_000_000_u128;
+            let nanos = numerator.div_ceil(u128::from(rate));
+            let transfer_time = Duration::from_nanos(
+                u64::try_from(nanos).expect("bounded admission chunks fit duration nanoseconds"),
+            );
+            bucket.next_available = start + transfer_time;
+            bucket.next_available.duration_since(now)
+        };
+        saturating_increment(throttled, 1);
+        sleep(wait).await;
+    }
+}
+
+async fn transfer<R, W>(
+    mut reader: R,
+    mut writer: W,
+    limiter: Arc<BandwidthLimiter>,
+    bytes_counter: &AtomicU64,
+    throttled_counter: &AtomicU64,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            writer.shutdown().await?;
+            return Ok(());
+        }
+        limiter.acquire(count, throttled_counter).await;
+        writer.write_all(&buffer[..count]).await?;
+        saturating_increment(bytes_counter, count as u64);
+    }
+}
+
+fn saturating_increment(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        Some(value.saturating_add(amount))
+    });
+}
+
 fn log_connection_result(result: std::result::Result<Result<()>, tokio::task::JoinError>) {
     match result {
         Ok(Ok(())) => {}
@@ -285,6 +438,7 @@ mod tests {
     fn fast_options() -> AdmissionOptions {
         AdmissionOptions {
             max_connections: 2,
+            bandwidth_limit_bps: None,
             connect_timeout: Duration::from_millis(100),
             canary_timeout: Duration::from_millis(200),
             probe_interval: Duration::from_millis(5),
@@ -410,6 +564,10 @@ mod tests {
                 .await
                 .is_err()
         );
+        let limited = gate.counters();
+        assert_eq!(limited.active_sessions, 1);
+        assert!(limited.accepted_sessions >= 1);
+        assert!(limited.rejected_session_limit >= 1);
 
         drop(first_client);
         drop(first_backend);
@@ -424,6 +582,41 @@ mod tests {
         drop(third_client);
         drop(third_backend);
         gate.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aggregate_bandwidth_limit_throttles_and_counts_forwarded_bytes() {
+        let _network_test_lock = lock_network_tests().await;
+        let backend = bind_unique_loopback().await;
+        let backend_port = backend.local_addr().unwrap().port();
+        let backend_task = tokio::spawn(async move {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            let mut bytes = vec![0_u8; 1024];
+            stream.read_exact(&mut bytes).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+        });
+        let public_port = unique_unused_port().await;
+        let mut options = fast_options();
+        options.bandwidth_limit_bps = Some(8_000);
+        let mut gate = AdmissionGate::start(public_port, backend_port, options).unwrap();
+        let started = tokio::time::Instant::now();
+        let mut client = TcpStream::connect(("127.0.0.1", public_port))
+            .await
+            .unwrap();
+        client.write_all(&vec![7_u8; 1024]).await.unwrap();
+        let mut echoed = vec![0_u8; 1024];
+        tokio::time::timeout(Duration::from_secs(4), client.read_exact(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(1900));
+        assert_eq!(echoed, vec![7_u8; 1024]);
+        let counters = gate.counters();
+        assert!(counters.throttled_chunks >= 2);
+        assert_eq!(counters.bytes_up, 1024);
+        assert_eq!(counters.bytes_down, 1024);
+        gate.shutdown().await.unwrap();
+        backend_task.await.unwrap();
     }
 
     #[test]

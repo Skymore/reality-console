@@ -12,6 +12,7 @@ pub mod operations;
 pub mod probe;
 pub mod protocol;
 pub mod protocol_canary;
+pub mod relay;
 
 pub use config::ServiceConfig;
 pub use db::Database;

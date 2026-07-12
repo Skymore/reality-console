@@ -15,13 +15,14 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use control_protocol::account::{
     AccountMetadata, AccountNodeAssignment, AccountNodeAssignmentStatus,
-    AccountNodeProvisioningState, AccountStatus, AccountSummary, ConsumeDeviceActivationRequest,
-    CreateAccountRequest, CreateDeviceActivationRequest, CreateDeviceSessionResponse,
-    CreateSessionRequest, DeviceEnrollment, EncryptedProfilePayload, MemberSetupActivation,
-    NodeProfile, ProfileBundleManifest, ProfileDescriptor, ProfileEndpoint,
-    RealityConnectionParameters, RefreshSessionRequest, RefreshSessionResponse,
-    ReplaceAccountNodesRequest, ResetAccountSessionsResponse, SelectionHints, SessionCredentials,
-    SetAccountPasswordRequest, SignedProfileBundle,
+    AccountNodeProvisioningState, AccountStatus, AccountSummary, ConsumeAccountResetTokenRequest,
+    ConsumeAccountResetTokenResponse, ConsumeDeviceActivationRequest, CreateAccountRequest,
+    CreateDeviceActivationRequest, CreateDeviceSessionResponse, CreateSessionRequest,
+    DeviceEnrollment, EncryptedProfilePayload, IssueAccountResetTokenRequest,
+    IssueAccountResetTokenResponse, MemberSetupActivation, NodeProfile, ProfileBundleManifest,
+    ProfileDescriptor, ProfileEndpoint, RealityConnectionParameters, RefreshSessionRequest,
+    RefreshSessionResponse, ReplaceAccountNodesRequest, ResetAccountSessionsResponse,
+    SelectionHints, SessionCredentials, SetAccountPasswordRequest, SignedProfileBundle,
 };
 use control_protocol::account_crypto::{
     device_activation_proof_transcript, device_login_proof_transcript, encrypt_profile,
@@ -36,17 +37,24 @@ use control_protocol::enrollment::{
 use control_protocol::id::{
     AssignmentId, BundleGeneration, BundleId, ControllerInstanceId, CredentialId,
     DeviceActivationId, DeviceId, EndpointId, NetworkId, NodeId, NodeInvitationId, NodeKeyId,
-    Revision, SequenceNumber, SessionId, SigningKeyId, Timestamp, UserId,
+    RelayGeneration, RelayGrantId, RelayRouteId, Revision, SequenceNumber, SessionId, SigningKeyId,
+    Timestamp, UserId,
 };
 use control_protocol::idempotency::IdempotencyKey;
 use control_protocol::node::{
     CreateNodeInvitationRequest, CreateNodeInvitationResponse, DesiredUser, EndpointCandidate,
     EndpointMode, EndpointReadiness, EnrollNodeRequest, EnrollNodeResponse, NodeAuthenticationMode,
     NodeCapability, NodeCredential, NodeEndpointStatus, NodeHeartbeat, NodeHeartbeatStatus,
-    NodeInitialConfiguration, NodeLifecycleState, PairingPurpose, RevisionResult,
-    RevisionResultState, SignedDesiredState, SignedNodeHeartbeatStatus,
+    NodeInitialConfiguration, NodeLifecycleState, NodeRevisionFailureSummary,
+    OperatorCohortRollbackRequest, OperatorNodeRollbackRequest, OperatorRollbackPublication,
+    OperatorRollbackReason, OperatorRollbackResponse, OperatorRollbackTarget, PairingPurpose,
+    RevisionResult, RevisionResultState, SignedDesiredState, SignedNodeHeartbeatStatus,
 };
 use control_protocol::node_status::node_heartbeat_status_transcript;
+use control_protocol::relay::{
+    AcknowledgeRelayAssignmentRequest, RelayAssignmentHeader, SignedRelayAssignment,
+    SignedRelayRoute,
+};
 use control_protocol::request_auth::{
     verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
 };
@@ -72,17 +80,20 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 15;
 pub(crate) const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
 const IDEMPOTENCY_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
 const BOOTSTRAP_ADMIN_PRINCIPAL: &str = "bootstrap-admin";
 const CREATE_ACCOUNT_ROUTE_ID: &str = "v1.admin.accounts.create";
+const NODE_ROLLBACK_ROUTE_ID: &str = "v1.admin.nodes.rollback";
+const COHORT_ROLLBACK_ROUTE_ID: &str = "v1.admin.rollbacks.create";
 const NODE_INVITATION_SECRET_DOMAIN: &[u8] = b"private-network/node-invitation-secret/v1\0";
 const HTTP_CREATED_STATUS: i64 = 201;
 const NODE_REQUEST_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 const ACTIVATION_SECRET_DOMAIN: &[u8] = b"private-network/device-activation-secret/v1\0";
+const ACCOUNT_RESET_SECRET_DOMAIN: &[u8] = b"private-network/account-reset-secret/v1\0";
 const ACCESS_TOKEN_DOMAIN: &[u8] = b"private-network/member-access-token/v1\0";
 const REFRESH_TOKEN_DOMAIN: &[u8] = b"private-network/member-refresh-token/v1\0";
 const LOGIN_REQUEST_DOMAIN: &[u8] = b"private-network/member-login-request/v1\0";
@@ -1199,6 +1210,95 @@ BEGIN
 END;
 ";
 
+const MIGRATION_14_SQL: &str = r"
+CREATE TABLE account_reset_tokens (
+    network_id TEXT NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+    token_id TEXT NOT NULL CHECK(length(token_id) = 36),
+    user_id TEXT NOT NULL,
+    secret_verifier BLOB NOT NULL CHECK(length(secret_verifier) = 32),
+    issue_idempotency_key_sha256 BLOB NOT NULL CHECK(length(issue_idempotency_key_sha256) = 32),
+    issue_request_sha256 BLOB NOT NULL CHECK(length(issue_request_sha256) = 32),
+    expires_at INTEGER NOT NULL,
+    consumed_at INTEGER,
+    consume_idempotency_key_sha256 BLOB
+        CHECK(consume_idempotency_key_sha256 IS NULL OR length(consume_idempotency_key_sha256) = 32),
+    consume_request_sha256 BLOB
+        CHECK(consume_request_sha256 IS NULL OR length(consume_request_sha256) = 32),
+    consume_response_json TEXT CHECK(
+        consume_response_json IS NULL
+        OR (json_valid(consume_response_json) AND length(consume_response_json) <= 65536)
+    ),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, token_id),
+    UNIQUE(network_id, secret_verifier),
+    UNIQUE(network_id, user_id, issue_idempotency_key_sha256),
+    FOREIGN KEY(network_id, user_id) REFERENCES users(network_id, user_id) ON DELETE RESTRICT,
+    CHECK(expires_at > created_at),
+    CHECK(
+        (consumed_at IS NULL AND consume_idempotency_key_sha256 IS NULL
+            AND consume_request_sha256 IS NULL AND consume_response_json IS NULL)
+        OR (consumed_at IS NOT NULL AND consume_idempotency_key_sha256 IS NOT NULL
+            AND consume_request_sha256 IS NOT NULL AND consume_response_json IS NOT NULL)
+    )
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX account_reset_tokens_expiry
+    ON account_reset_tokens(network_id, expires_at) WHERE consumed_at IS NULL;
+";
+
+const MIGRATION_15_SQL: &str = r"
+CREATE TABLE relay_routes (
+    network_id TEXT NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL,
+    route_id TEXT NOT NULL CHECK(length(route_id) = 36),
+    endpoint_id TEXT NOT NULL CHECK(length(endpoint_id) = 36),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id),
+    UNIQUE(network_id, route_id),
+    FOREIGN KEY(network_id, node_id) REFERENCES nodes(network_id, node_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE relay_grants (
+    network_id TEXT NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+    grant_id TEXT NOT NULL CHECK(length(grant_id) = 36),
+    node_id TEXT NOT NULL,
+    route_id TEXT NOT NULL CHECK(length(route_id) = 36),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    public_port INTEGER NOT NULL CHECK(public_port BETWEEN 1 AND 65535),
+    state TEXT NOT NULL CHECK(state IN ('pending', 'published', 'revoking', 'revoked', 'expired')),
+    header_json TEXT NOT NULL CHECK(json_valid(header_json) AND length(header_json) <= 16384),
+    assignment_json TEXT NOT NULL CHECK(json_valid(assignment_json) AND length(assignment_json) <= 262144),
+    route_json TEXT NOT NULL CHECK(json_valid(route_json) AND length(route_json) <= 65536),
+    route_sha256 TEXT NOT NULL CHECK(length(route_sha256) = 71),
+    issued_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    published_at INTEGER,
+    revoked_at INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, grant_id),
+    UNIQUE(network_id, route_id, generation),
+    FOREIGN KEY(network_id, node_id) REFERENCES nodes(network_id, node_id) ON DELETE CASCADE,
+    FOREIGN KEY(network_id, node_id) REFERENCES relay_routes(network_id, node_id) ON DELETE CASCADE,
+    CHECK(expires_at > issued_at)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX relay_grants_current_node ON relay_grants(network_id, node_id, state, expires_at DESC);
+CREATE INDEX relay_grants_port ON relay_grants(network_id, public_port) WHERE state IN ('pending', 'published', 'revoking');
+
+CREATE TABLE relay_outbox (
+    network_id TEXT NOT NULL REFERENCES networks(network_id) ON DELETE CASCADE,
+    grant_id TEXT NOT NULL CHECK(length(grant_id) = 36),
+    action TEXT NOT NULL CHECK(action IN ('publish', 'revoke')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    next_attempt_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, grant_id, action),
+    FOREIGN KEY(network_id, grant_id) REFERENCES relay_grants(network_id, grant_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE INDEX relay_outbox_due ON relay_outbox(completed_at, next_attempt_at);
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -1271,6 +1371,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "protocol_canary_and_telemetry",
         sql: MIGRATION_13_SQL,
     },
+    Migration {
+        version: 14,
+        name: "account_reset_tokens",
+        sql: MIGRATION_14_SQL,
+    },
+    Migration {
+        version: 15,
+        name: "relay_provisioning_outbox",
+        sql: MIGRATION_15_SQL,
+    },
 ];
 
 #[derive(Clone)]
@@ -1332,6 +1442,26 @@ pub struct StoredProfileBundle {
     pub etag: String,
 }
 
+/// Non-secret facts needed to issue one node-encrypted relay grant.
+#[derive(Clone, Debug)]
+pub struct RelayGrantDraft {
+    pub header: RelayAssignmentHeader,
+    pub recipient_encryption_key: control_protocol::crypto::X25519PublicKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct RelayOutboxJob {
+    pub grant_id: RelayGrantId,
+    pub action: RelayOutboxAction,
+    pub route: Option<SignedRelayRoute>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayOutboxAction {
+    Publish,
+    Revoke,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeProviderConsentRecord {
     pub policy_version: String,
@@ -1361,6 +1491,7 @@ pub struct NodeSummaryRecord {
     pub received_revision: Option<i64>,
     pub validated_revision: Option<i64>,
     pub applied_revision: Option<i64>,
+    pub last_failure: Option<NodeRevisionFailureSummary>,
     pub telemetry_cursor: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -1502,6 +1633,60 @@ impl Database {
                 user_id,
                 &request,
                 &controller_origin,
+                &idempotency_key,
+            )
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Creates or exactly replays one short-lived account reset token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid lifecycle, idempotency conflict, clock, or storage failure.
+    pub async fn issue_account_reset_token(
+        &self,
+        user_id: UserId,
+        request: IssueAccountResetTokenRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<IssueAccountResetTokenResponse, DatabaseError> {
+        request.validate()?;
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            issue_account_reset_token(
+                &mut guard.connection,
+                &identity,
+                user_id,
+                &request,
+                &idempotency_key,
+            )
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Consumes or exactly replays one account reset token and replaces the password.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid, expired, consumed, conflicting, or unavailable recovery state.
+    pub async fn consume_account_reset_token(
+        &self,
+        request: ConsumeAccountResetTokenRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<ConsumeAccountResetTokenResponse, DatabaseError> {
+        request.validate()?;
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            consume_account_reset_token(
+                &mut guard.connection,
+                &identity,
+                &request,
                 &idempotency_key,
             )
         })
@@ -1996,6 +2181,77 @@ impl Database {
         .map_err(DatabaseError::Worker)?
     }
 
+    /// Publishes a newly signed rollback revision for one explicit node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source/failure evidence, compatibility, idempotency, or storage
+    /// transaction is invalid.
+    pub(crate) async fn rollback_node(
+        &self,
+        node_id: NodeId,
+        request: OperatorNodeRollbackRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<OperatorRollbackResponse, DatabaseError> {
+        request.validate()?;
+        let target = OperatorRollbackTarget {
+            node_id,
+            source_revision: request.source_revision,
+            failed_revision: request.failed_revision,
+        };
+        self.rollback_targets(
+            vec![target],
+            request.reason,
+            idempotency_key,
+            NODE_ROLLBACK_ROUTE_ID,
+        )
+        .await
+    }
+
+    /// Publishes newly signed rollback revisions for an explicit affected cohort.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before publication if any cohort member is invalid or incompatible.
+    pub(crate) async fn rollback_cohort(
+        &self,
+        request: OperatorCohortRollbackRequest,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<OperatorRollbackResponse, DatabaseError> {
+        request.validate()?;
+        self.rollback_targets(
+            request.targets,
+            request.reason,
+            idempotency_key,
+            COHORT_ROLLBACK_ROUTE_ID,
+        )
+        .await
+    }
+
+    async fn rollback_targets(
+        &self,
+        targets: Vec<OperatorRollbackTarget>,
+        reason: OperatorRollbackReason,
+        idempotency_key: IdempotencyKey,
+        route_id: &'static str,
+    ) -> Result<OperatorRollbackResponse, DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            operator_rollback(
+                &mut guard.connection,
+                &identity,
+                targets,
+                reason,
+                &idempotency_key,
+                route_id,
+            )
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
     /// Returns or republishes the current authoritative snapshot for one node.
     pub(crate) async fn reconcile_node_desired_state(
         &self,
@@ -2133,6 +2389,199 @@ impl Database {
         tokio::task::spawn_blocking(move || {
             let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
             build_support_bundle(&guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Reserves a stable route identity and returns a new grant generation only
+    /// for an active, relay-capable node with recorded provider consent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when eligibility, allocation, or storage fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_relay_grant(
+        &self,
+        node_id: NodeId,
+        relay_id: control_protocol::id::RelayId,
+        public_host: String,
+        tunnel_host: String,
+        tunnel_port: u16,
+        tls_server_name: String,
+        public_port_start: u16,
+        public_port_end: u16,
+        limits: control_protocol::relay::RelayLimits,
+    ) -> Result<RelayGrantDraft, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            prepare_relay_grant(
+                &mut guard.connection,
+                node_id,
+                relay_id,
+                &public_host,
+                &tunnel_host,
+                tunnel_port,
+                &tls_server_name,
+                public_port_start,
+                public_port_end,
+                limits,
+            )
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Commits only encrypted node material and non-secret signed-route data,
+    /// then queues durable filesystem publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] for invalid artifacts or failed persistence.
+    pub async fn store_pending_relay_grant(
+        &self,
+        assignment: SignedRelayAssignment,
+        route: SignedRelayRoute,
+    ) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            store_pending_relay_grant(&mut guard.connection, &assignment, &route)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Returns only a relay assignment that is already published and unexpired.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when durable data is unreadable.
+    pub async fn relay_assignment(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<SignedRelayAssignment>, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            relay_assignment(&guard.connection, node_id)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Moves expired grants into the revocation outbox before they can be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when expiry reconciliation cannot commit.
+    pub async fn expire_relay_grants(&self) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            expire_relay_grants(&mut guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Loads durable, incomplete file side effects for startup and retry repair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] for an invalid or unreadable outbox row.
+    pub async fn due_relay_outbox(&self) -> Result<Vec<RelayOutboxJob>, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            due_relay_outbox(&guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Marks a verified route file as published. Predecessors remain available
+    /// until the node acknowledges that this generation registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] unless the grant remains pending.
+    pub async fn mark_relay_published(&self, grant_id: RelayGrantId) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            mark_relay_published(&mut guard.connection, grant_id)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Records a node's registered-generation acknowledgement and queues only
+    /// older generations of the same logical route for revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when the grant does not belong to this node,
+    /// is not published, or the generation identity conflicts.
+    pub async fn acknowledge_relay_assignment(
+        &self,
+        node_id: NodeId,
+        acknowledgement: AcknowledgeRelayAssignmentRequest,
+    ) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            acknowledge_relay_assignment(&mut guard.connection, node_id, acknowledgement)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Marks a verified absent route file as revoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when durable state cannot be updated.
+    pub async fn mark_relay_revoked(&self, grant_id: RelayGrantId) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            mark_relay_revoked(&mut guard.connection, grant_id)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Defers a failed route file operation using bounded exponential backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when retry metadata cannot be updated.
+    pub async fn record_relay_outbox_failure(
+        &self,
+        grant_id: RelayGrantId,
+        action: RelayOutboxAction,
+    ) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            record_relay_outbox_failure(&mut guard.connection, grant_id, action)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Admin revocation queues removal but never returns route or credential material.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DatabaseError`] when the grant does not exist or cannot be queued.
+    pub async fn revoke_relay_grant(&self, grant_id: RelayGrantId) -> Result<(), DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            revoke_relay_grant(&mut guard.connection, grant_id)
         })
         .await
         .map_err(DatabaseError::Worker)?
@@ -2443,7 +2892,7 @@ fn validate_telemetry_user(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn upsert_traffic_aggregate(
     connection: &Connection,
     table: &'static str,
@@ -4389,6 +4838,331 @@ fn publish_desired_state(
     Ok(desired)
 }
 
+struct PreparedRollback {
+    target: OperatorRollbackTarget,
+    configuration: DesiredStateConfigurationDraft,
+}
+
+#[allow(clippy::too_many_lines)]
+fn operator_rollback(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    mut targets: Vec<OperatorRollbackTarget>,
+    reason: OperatorRollbackReason,
+    idempotency_key: &IdempotencyKey,
+    route_id: &'static str,
+) -> Result<OperatorRollbackResponse, DatabaseError> {
+    targets.sort_by_key(|target| target.node_id);
+    let now = unix_timestamp()?;
+    let expires_at = now
+        .checked_add(IDEMPOTENCY_LIFETIME_SECONDS)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let key_digest: [u8; 32] = Sha256::digest(idempotency_key.as_str().as_bytes()).into();
+    let request_digest =
+        canonical_request_digest(b"operator-rollback/v1\0", &(targets.clone(), reason))?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut network = load_network(&transaction)?;
+    if let Some(response) = load_rollback_replay(
+        &transaction,
+        &network.network_id,
+        route_id,
+        &key_digest,
+        &request_digest,
+    )? {
+        transaction.commit()?;
+        return Ok(response);
+    }
+
+    let mut prepared = Vec::with_capacity(targets.len());
+    for target in targets {
+        match prepare_rollback_target(&transaction, identity, &network, &target) {
+            Ok(configuration) => prepared.push(PreparedRollback {
+                target,
+                configuration,
+            }),
+            Err(error) => {
+                insert_audit_event(
+                    &transaction,
+                    Some(&network.network_id),
+                    "admin",
+                    Some(BOOTSTRAP_ADMIN_PRINCIPAL),
+                    "node.operator-rollback-rejected",
+                    "node",
+                    Some(&target.node_id.to_string()),
+                    "rejected",
+                    &serde_json::json!({
+                        "failedRevision": target.failed_revision,
+                        "reason": enum_wire(&reason)?,
+                        "rejectionCode": rollback_rejection_code(&error),
+                        "sourceRevision": target.source_revision,
+                    }),
+                    now,
+                )?;
+                transaction.commit()?;
+                return Err(error);
+            }
+        }
+    }
+
+    let mut publications = Vec::with_capacity(prepared.len());
+    for prepared in prepared {
+        let users =
+            compile_desired_users(&transaction, &network.network_id, prepared.target.node_id)?;
+        let desired = publish_compiled_desired_state(
+            &transaction,
+            identity,
+            &mut network,
+            prepared.target.node_id,
+            prepared.configuration,
+            &users,
+            "operator-rollback",
+            now,
+        )?;
+        let publication = OperatorRollbackPublication {
+            node_id: prepared.target.node_id,
+            source_revision: prepared.target.source_revision,
+            failed_revision: prepared.target.failed_revision,
+            revision: desired.document.revision,
+        };
+        insert_audit_event(
+            &transaction,
+            Some(&network.network_id),
+            "admin",
+            Some(BOOTSTRAP_ADMIN_PRINCIPAL),
+            "node.operator-rollback-published",
+            "node",
+            Some(&publication.node_id.to_string()),
+            "success",
+            &serde_json::json!({
+                "failedRevision": publication.failed_revision,
+                "idempotencyKeyHash": Sha256Digest::from_bytes(key_digest),
+                "reason": enum_wire(&reason)?,
+                "revision": publication.revision,
+                "sourceRevision": publication.source_revision,
+            }),
+            now,
+        )?;
+        publications.push(publication);
+    }
+    let response = OperatorRollbackResponse { publications };
+    store_rollback_idempotency(
+        &transaction,
+        &network.network_id,
+        route_id,
+        &key_digest,
+        &request_digest,
+        &response,
+        now,
+        expires_at,
+    )?;
+    transaction.commit()?;
+    Ok(response)
+}
+
+fn prepare_rollback_target(
+    connection: &rusqlite::Transaction<'_>,
+    identity: &ControllerIdentity,
+    network: &NetworkRecord,
+    target: &OperatorRollbackTarget,
+) -> Result<DesiredStateConfigurationDraft, DatabaseError> {
+    let node_id = target.node_id.to_string();
+    let (status, agent_version, desired_revision, capabilities_json) = connection
+        .query_row(
+            "SELECT status, agent_version, desired_revision, capabilities_json
+             FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeNotFound)?;
+    if status != "active" || desired_revision != Some(target.failed_revision.get()) {
+        return Err(DatabaseError::RollbackTargetInvalid);
+    }
+    let capabilities: Vec<NodeCapability> = serde_json::from_str(&capabilities_json)?;
+    if !capabilities.contains(&NodeCapability::Xray) {
+        return Err(DatabaseError::RollbackTargetIncompatible);
+    }
+
+    let source = load_stored_desired_revision(
+        connection,
+        &network.network_id,
+        &node_id,
+        target.source_revision.get(),
+    )?
+    .ok_or(DatabaseError::RollbackTargetInvalid)?;
+    let source = verify_desired_revision(identity, network, target.node_id, &source)?;
+    let validated = load_revision_result_state(
+        connection,
+        &network.network_id,
+        target.node_id,
+        target.source_revision,
+        RevisionResultState::Validated,
+    )?
+    .is_some();
+    let applied = load_revision_result_state(
+        connection,
+        &network.network_id,
+        target.node_id,
+        target.source_revision,
+        RevisionResultState::Applied,
+    )?
+    .is_some();
+    if !validated || !applied {
+        return Err(DatabaseError::RollbackTargetInvalid);
+    }
+    let failed = load_latest_revision_result(
+        connection,
+        &network.network_id,
+        target.node_id,
+        target.failed_revision,
+    )?;
+    if !failed.is_some_and(|result| {
+        matches!(
+            result.state,
+            RevisionResultState::Rejected | RevisionResultState::RolledBack
+        )
+    }) {
+        return Err(DatabaseError::RollbackTargetInvalid);
+    }
+    if !agent_version_satisfies(&agent_version, &source.document.min_agent_version) {
+        return Err(DatabaseError::RollbackTargetIncompatible);
+    }
+    Ok(DesiredStateConfigurationDraft {
+        min_agent_version: source.document.min_agent_version,
+        xray: source.document.xray,
+    })
+}
+
+fn agent_version_satisfies(agent_version: &str, minimum_version: &str) -> bool {
+    match (
+        numeric_version_core(agent_version),
+        numeric_version_core(minimum_version),
+    ) {
+        (Some(agent), Some(minimum)) => agent >= minimum,
+        _ => agent_version == minimum_version,
+    }
+}
+
+fn numeric_version_core(value: &str) -> Option<Vec<u64>> {
+    if value
+        .bytes()
+        .any(|byte| !byte.is_ascii_digit() && byte != b'.')
+    {
+        return None;
+    }
+    let mut parts = value
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    parts.resize(4, 0);
+    Some(parts)
+}
+
+fn rollback_rejection_code(error: &DatabaseError) -> &'static str {
+    match error {
+        DatabaseError::NodeNotFound => "node_not_found",
+        DatabaseError::RollbackTargetIncompatible => "target_incompatible",
+        DatabaseError::StoredDesiredStateCorrupt | DatabaseError::DesiredState(_) => {
+            "source_artifact_invalid"
+        }
+        _ => "target_invalid",
+    }
+}
+
+fn load_rollback_replay(
+    connection: &Connection,
+    network_id: &str,
+    route_id: &str,
+    key_digest: &[u8; 32],
+    request_digest: &[u8; 32],
+) -> Result<Option<OperatorRollbackResponse>, DatabaseError> {
+    let stored = connection
+        .query_row(
+            "SELECT request_sha256, state, response_status, response_json, response_sha256
+             FROM idempotency_records
+             WHERE network_id = ?1 AND principal_type = 'bootstrap-admin'
+               AND principal_id = 'bootstrap-admin' AND route_id = ?2
+               AND idempotency_key_sha256 = ?3",
+            params![network_id, route_id, key_digest.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_request, state, status, response_json, stored_response_digest)) = stored
+    else {
+        return Ok(None);
+    };
+    if stored_request.as_slice() != request_digest {
+        return Err(DatabaseError::IdempotencyKeyConflict);
+    }
+    let (Some(status), Some(response_json), Some(stored_response_digest)) =
+        (status, response_json, stored_response_digest)
+    else {
+        return Err(DatabaseError::StoredProtocolValue);
+    };
+    let response_digest: [u8; 32] = Sha256::digest(response_json.as_bytes()).into();
+    if state != "completed"
+        || status != HTTP_CREATED_STATUS
+        || stored_response_digest.as_slice() != response_digest
+    {
+        return Err(DatabaseError::StoredProtocolValue);
+    }
+    Ok(Some(serde_json::from_str(&response_json)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_rollback_idempotency(
+    connection: &Connection,
+    network_id: &str,
+    route_id: &str,
+    key_digest: &[u8; 32],
+    request_digest: &[u8; 32],
+    response: &OperatorRollbackResponse,
+    now: i64,
+    expires_at: i64,
+) -> Result<(), DatabaseError> {
+    let response_json = serde_json::to_string(response)?;
+    let response_digest: [u8; 32] = Sha256::digest(response_json.as_bytes()).into();
+    connection.execute(
+        "INSERT INTO idempotency_records(
+            network_id, principal_type, principal_id, route_id,
+            idempotency_key_sha256, request_sha256, state, response_status,
+            response_json, response_sha256, created_at, completed_at, expires_at
+         ) VALUES (?1, 'bootstrap-admin', 'bootstrap-admin', ?2, ?3, ?4,
+                   'completed', ?5, ?6, ?7, ?8, ?8, ?9)",
+        params![
+            network_id,
+            route_id,
+            key_digest.as_slice(),
+            request_digest.as_slice(),
+            HTTP_CREATED_STATUS,
+            response_json,
+            response_digest.as_slice(),
+            now,
+            expires_at,
+        ],
+    )?;
+    Ok(())
+}
+
 fn reconcile_node_desired_state(
     connection: &mut Connection,
     identity: &ControllerIdentity,
@@ -5172,6 +5946,28 @@ fn record_revision_result(
     ) {
         reconcile_applied_member_credentials(&transaction, &network.network_id, node_id, now)?;
     }
+    if matches!(
+        result.state,
+        RevisionResultState::Rejected | RevisionResultState::RolledBack
+    ) {
+        insert_audit_event(
+            &transaction,
+            Some(&network.network_id),
+            "node",
+            Some(&node_id.to_string()),
+            "node.revision-failed",
+            "revision",
+            Some(&revision.get().to_string()),
+            "failure",
+            &serde_json::json!({
+                "errorCode": result.error_code.as_ref().map(control_protocol::error::ErrorCode::as_str),
+                "revision": revision,
+                "rollbackRevision": result.rollback_revision,
+                "state": enum_wire(&result.state)?,
+            }),
+            now,
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -5910,11 +6706,13 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
     for row in rows {
         let row = row?;
         let onboarding_state = derive_node_onboarding_state(connection, &network.network_id, &row)?;
+        let node_id = row
+            .node_id
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?;
+        let last_failure = load_latest_node_failure(connection, &network.network_id, node_id)?;
         summaries.push(NodeSummaryRecord {
-            node_id: row
-                .node_id
-                .parse()
-                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            node_id,
             network_id: row.network_id,
             display_name: row.display_name,
             status: row.status,
@@ -5938,12 +6736,56 @@ fn load_nodes(connection: &Connection) -> Result<Vec<NodeSummaryRecord>, Databas
             received_revision: row.received_revision,
             validated_revision: row.validated_revision,
             applied_revision: row.applied_revision,
+            last_failure,
             telemetry_cursor: row.telemetry_cursor,
             created_at: row.created_at,
             updated_at: row.updated_at,
         });
     }
     Ok(summaries)
+}
+
+fn load_latest_node_failure(
+    connection: &Connection,
+    network_id: &str,
+    node_id: NodeId,
+) -> Result<Option<NodeRevisionFailureSummary>, DatabaseError> {
+    let stored = connection
+        .query_row(
+            "SELECT revision, result_json
+             FROM node_revision_results
+             WHERE network_id = ?1 AND node_id = ?2
+               AND state IN ('rejected', 'rolledBack')
+             ORDER BY revision DESC LIMIT 1",
+            params![network_id, node_id.to_string()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((revision, result_json)) = stored else {
+        return Ok(None);
+    };
+    let revision =
+        Revision::new(revision).map_err(|_| DatabaseError::StoredRevisionResultCorrupt)?;
+    let result: RevisionResult = serde_json::from_str(&result_json)
+        .map_err(|_| DatabaseError::StoredRevisionResultCorrupt)?;
+    result
+        .validate(revision)
+        .map_err(|_| DatabaseError::StoredRevisionResultCorrupt)?;
+    if !matches!(
+        result.state,
+        RevisionResultState::Rejected | RevisionResultState::RolledBack
+    ) {
+        return Err(DatabaseError::StoredRevisionResultCorrupt);
+    }
+    Ok(Some(NodeRevisionFailureSummary {
+        revision,
+        state: result.state,
+        error_code: result
+            .error_code
+            .ok_or(DatabaseError::StoredRevisionResultCorrupt)?,
+        rollback_revision: result.rollback_revision,
+        completed_at: result.completed_at,
+    }))
 }
 
 fn derive_node_onboarding_state(
@@ -6020,6 +6862,334 @@ fn derive_node_onboarding_state(
         }
     };
     Ok(state.to_string())
+}
+
+#[allow(clippy::too_many_lines)]
+fn issue_account_reset_token(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    user_id: UserId,
+    request: &IssueAccountResetTokenRequest,
+    idempotency_key: &IdempotencyKey,
+) -> Result<IssueAccountResetTokenResponse, DatabaseError> {
+    let now = unix_timestamp()?;
+    let expires_at = now
+        .checked_add(i64::from(request.expires_in_seconds))
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let key_digest: [u8; 32] = Sha256::digest(idempotency_key.as_str().as_bytes()).into();
+    let request_digest = canonical_request_digest(b"account-reset-issue/v1\0", request)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    if let Some((token_id, stored_request, stored_expiry, stored_verifier)) = transaction
+        .query_row(
+            "SELECT token_id, issue_request_sha256, expires_at, secret_verifier
+             FROM account_reset_tokens
+             WHERE network_id = ?1 AND user_id = ?2 AND issue_idempotency_key_sha256 = ?3",
+            params![
+                network.network_id,
+                user_id.to_string(),
+                key_digest.as_slice()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        if stored_request.as_slice() != request_digest {
+            return Err(DatabaseError::IdempotencyKeyConflict);
+        }
+        let secret = derive_account_reset_secret(
+            identity,
+            &network.network_id,
+            user_id,
+            &token_id,
+            &key_digest,
+            &request_digest,
+        )?;
+        if credential_verifier(identity, ACCOUNT_RESET_SECRET_DOMAIN, secret.as_bytes())?.as_slice()
+            != stored_verifier
+        {
+            return Err(DatabaseError::StoredProtocolValue);
+        }
+        transaction.commit()?;
+        return Ok(IssueAccountResetTokenResponse {
+            reset_token: Secret::new(secret),
+            expires_at: timestamp(stored_expiry)?,
+        });
+    }
+
+    if load_account_status(&transaction, &network.network_id, user_id)? != "active" {
+        return Err(DatabaseError::AccountAuthenticationBlocked);
+    }
+    let token_id = Uuid::new_v4().hyphenated().to_string();
+    let secret = derive_account_reset_secret(
+        identity,
+        &network.network_id,
+        user_id,
+        &token_id,
+        &key_digest,
+        &request_digest,
+    )?;
+    let verifier = credential_verifier(identity, ACCOUNT_RESET_SECRET_DOMAIN, secret.as_bytes())?;
+    transaction.execute(
+        "INSERT INTO account_reset_tokens(
+            network_id, token_id, user_id, secret_verifier,
+            issue_idempotency_key_sha256, issue_request_sha256,
+            expires_at, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            network.network_id,
+            token_id,
+            user_id.to_string(),
+            verifier.as_slice(),
+            key_digest.as_slice(),
+            request_digest.as_slice(),
+            expires_at,
+            now,
+        ],
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "admin",
+        Some(BOOTSTRAP_ADMIN_PRINCIPAL),
+        "account.reset-token-issued",
+        "account",
+        Some(&user_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "expiresAt": expires_at,
+            "idempotencyKeyHash": Sha256Digest::from_bytes(key_digest),
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(IssueAccountResetTokenResponse {
+        reset_token: Secret::new(secret),
+        expires_at: timestamp(expires_at)?,
+    })
+}
+
+fn derive_account_reset_secret(
+    identity: &ControllerIdentity,
+    network_id: &str,
+    user_id: UserId,
+    token_id: &str,
+    key_digest: &[u8; 32],
+    request_digest: &[u8; 32],
+) -> Result<String, DatabaseError> {
+    let mut context = Vec::new();
+    context.extend_from_slice(network_id.as_bytes());
+    context.extend_from_slice(user_id.to_string().as_bytes());
+    context.extend_from_slice(token_id.as_bytes());
+    context.extend_from_slice(key_digest);
+    context.extend_from_slice(request_digest);
+    Ok(format!(
+        "rcr1.{token_id}.{}",
+        derive_secret(identity, ACCOUNT_RESET_SECRET_DOMAIN, &context)?
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+fn consume_account_reset_token(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    request: &ConsumeAccountResetTokenRequest,
+    idempotency_key: &IdempotencyKey,
+) -> Result<ConsumeAccountResetTokenResponse, DatabaseError> {
+    let now = unix_timestamp()?;
+    let verifier = credential_verifier(
+        identity,
+        ACCOUNT_RESET_SECRET_DOMAIN,
+        request.reset_token.expose_secret().as_bytes(),
+    )?;
+    let key_digest: [u8; 32] = Sha256::digest(idempotency_key.as_str().as_bytes()).into();
+    let request_digest = canonical_request_digest(b"account-reset-consume/v1\0", request)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut network = load_network(&transaction)?;
+    let stored = transaction
+        .query_row(
+            "SELECT token_id, user_id, expires_at, consumed_at,
+                    consume_idempotency_key_sha256, consume_request_sha256,
+                    consume_response_json
+             FROM account_reset_tokens
+             WHERE network_id = ?1 AND secret_verifier = ?2",
+            params![network.network_id, verifier.as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        token_id,
+        user_id,
+        expires_at,
+        consumed_at,
+        stored_key,
+        stored_request,
+        response_json,
+    )) = stored
+    else {
+        // Unknown public bearer values are intentionally not persisted. Auditing each random
+        // token would let an unauthenticated caller grow the database without a valid identity.
+        return Err(DatabaseError::AccountResetTokenInvalid);
+    };
+    let user_id = user_id
+        .parse::<UserId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    if consumed_at.is_some() {
+        if stored_key.as_deref() == Some(key_digest.as_slice())
+            && stored_request.as_deref() == Some(request_digest.as_slice())
+        {
+            let response = response_json
+                .ok_or(DatabaseError::StoredProtocolValue)
+                .and_then(|value| serde_json::from_str(&value).map_err(DatabaseError::from))?;
+            transaction.commit()?;
+            return Ok(response);
+        }
+        insert_account_reset_rejection(
+            &transaction,
+            &network.network_id,
+            Some(user_id),
+            "consumed",
+            now,
+        )?;
+        transaction.commit()?;
+        return Err(DatabaseError::AccountResetTokenConsumed);
+    }
+    if now >= expires_at {
+        insert_account_reset_rejection(
+            &transaction,
+            &network.network_id,
+            Some(user_id),
+            "expired",
+            now,
+        )?;
+        transaction.commit()?;
+        return Err(DatabaseError::AccountResetTokenExpired);
+    }
+    if load_account_status(&transaction, &network.network_id, user_id)? != "active" {
+        insert_account_reset_rejection(
+            &transaction,
+            &network.network_id,
+            Some(user_id),
+            "account-unavailable",
+            now,
+        )?;
+        transaction.commit()?;
+        return Err(DatabaseError::AccountAuthenticationBlocked);
+    }
+
+    let salt = SaltString::generate(&mut OsRng);
+    let password_verifier = Argon2::default()
+        .hash_password(request.new_password.expose_secret().as_bytes(), &salt)
+        .map_err(|_| DatabaseError::PasswordHash)?
+        .to_string();
+    transaction.execute(
+        "UPDATE users SET password_verifier = ?1, password_updated_at = ?2,
+             credential_version = credential_version + 1, updated_at = ?2
+         WHERE network_id = ?3 AND user_id = ?4",
+        params![
+            password_verifier,
+            now,
+            network.network_id,
+            user_id.to_string()
+        ],
+    )?;
+    let revoked_sessions = revoke_user_sessions(
+        &transaction,
+        &network.network_id,
+        user_id,
+        now,
+        "account-reset-token",
+    )?;
+    let affected_nodes =
+        rotate_account_credentials(&transaction, &network.network_id, user_id, now)?;
+    let revisions = publish_account_revisions(
+        &transaction,
+        identity,
+        &mut network,
+        &affected_nodes,
+        "account-reset-token",
+        now,
+    )?;
+    let response = ConsumeAccountResetTokenResponse {
+        user_id,
+        revoked_sessions: u32::try_from(revoked_sessions)
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        published_revisions: revisions.iter().map(|(_, revision)| *revision).collect(),
+    };
+    let response_json = serde_json::to_string(&response)?;
+    let changed = transaction.execute(
+        "UPDATE account_reset_tokens
+         SET consumed_at = ?1, consume_idempotency_key_sha256 = ?2,
+             consume_request_sha256 = ?3, consume_response_json = ?4
+         WHERE network_id = ?5 AND token_id = ?6 AND consumed_at IS NULL",
+        params![
+            now,
+            key_digest.as_slice(),
+            request_digest.as_slice(),
+            response_json,
+            network.network_id,
+            token_id,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(DatabaseError::AccountResetTokenConsumed);
+    }
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "anonymous-account-recovery",
+        None,
+        "account.reset-token-consumed",
+        "account",
+        Some(&user_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "publishedRevisions": revision_audit_details(&revisions),
+            "revokedSessions": revoked_sessions,
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(response)
+}
+
+fn insert_account_reset_rejection(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    user_id: Option<UserId>,
+    reason: &'static str,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let target_id = user_id.map(|value| value.to_string());
+    insert_audit_event(
+        transaction,
+        Some(network_id),
+        "anonymous-account-recovery",
+        None,
+        "account.reset-token-rejected",
+        "account",
+        target_id.as_deref(),
+        "rejected",
+        &serde_json::json!({ "reason": reason }),
+        now,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8572,6 +9742,7 @@ fn transition_node(
         revoke_node_credentials(&transaction, &network.network_id, &node_id, action, now)?;
     let (member_assignments_closed, member_credentials_revoked) =
         close_node_member_access(&transaction, &network.network_id, &node_id, action, now)?;
+    revoke_node_relay_grants(&transaction, &network.network_id, &node_id, now)?;
     if (credentials_revoked > 0 || member_assignments_closed > 0 || member_credentials_revoked > 0)
         && !status_changed
     {
@@ -8602,6 +9773,26 @@ fn transition_node(
         now,
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn revoke_node_relay_grants(
+    transaction: &rusqlite::Transaction<'_>,
+    network_id: &str,
+    node_id: &str,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "UPDATE relay_grants SET state = 'revoking' WHERE network_id = ?1 AND node_id = ?2
+         AND state IN ('pending', 'published')",
+        params![network_id, node_id],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO relay_outbox(network_id, grant_id, action, next_attempt_at, created_at)
+         SELECT network_id, grant_id, 'revoke', ?1, ?1 FROM relay_grants
+         WHERE network_id = ?2 AND node_id = ?3 AND state = 'revoking'",
+        params![now, network_id, node_id],
+    )?;
     Ok(())
 }
 
@@ -9511,6 +10702,408 @@ fn timestamp(value: i64) -> Result<Timestamp, DatabaseError> {
     ))
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn prepare_relay_grant(
+    connection: &mut Connection,
+    node_id: NodeId,
+    relay_id: control_protocol::id::RelayId,
+    public_host: &str,
+    tunnel_host: &str,
+    tunnel_port: u16,
+    tls_server_name: &str,
+    public_port_start: u16,
+    public_port_end: u16,
+    limits: control_protocol::relay::RelayLimits,
+) -> Result<RelayGrantDraft, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let node = transaction
+        .query_row(
+            "SELECT status, capabilities_json, consent_exit_ip, encryption_public_key
+         FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeNotFound)?;
+    let capabilities: Vec<NodeCapability> = serde_json::from_str(&node.1)?;
+    if node.0 != "active" || !node.2 || !capabilities.contains(&NodeCapability::RelayTcp) {
+        return Err(DatabaseError::RelayNotEligible);
+    }
+    let recipient_encryption_key = node
+        .3
+        .parse()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let route = transaction
+        .query_row(
+            "SELECT route_id, endpoint_id FROM relay_routes WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (route_id, endpoint_id) = if let Some((route_id, endpoint_id)) = route {
+        (
+            route_id
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            endpoint_id
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        )
+    } else {
+        let route_id = RelayRouteId::new();
+        let endpoint_id = EndpointId::new();
+        transaction.execute(
+            "INSERT INTO relay_routes(network_id, node_id, route_id, endpoint_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                network.network_id,
+                node_id.to_string(),
+                route_id.to_string(),
+                endpoint_id.to_string(),
+                now
+            ],
+        )?;
+        (route_id, endpoint_id)
+    };
+    let next_generation: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM relay_grants WHERE network_id = ?1 AND route_id = ?2",
+        params![network.network_id, route_id.to_string()], |row| row.get(0),
+    )?;
+    let generation = RelayGeneration::new(next_generation)
+        .map_err(|_| DatabaseError::RelayGenerationOverflow)?;
+    let mut public_port = None;
+    for port in public_port_start..=public_port_end {
+        let used: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM relay_grants WHERE network_id = ?1 AND public_port = ?2
+              AND state IN ('pending', 'published', 'revoking'))",
+            params![network.network_id, i64::from(port)],
+            |row| row.get(0),
+        )?;
+        if !used {
+            public_port = Some(port);
+            break;
+        }
+    }
+    let public_port = public_port.ok_or(DatabaseError::RelayPortExhausted)?;
+    let issued_at = timestamp(now)?;
+    let expires_at = timestamp(
+        now.checked_add(control_protocol::relay::MAX_RELAY_GRANT_LIFETIME_SECONDS)
+            .ok_or(DatabaseError::TimestampOverflow)?,
+    )?;
+    let header = RelayAssignmentHeader {
+        schema_version: control_protocol::relay::RELAY_SCHEMA_VERSION,
+        network_id: network
+            .network_id
+            .parse()
+            .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        node_id,
+        relay_id,
+        route_id,
+        grant_id: RelayGrantId::new(),
+        generation,
+        endpoint_id,
+        public_host: public_host.to_owned(),
+        public_port,
+        tunnel_host: tunnel_host.to_owned(),
+        tunnel_port,
+        tls_server_name: tls_server_name.to_owned(),
+        issued_at,
+        not_before: issued_at,
+        expires_at,
+        limits,
+    };
+    header.validate()?;
+    transaction.commit()?;
+    Ok(RelayGrantDraft {
+        header,
+        recipient_encryption_key,
+    })
+}
+
+fn store_pending_relay_grant(
+    connection: &mut Connection,
+    assignment: &SignedRelayAssignment,
+    route: &SignedRelayRoute,
+) -> Result<(), DatabaseError> {
+    assignment.validate()?;
+    route.validate()?;
+    if assignment.header != route.header || assignment.signing_key_id != route.signing_key_id {
+        return Err(DatabaseError::RelayGrantMismatch);
+    }
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let header = &assignment.header;
+    let route_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM relay_routes WHERE network_id = ?1 AND node_id = ?2 AND route_id = ?3)",
+        params![network.network_id, header.node_id.to_string(), header.route_id.to_string()], |row| row.get(0),
+    )?;
+    if !route_exists {
+        return Err(DatabaseError::RelayGrantMismatch);
+    }
+    let route_bytes = serde_json::to_vec(route)?;
+    let route_sha256 = format!("sha256:{:x}", Sha256::digest(&route_bytes));
+    transaction.execute(
+        "INSERT INTO relay_grants(network_id, grant_id, node_id, route_id, generation, public_port, state,
+             header_json, assignment_json, route_json, route_sha256, issued_at, expires_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![network.network_id, header.grant_id.to_string(), header.node_id.to_string(), header.route_id.to_string(),
+            header.generation.get(), i64::from(header.public_port), serde_json::to_string(header)?,
+            serde_json::to_string(assignment)?, serde_json::to_string(route)?, route_sha256,
+            header.issued_at.as_datetime().unix_timestamp(), header.expires_at.as_datetime().unix_timestamp(), now],
+    )?;
+    transaction.execute(
+        "INSERT INTO relay_outbox(network_id, grant_id, action, next_attempt_at, created_at)
+         VALUES (?1, ?2, 'publish', ?3, ?3)",
+        params![network.network_id, header.grant_id.to_string(), now],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn relay_assignment(
+    connection: &Connection,
+    node_id: NodeId,
+) -> Result<Option<SignedRelayAssignment>, DatabaseError> {
+    let network = load_network(connection)?;
+    let now = unix_timestamp()?;
+    connection
+        .query_row(
+            "SELECT assignment_json FROM relay_grants WHERE network_id = ?1 AND node_id = ?2
+         AND state = 'published' AND expires_at > ?3 ORDER BY generation DESC LIMIT 1",
+            params![network.network_id, node_id.to_string(), now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|json| {
+            let assignment: SignedRelayAssignment = serde_json::from_str(&json)?;
+            assignment.validate()?;
+            Ok(assignment)
+        })
+        .transpose()
+}
+
+fn expire_relay_grants(connection: &mut Connection) -> Result<(), DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "UPDATE relay_grants SET state = 'revoking' WHERE state IN ('pending', 'published') AND expires_at <= ?1",
+        [now],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO relay_outbox(network_id, grant_id, action, next_attempt_at, created_at)
+         SELECT network_id, grant_id, 'revoke', ?1, ?1 FROM relay_grants WHERE state = 'revoking'",
+        [now],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn due_relay_outbox(connection: &Connection) -> Result<Vec<RelayOutboxJob>, DatabaseError> {
+    let now = unix_timestamp()?;
+    let mut statement = connection.prepare(
+        "SELECT outbox.grant_id, outbox.action, grants.route_json FROM relay_outbox AS outbox
+         JOIN relay_grants AS grants ON grants.network_id = outbox.network_id AND grants.grant_id = outbox.grant_id
+         WHERE outbox.completed_at IS NULL AND outbox.next_attempt_at <= ?1
+           AND ((outbox.action = 'publish' AND grants.state = 'pending')
+             OR (outbox.action = 'revoke' AND grants.state = 'revoking'))
+         ORDER BY outbox.created_at ASC",
+    )?;
+    let jobs = statement
+        .query_map([now], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .map(|row| {
+            let (grant_id, action, route_json) = row?;
+            let grant_id = grant_id
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?;
+            match action.as_str() {
+                "publish" => {
+                    let route: SignedRelayRoute = serde_json::from_str(&route_json)?;
+                    route.validate()?;
+                    Ok(RelayOutboxJob {
+                        grant_id,
+                        action: RelayOutboxAction::Publish,
+                        route: Some(route),
+                    })
+                }
+                "revoke" => Ok(RelayOutboxJob {
+                    grant_id,
+                    action: RelayOutboxAction::Revoke,
+                    route: None,
+                }),
+                _ => Err(DatabaseError::StoredProtocolValue),
+            }
+        })
+        .collect();
+    jobs
+}
+
+fn mark_relay_published(
+    connection: &mut Connection,
+    grant_id: RelayGrantId,
+) -> Result<(), DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM relay_grants
+         WHERE network_id = ?1 AND grant_id = ?2 AND state = 'pending')",
+        params![network.network_id, grant_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(DatabaseError::RelayGrantNotPending);
+    }
+    transaction.execute("UPDATE relay_grants SET state = 'published', published_at = ?1 WHERE network_id = ?2 AND grant_id = ?3",
+        params![now, network.network_id, grant_id.to_string()])?;
+    transaction.execute("UPDATE relay_outbox SET completed_at = ?1 WHERE network_id = ?2 AND grant_id = ?3 AND action = 'publish'",
+        params![now, network.network_id, grant_id.to_string()])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn acknowledge_relay_assignment(
+    connection: &mut Connection,
+    node_id: NodeId,
+    acknowledgement: AcknowledgeRelayAssignmentRequest,
+) -> Result<(), DatabaseError> {
+    acknowledgement.validate()?;
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let route_id: String = transaction
+        .query_row(
+            "SELECT route_id FROM relay_grants
+             WHERE network_id = ?1 AND node_id = ?2 AND grant_id = ?3
+               AND generation = ?4 AND state = 'published' AND expires_at > ?5
+               AND NOT EXISTS(
+                   SELECT 1 FROM relay_grants AS newer
+                   WHERE newer.network_id = relay_grants.network_id
+                     AND newer.node_id = relay_grants.node_id
+                     AND newer.route_id = relay_grants.route_id
+                     AND newer.generation > relay_grants.generation
+                     AND newer.state = 'published'
+               )",
+            params![
+                network.network_id,
+                node_id.to_string(),
+                acknowledgement.grant_id.to_string(),
+                acknowledgement.generation.get(),
+                now
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::RelayAcknowledgementConflict)?;
+    transaction.execute(
+        "UPDATE relay_grants SET state = 'revoking'
+         WHERE network_id = ?1 AND node_id = ?2 AND route_id = ?3
+           AND generation < ?4 AND state = 'published'",
+        params![
+            network.network_id,
+            node_id.to_string(),
+            route_id,
+            acknowledgement.generation.get()
+        ],
+    )?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO relay_outbox(
+            network_id, grant_id, action, next_attempt_at, created_at
+         )
+         SELECT network_id, grant_id, 'revoke', ?1, ?1 FROM relay_grants
+         WHERE network_id = ?2 AND node_id = ?3 AND route_id = ?4 AND state = 'revoking'",
+        params![now, network.network_id, node_id.to_string(), route_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn mark_relay_revoked(
+    connection: &mut Connection,
+    grant_id: RelayGrantId,
+) -> Result<(), DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    transaction.execute(
+        "UPDATE relay_grants SET state = 'revoked', revoked_at = ?1 WHERE network_id = ?2 AND grant_id = ?3 AND state = 'revoking'",
+        params![now, network.network_id, grant_id.to_string()],
+    )?;
+    transaction.execute("UPDATE relay_outbox SET completed_at = ?1 WHERE network_id = ?2 AND grant_id = ?3 AND action = 'revoke'",
+        params![now, network.network_id, grant_id.to_string()])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn record_relay_outbox_failure(
+    connection: &mut Connection,
+    grant_id: RelayGrantId,
+    action: RelayOutboxAction,
+) -> Result<(), DatabaseError> {
+    let now = unix_timestamp()?;
+    let action = match action {
+        RelayOutboxAction::Publish => "publish",
+        RelayOutboxAction::Revoke => "revoke",
+    };
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let attempts: i64 = transaction.query_row(
+        "SELECT attempts FROM relay_outbox WHERE network_id = ?1 AND grant_id = ?2 AND action = ?3",
+        params![network.network_id, grant_id.to_string(), action],
+        |row| row.get(0),
+    )?;
+    let delay = 1_i64
+        .checked_shl(u32::try_from(attempts.min(8)).unwrap_or(8))
+        .unwrap_or(300)
+        .min(300);
+    transaction.execute("UPDATE relay_outbox SET attempts = attempts + 1, next_attempt_at = ?1 WHERE network_id = ?2 AND grant_id = ?3 AND action = ?4",
+        params![now + delay, network.network_id, grant_id.to_string(), action])?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn revoke_relay_grant(
+    connection: &mut Connection,
+    grant_id: RelayGrantId,
+) -> Result<(), DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let changed = transaction.execute(
+        "UPDATE relay_grants SET state = 'revoking' WHERE network_id = ?1 AND grant_id = ?2 AND state IN ('pending', 'published')",
+        params![network.network_id, grant_id.to_string()],
+    )?;
+    if changed == 0 {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM relay_grants WHERE network_id = ?1 AND grant_id = ?2)",
+            params![network.network_id, grant_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(DatabaseError::RelayGrantNotFound);
+        }
+    }
+    transaction.execute("INSERT OR IGNORE INTO relay_outbox(network_id, grant_id, action, next_attempt_at, created_at) VALUES (?1, ?2, 'revoke', ?3, ?3)",
+        params![network.network_id, grant_id.to_string(), now])?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn verify_database(connection: &Connection) -> Result<(), DatabaseError> {
     let foreign_key_violation = connection.prepare("PRAGMA foreign_key_check")?.exists([])?;
     if foreign_key_violation {
@@ -9667,6 +11260,12 @@ pub enum DatabaseError {
     ActivationExpired,
     #[error("the device activation was already consumed")]
     ActivationConsumed,
+    #[error("the account reset token is invalid")]
+    AccountResetTokenInvalid,
+    #[error("the account reset token has expired")]
+    AccountResetTokenExpired,
+    #[error("the account reset token was already consumed")]
+    AccountResetTokenConsumed,
     #[error("the device enrollment proof is invalid")]
     InvalidDeviceProof,
     #[error("member authentication failed")]
@@ -9717,8 +11316,26 @@ pub enum DatabaseError {
     RevisionTargetNotFound,
     #[error("the revision result conflicts with its durable result journal")]
     RevisionResultConflict,
+    #[error("the rollback source or failed revision is not an eligible target")]
+    RollbackTargetInvalid,
+    #[error("the rollback source is incompatible with the current node")]
+    RollbackTargetIncompatible,
     #[error("the stored desired-state artifact is corrupt")]
     StoredDesiredStateCorrupt,
+    #[error("relay provisioning requires an active relay-capable node with provider consent")]
+    RelayNotEligible,
+    #[error("the configured relay public-port range is exhausted")]
+    RelayPortExhausted,
+    #[error("relay generation sequence is exhausted")]
+    RelayGenerationOverflow,
+    #[error("relay assignment and route metadata do not match")]
+    RelayGrantMismatch,
+    #[error("the relay grant was not found")]
+    RelayGrantNotFound,
+    #[error("the relay grant is no longer pending publication")]
+    RelayGrantNotPending,
+    #[error("the relay generation acknowledgement conflicts with published state")]
+    RelayAcknowledgementConflict,
     #[error("the stored revision result is corrupt")]
     StoredRevisionResultCorrupt,
     #[error("the network revision sequence is exhausted")]
@@ -9750,10 +11367,17 @@ impl DatabaseError {
 #[cfg(test)]
 mod tests {
     use super::{
-        enforce_telemetry_retention_at, ingest_telemetry, lock_path, migration_checksum, Database,
-        DatabaseError, MIGRATIONS, SCHEMA_VERSION,
+        acknowledge_relay_assignment, enforce_telemetry_retention_at, ingest_telemetry, lock_path,
+        migration_checksum, unix_timestamp, Database, DatabaseError, MIGRATIONS, SCHEMA_VERSION,
     };
-    use control_protocol::id::{NodeId, SequenceNumber, Timestamp, UserId};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    use control_protocol::id::{
+        Count, EndpointId, NodeId, RelayGeneration, RelayGrantId, RelayId, RelayRouteId,
+        SequenceNumber, Timestamp, UserId,
+    };
+    use control_protocol::node::NodeCapability;
+    use control_protocol::relay::{AcknowledgeRelayAssignmentRequest, RelayLimits};
     use control_protocol::telemetry::{
         NetworkProtocol, TelemetryBatch, TelemetryEvent, TelemetryEventKind,
         TELEMETRY_SCHEMA_VERSION,
@@ -9771,6 +11395,174 @@ mod tests {
 
     fn database_path(temp: &TempDir) -> std::path::PathBuf {
         temp.path().join("control.sqlite3")
+    }
+
+    fn insert_relay_node(
+        database: &Database,
+        capabilities: &[NodeCapability],
+        consent: bool,
+    ) -> NodeId {
+        let node_id = NodeId::new();
+        let mut key_bytes = [0_u8; 32];
+        key_bytes[..16].copy_from_slice(node_id.as_uuid().as_bytes());
+        let key = URL_SAFE_NO_PAD.encode(key_bytes);
+        let guard = database.inner.lock().unwrap();
+        let network_id: String = guard
+            .connection
+            .query_row("SELECT network_id FROM networks", [], |row| row.get(0))
+            .unwrap();
+        guard.connection.execute(
+            "INSERT INTO nodes(node_id, network_id, display_name, status, agent_version, platform,
+                capabilities_json, identity_public_key, encryption_public_key, consent_policy_version,
+                consent_host_owner, consent_exit_ip, consent_accepted_at, created_at, updated_at)
+             VALUES (?1, ?2, 'Relay test', 'active', '0.1.0', 'macos-arm64', ?3, ?4, ?5,
+                'relay-test', 1, ?6, 1, 1, 1)",
+            params![
+                node_id.to_string(), network_id, serde_json::to_string(capabilities).unwrap(),
+                format!("identity-{node_id}"), key, i64::from(consent),
+            ],
+        ).unwrap();
+        node_id
+    }
+
+    #[tokio::test]
+    async fn relay_grants_require_capability_and_provider_consent() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::open(&database_path(&temp), "Relay test").unwrap();
+        let limits = RelayLimits {
+            max_concurrent_streams: 1,
+            max_bytes_per_second: 1_024,
+            max_bytes_per_connection: 1_048_576,
+            monthly_byte_limit: 1_048_576,
+        };
+        let no_capability = insert_relay_node(&database, &[NodeCapability::Xray], true);
+        let no_consent = insert_relay_node(&database, &[NodeCapability::RelayTcp], false);
+        for node_id in [no_capability, no_consent] {
+            assert!(matches!(
+                database
+                    .prepare_relay_grant(
+                        node_id,
+                        RelayId::new(),
+                        "relay.test".to_string(),
+                        "relay.test".to_string(),
+                        9443,
+                        "relay.test".to_string(),
+                        20_000,
+                        20_010,
+                        limits,
+                    )
+                    .await,
+                Err(DatabaseError::RelayNotEligible)
+            ));
+        }
+    }
+
+    #[test]
+    fn relay_predecessor_is_retained_until_successor_acknowledgement() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::open(&database_path(&temp), "Relay rotation").unwrap();
+        let node_id = insert_relay_node(&database, &[NodeCapability::RelayTcp], true);
+        let route_id = RelayRouteId::new();
+        let endpoint_id = EndpointId::new();
+        let first = RelayGrantId::new();
+        let second = RelayGrantId::new();
+        let mut guard = database.inner.lock().unwrap();
+        let network_id: String = guard
+            .connection
+            .query_row("SELECT network_id FROM networks", [], |row| row.get(0))
+            .unwrap();
+        guard
+            .connection
+            .execute(
+                "INSERT INTO relay_routes(network_id, node_id, route_id, endpoint_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                params![
+                    network_id,
+                    node_id.to_string(),
+                    route_id.to_string(),
+                    endpoint_id.to_string()
+                ],
+            )
+            .unwrap();
+        let now = unix_timestamp().unwrap();
+        for (grant_id, generation, port) in [(first, 1_i64, 20_001_i64), (second, 2, 20_002)] {
+            guard
+                .connection
+                .execute(
+                    "INSERT INTO relay_grants(
+                    network_id, grant_id, node_id, route_id, generation, public_port, state,
+                    header_json, assignment_json, route_json, route_sha256, issued_at,
+                    expires_at, published_at, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'published', '{}', '{}', '{}', ?7,
+                    ?8, ?9, ?8, ?8)",
+                    params![
+                        network_id,
+                        grant_id.to_string(),
+                        node_id.to_string(),
+                        route_id.to_string(),
+                        generation,
+                        port,
+                        format!("sha256:{}", "0".repeat(64)),
+                        now,
+                        now + 3600
+                    ],
+                )
+                .unwrap();
+        }
+
+        acknowledge_relay_assignment(
+            &mut guard.connection,
+            node_id,
+            AcknowledgeRelayAssignmentRequest {
+                grant_id: second,
+                generation: RelayGeneration::new(2).unwrap(),
+            },
+        )
+        .unwrap();
+
+        let states = guard
+            .connection
+            .prepare("SELECT generation, state FROM relay_grants ORDER BY generation")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            [(1, "revoking".to_string()), (2, "published".to_string())]
+        );
+        let revoke_jobs: i64 = guard
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM relay_outbox WHERE grant_id = ?1 AND action = 'revoke'",
+                [first.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revoke_jobs, 1);
+        assert!(matches!(
+            acknowledge_relay_assignment(
+                &mut guard.connection,
+                node_id,
+                AcknowledgeRelayAssignmentRequest {
+                    grant_id: first,
+                    generation: RelayGeneration::new(1).unwrap(),
+                },
+            ),
+            Err(DatabaseError::RelayAcknowledgementConflict)
+        ));
+        acknowledge_relay_assignment(
+            &mut guard.connection,
+            node_id,
+            AcknowledgeRelayAssignmentRequest {
+                grant_id: second,
+                generation: RelayGeneration::new(2).unwrap(),
+            },
+        )
+        .expect("exact acknowledgement retry is idempotent");
     }
 
     fn insert_telemetry_subjects(connection: &Connection) -> (String, NodeId, UserId) {
@@ -9820,6 +11612,200 @@ mod tests {
             )
             .unwrap();
         (network_id, node_id, user_id)
+    }
+
+    fn traffic_batch(
+        node_id: NodeId,
+        user_id: UserId,
+        first: i64,
+        values: &[(i64, i64, i64)],
+    ) -> TelemetryBatch {
+        let events = values
+            .iter()
+            .enumerate()
+            .map(
+                |(offset, (bytes_up, bytes_down, connections))| TelemetryEvent {
+                    sequence: SequenceNumber::new(first + i64::try_from(offset).unwrap()).unwrap(),
+                    occurred_at: Timestamp::from_datetime(time::OffsetDateTime::now_utc()),
+                    kind: TelemetryEventKind::TrafficDelta {
+                        user_id,
+                        bytes_up: Count::new(*bytes_up).unwrap(),
+                        bytes_down: Count::new(*bytes_down).unwrap(),
+                        connection_count: Count::new(*connections).unwrap(),
+                    },
+                },
+            )
+            .collect::<Vec<_>>();
+        TelemetryBatch {
+            schema_version: TELEMETRY_SCHEMA_VERSION,
+            node_id,
+            first_sequence: events.first().unwrap().sequence,
+            last_sequence: events.last().unwrap().sequence,
+            events,
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_exact_retries_converge_and_overlap_or_gap_never_double_count() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::open(&database_path(&temp), "Telemetry retry").unwrap();
+        let (node_id, user_id) = {
+            let guard = database.inner.lock().unwrap();
+            let (_, node_id, user_id) = insert_telemetry_subjects(&guard.connection);
+            (node_id, user_id)
+        };
+        let first = traffic_batch(node_id, user_id, 1, &[(10, 20, 1)]);
+        let (left, right) = tokio::join!(
+            database.ingest_telemetry(node_id, first.clone()),
+            database.ingest_telemetry(node_id, first.clone())
+        );
+        assert_eq!(left.unwrap().acknowledged_sequence.get(), 1);
+        assert_eq!(right.unwrap().acknowledged_sequence.get(), 1);
+
+        let gap = traffic_batch(node_id, user_id, 3, &[(30, 40, 1)]);
+        assert!(matches!(
+            database.ingest_telemetry(node_id, gap).await,
+            Err(DatabaseError::TelemetrySequenceGap { expected: 2 })
+        ));
+        let overlap = traffic_batch(node_id, user_id, 1, &[(10, 20, 1), (30, 40, 1)]);
+        assert!(matches!(
+            database.ingest_telemetry(node_id, overlap).await,
+            Err(DatabaseError::TelemetrySequenceGap { expected: 2 })
+        ));
+        let second = traffic_batch(node_id, user_id, 2, &[(30, 40, 1)]);
+        assert_eq!(
+            database
+                .ingest_telemetry(node_id, second)
+                .await
+                .unwrap()
+                .acknowledged_sequence
+                .get(),
+            2
+        );
+        assert_eq!(
+            database
+                .ingest_telemetry(node_id, first)
+                .await
+                .unwrap()
+                .acknowledged_sequence
+                .get(),
+            2
+        );
+
+        let guard = database.inner.lock().unwrap();
+        let totals: (i64, i64, i64) = guard
+            .connection
+            .query_row(
+                "SELECT SUM(bytes_up), SUM(bytes_down), SUM(connection_count)
+             FROM traffic_hourly_aggregates WHERE node_id = ?1 AND user_id = ?2",
+                params![node_id.to_string(), user_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, (40, 60, 2));
+        let stored_events: i64 = guard
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM node_telemetry_events WHERE node_id = ?1",
+                [node_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_events, 2);
+    }
+
+    #[tokio::test]
+    async fn two_node_telemetry_aggregates_reconcile_to_each_acknowledged_sequence() {
+        let temp = TempDir::new().unwrap();
+        let database = Database::open(&database_path(&temp), "Telemetry multi-node").unwrap();
+        let (network_id, first_node, user_id, second_node) = {
+            let guard = database.inner.lock().unwrap();
+            let (network_id, first_node, user_id) = insert_telemetry_subjects(&guard.connection);
+            let second_node = NodeId::new();
+            guard
+                .connection
+                .execute(
+                    "INSERT INTO nodes(
+                    node_id, network_id, display_name, status, agent_version, platform,
+                    capabilities_json, identity_public_key, encryption_public_key,
+                    consent_policy_version, consent_host_owner, consent_exit_ip,
+                    consent_accepted_at, created_at, updated_at
+                 ) VALUES (?1, ?2, 'node two', 'active', '0.1.0', 'macos-arm64',
+                    '[]', ?3, ?4, 'v1', 1, 1, 1, 1, 1)",
+                    params![
+                        second_node.to_string(),
+                        network_id,
+                        format!("identity-{second_node}"),
+                        format!("encryption-{second_node}")
+                    ],
+                )
+                .unwrap();
+            guard
+                .connection
+                .execute(
+                    "INSERT INTO user_node_assignments(
+                    network_id, assignment_id, user_id, node_id, status,
+                    created_at, updated_at, disabled_at, deleted_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'enabled', 1, 1, NULL, NULL)",
+                    params![
+                        network_id,
+                        uuid::Uuid::new_v4().to_string(),
+                        user_id.to_string(),
+                        second_node.to_string()
+                    ],
+                )
+                .unwrap();
+            (network_id, first_node, user_id, second_node)
+        };
+        let first_batch = traffic_batch(first_node, user_id, 1, &[(10, 20, 1), (5, 7, 0)]);
+        let second_batch = traffic_batch(second_node, user_id, 1, &[(100, 200, 3)]);
+        let (first_ack, second_ack) = tokio::join!(
+            database.ingest_telemetry(first_node, first_batch),
+            database.ingest_telemetry(second_node, second_batch)
+        );
+        assert_eq!(first_ack.unwrap().acknowledged_sequence.get(), 2);
+        assert_eq!(second_ack.unwrap().acknowledged_sequence.get(), 1);
+
+        let guard = database.inner.lock().unwrap();
+        let mut statement = guard
+            .connection
+            .prepare(
+                "SELECT node_id, SUM(bytes_up), SUM(bytes_down), SUM(connection_count)
+             FROM traffic_hourly_aggregates
+             WHERE network_id = ?1 AND user_id = ?2 GROUP BY node_id ORDER BY node_id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map(params![network_id, user_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let expected = std::collections::BTreeMap::from([
+            (first_node.to_string(), (15, 27, 1)),
+            (second_node.to_string(), (100, 200, 3)),
+        ]);
+        let actual = rows
+            .into_iter()
+            .map(|(node, up, down, count)| (node, (up, down, count)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(actual, expected);
+        let cursor_sum: i64 = guard
+            .connection
+            .query_row(
+                "SELECT SUM(acknowledged_sequence) FROM node_telemetry_cursors
+             WHERE network_id = ?1 AND node_id IN (?2, ?3)",
+                params![network_id, first_node.to_string(), second_node.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_sum, 3);
     }
 
     #[test]

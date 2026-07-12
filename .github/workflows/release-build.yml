@@ -27,31 +27,56 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: control
+          - name: protocol
+          - name: xray-runtime
+          - name: node-host
+          - name: relay
+          - name: relay-provisioning
+          - name: connect
+          - name: control-app
+          - name: node-host-app
+          - name: probe-worker
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Run exact component gate and write evidence
+        run: scripts/release/run-component-gate.sh "${{ matrix.name }}" "component-evidence/${{ matrix.name }}.component.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: component-${{ matrix.name }}
+          path: component-evidence/${{ matrix.name }}.component.json
+          if-no-files-found: error
+
+  release-tooling-gates:
+    name: Release tooling gate (${{ matrix.name }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - name: release-manifest
             manifest: crates/release-manifest/Cargo.toml
           - name: release-manifest-tool
             manifest: scripts/release-manifest-tool/Cargo.toml
-          - name: node-host-app
-            manifest: node-host-app/src-tauri/Cargo.toml
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - name: Install pinned Rust
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
           rustup default "$RUST_TOOLCHAIN"
-      - name: Prepare Node Host test sidecars
-        if: matrix.name == 'node-host-app'
-        run: scripts/release/prepare-sidecars.sh --product node-host --target aarch64-apple-darwin
-      - name: Format
-        run: cargo fmt --manifest-path "${{ matrix.manifest }}" -- --check
-      - name: Test
-        run: cargo test --locked --manifest-path "${{ matrix.manifest }}" --all-targets
-      - name: Clippy
-        run: cargo clippy --locked --manifest-path "${{ matrix.manifest }}" --all-targets -- -D warnings
-      - name: Rustdoc
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --manifest-path "${{ matrix.manifest }}" --no-deps
+      - name: Test release tooling boundary
+        run: |
+          cargo fmt --manifest-path "${{ matrix.manifest }}" -- --check
+          cargo test --locked --manifest-path "${{ matrix.manifest }}" --all-targets
+          cargo clippy --locked --manifest-path "${{ matrix.manifest }}" --all-targets -- -D warnings
+          RUSTDOCFLAGS=-Dwarnings cargo doc --locked --manifest-path "${{ matrix.manifest }}" --no-deps
 
   packaging-gates:
     name: Packaging configuration and lifecycle
@@ -62,22 +87,44 @@ jobs:
         run: |
           python3 -m json.tool packaging/release-config.json >/dev/null
           python3 -m json.tool packaging/release-trust.json >/dev/null
+          python3 -m json.tool packaging/release-acceptance-evidence.schema.json >/dev/null
           python3 -m py_compile scripts/release/*.py
-          find scripts packaging -type f \( -name '*.sh' -o -path '*/pkg-scripts/*' \) -print0 | xargs -0 -n1 sh -n
+          while IFS= read -r script; do
+            if head -1 "$script" | grep -q bash; then bash -n "$script"; else sh -n "$script"; fi
+          done < <(find scripts packaging -type f \( -name '*.sh' -o -path '*/pkg-scripts/*' \) | sort)
           plutil -lint packaging/macos/com.sky.realitynode.agent.plist
       - name: Validate unsigned configuration path
         run: |
           for target in connect-macos-aarch64 connect-macos-x86_64 connect-windows-x86_64 node-host-macos-aarch64 node-host-macos-x86_64; do
             python3 scripts/release/verify-release-config.py --target "$target" --mode validation --output "$RUNNER_TEMP/$target.json"
           done
-      - name: Lifecycle smoke
+      - name: Simulated Unix transaction smoke (not release evidence)
         run: |
           scripts/smoke/run-unix-lifecycle.sh
           scripts/smoke/release-manifest.sh
+          packaging/macos/tests/preinstall-keeps-service-running.sh
+          packaging/macos/tests/service-state-rollback.sh
+          python3 -m unittest discover -s scripts/release/tests -v
+
+  windows-lifecycle-smoke:
+    name: Simulated Windows transaction smoke (not release evidence)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Validate PowerShell and simulated lifecycle semantics
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts,packaging -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors) { throw ($parseErrors | Out-String) }
+          }
+          scripts/smoke/run-windows-lifecycle.ps1
 
   build:
     name: Build ${{ matrix.release_target }}
-    needs: [component-gates, packaging-gates]
+    needs: [component-gates, release-tooling-gates, packaging-gates, windows-lifecycle-smoke]
     strategy:
       fail-fast: false
       matrix:
@@ -185,6 +232,14 @@ jobs:
       - name: Install frontend build dependencies
         working-directory: ${{ matrix.project }}
         run: npm ci
+      - name: Sign Windows inner executable and sidecar before bundling
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          cargo build --locked --manifest-path client/src-tauri/Cargo.toml --release --target "${{ matrix.triple }}"
+          scripts/release/sign-windows.ps1 `
+            -Files "client/src-tauri/target/${{ matrix.triple }}/release/reality-client.exe","client/src-tauri/binaries/xray-${{ matrix.triple }}.exe" `
+            -StatusFile "$env:RUNNER_TEMP/windows-inner-signing-status.json"
       - name: Build Tauri package
         working-directory: ${{ matrix.project }}
         shell: bash
@@ -203,6 +258,10 @@ jobs:
           if [[ "${{ matrix.product }}" == nodeHost ]]; then
             app=$(find "$bundle/macos" -maxdepth 1 -name '*.app' -type d -print -quit)
             ext=""; agent="node-host-${{ matrix.triple }}"; xray="xray-${{ matrix.triple }}"
+            if [[ "$REQUIRE_SIGNING" == 1 ]]; then
+              codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "node-host-app/src-tauri/binaries/$agent"
+              codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "node-host-app/src-tauri/binaries/$xray"
+            fi
             packaging/macos/build-node-host-pkg.sh --app "$app" --agent "node-host-app/src-tauri/binaries/$agent" --xray "node-host-app/src-tauri/binaries/$xray" --target "${{ matrix.triple }}" --version "$VERSION" --output release-output
             primary=$(find release-output -maxdepth 1 -name '*.pkg' -type f -print -quit)
           elif [[ "${{ matrix.platform }}" == macos ]]; then
@@ -239,6 +298,71 @@ jobs:
           name: ${{ matrix.release_target }}-${{ startsWith(github.ref, 'refs/tags/v') && 'signed-release' || 'unsigned-validation' }}
           path: release-output/
           if-no-files-found: error
+
+  artifact-lifecycle:
+    name: Actual artifact lifecycle (${{ matrix.release_target }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release_target: connect-macos-aarch64
+            platform: macos
+            runner: macos-14
+          - release_target: connect-macos-x86_64
+            platform: macos
+            runner: macos-15-intel
+          - release_target: connect-windows-x86_64
+            platform: windows
+            runner: windows-2022
+          - release_target: node-host-macos-aarch64
+            platform: macos
+            runner: macos-14
+          - release_target: node-host-macos-x86_64
+            platform: macos
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ${{ matrix.release_target }}-${{ startsWith(github.ref, 'refs/tags/v') && 'signed-release' || 'unsigned-validation' }}
+          path: lifecycle-input
+      - name: Select evidence mode and actual package
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then mode=release; else mode=validation; fi
+          artifact=$(find lifecycle-input -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.pkg' -o -name '*.exe' \) -print -quit)
+          [[ -n "$artifact" ]] || { echo "actual build artifact is missing" >&2; exit 66; }
+          echo "LIFECYCLE_MODE=$mode" >> "$GITHUB_ENV"
+          echo "LIFECYCLE_ARTIFACT=$artifact" >> "$GITHUB_ENV"
+          mkdir -p lifecycle-evidence
+      - name: Verify and install actual macOS package
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          scripts/smoke/run-macos-artifact-lifecycle.sh \
+            "$LIFECYCLE_ARTIFACT" \
+            "${{ matrix.release_target }}" \
+            "$LIFECYCLE_MODE" \
+            "lifecycle-evidence/${{ matrix.release_target }}.signature-verification.json" \
+            "lifecycle-evidence/${{ matrix.release_target }}.lifecycle.json"
+      - name: Verify and install actual Windows package
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          scripts/smoke/run-windows-artifact-lifecycle.ps1 `
+            -Artifact $env:LIFECYCLE_ARTIFACT `
+            -Target "${{ matrix.release_target }}" `
+            -Mode $env:LIFECYCLE_MODE `
+            -SignatureOutput "lifecycle-evidence/${{ matrix.release_target }}.signature-verification.json" `
+            -LifecycleOutput "lifecycle-evidence/${{ matrix.release_target }}.lifecycle.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: lifecycle-${{ matrix.release_target }}
+          path: lifecycle-evidence/
+          if-no-files-found: warn
 
   release-manifest:
     name: Release manifest and evidence
@@ -280,19 +404,127 @@ jobs:
             SHA256SUMS
           if-no-files-found: error
 
+  release-acceptance:
+    name: Aggregate strict release acceptance evidence
+    if: always()
+    needs: [component-gates, release-tooling-gates, packaging-gates, windows-lifecycle-smoke, build, artifact-lifecycle, release-manifest]
+    runs-on: ubuntu-24.04
+    outputs:
+      decision: ${{ steps.aggregate.outputs.decision }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Record upstream CI results
+        env:
+          COMPONENT_RESULT: ${{ needs.component-gates.result }}
+          RELEASE_TOOLING_RESULT: ${{ needs.release-tooling-gates.result }}
+          PACKAGING_RESULT: ${{ needs.packaging-gates.result }}
+          WINDOWS_SMOKE_RESULT: ${{ needs.windows-lifecycle-smoke.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          LIFECYCLE_RESULT: ${{ needs.artifact-lifecycle.result }}
+          MANIFEST_RESULT: ${{ needs.release-manifest.result }}
+        run: |
+          python3 - <<'PY' > "$RUNNER_TEMP/upstream-results.json"
+          import json, os
+          names = {
+              "component-gates": "COMPONENT_RESULT",
+              "release-tooling-gates": "RELEASE_TOOLING_RESULT",
+              "packaging-gates": "PACKAGING_RESULT",
+              "windows-lifecycle-smoke": "WINDOWS_SMOKE_RESULT",
+              "build": "BUILD_RESULT",
+              "artifact-lifecycle": "LIFECYCLE_RESULT",
+              "release-manifest": "MANIFEST_RESULT",
+          }
+          print(json.dumps({name: os.environ[variable] for name, variable in names.items()}))
+          PY
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/acceptance-inputs
+      - name: Aggregate candidate-bound evidence
+        id: aggregate
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then mode=release; else mode=validation; fi
+          if [[ -z "$(git status --porcelain --untracked-files=no)" ]]; then tree=clean; else tree=dirty; fi
+          release_evidence=$(find "$RUNNER_TEMP/acceptance-inputs" -name release-evidence.json -type f -print -quit 2>/dev/null || true)
+          [[ -n "$release_evidence" ]] || release_evidence="$RUNNER_TEMP/missing-release-evidence.json"
+          database_schema=$(sed -n 's/^pub const SCHEMA_VERSION: i64 = \([0-9][0-9]*\);/\1/p' control-server/src/db.rs)
+          minimum_agent=$(sed -n 's/^version = "\([^"]*\)"/\1/p' node-host/Cargo.toml | head -1)
+          minimum_client=$(python3 -c 'import json; print(json.load(open("client/src-tauri/tauri.conf.json"))["version"])')
+          decision=$(python3 scripts/release/acceptance-evidence.py aggregate \
+            --mode "$mode" \
+            --source-commit "$GITHUB_SHA" \
+            --tree-state "$tree" \
+            --ref "$GITHUB_REF" \
+            --components "$RUNNER_TEMP/acceptance-inputs" \
+            --artifacts "$RUNNER_TEMP/acceptance-inputs" \
+            --lifecycle "$RUNNER_TEMP/acceptance-inputs" \
+            --release-evidence "$release_evidence" \
+            --upstream-results "$RUNNER_TEMP/upstream-results.json" \
+            --database-schema "$database_schema" \
+            --minimum-agent "$minimum_agent" \
+            --minimum-client "$minimum_client" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "$GITHUB_WORKFLOW_REF" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --job release-acceptance \
+            --output release-acceptance-evidence.json)
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+          echo "release acceptance decision: $decision"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-acceptance
+          path: release-acceptance-evidence.json
+          if-no-files-found: error
+
   publish:
     name: Publish signed tag artifacts
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: release-manifest
+    if: always() && startsWith(github.ref, 'refs/tags/v')
+    needs: release-acceptance
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
+          pattern: '*-signed-release'
           path: publish
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-manifest-signed
+          path: publish
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-acceptance
+          path: publish
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: component-*
+          path: publish/components
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: lifecycle-*
+          path: publish/lifecycle
+          merge-multiple: true
+      - name: Fail closed unless the same immutable candidate is accepted
+        run: |
+          release_id=$(python3 -c 'import json; print(json.load(open("publish/release-evidence.json"))["releaseId"])')
+          python3 scripts/release/acceptance-evidence.py verify-accepted \
+            --evidence publish/release-acceptance-evidence.json \
+            --artifacts publish \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-release-id "$release_id" \
+            --components publish/components \
+            --lifecycle publish/lifecycle \
+            --release-evidence publish/release-evidence.json
       - name: Publish immutable GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" publish/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          mapfile -d '' files < <(find publish -maxdepth 1 -type f -print0 | sort -z)
+          [[ ${#files[@]} -gt 0 ]] || { echo "validated publish artifact set is empty" >&2; exit 66; }
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
