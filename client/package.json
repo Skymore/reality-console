@@ -5,8 +5,13 @@
   "type": "module",
   "scripts": {
     "prepare:xray": "node scripts/prepare-xray-sidecar.mjs",
+    "prepare:xray:all": "npm run prepare:xray -- --target=aarch64-apple-darwin && npm run prepare:xray -- --target=x86_64-apple-darwin && npm run prepare:xray -- --target=x86_64-pc-windows-msvc",
+    "test:sidecar": "node --test scripts/prepare-xray-sidecar.test.mjs",
     "dev": "vite",
     "build": "tsc && vite build",
+    "bundle:macos:arm64": "tauri build --target aarch64-apple-darwin",
+    "bundle:macos:x64": "tauri build --target x86_64-apple-darwin",
+    "bundle:windows:x64": "tauri build --target x86_64-pc-windows-msvc",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -20,6 +25,7 @@
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
+    "fflate": "^0.8.2",
     "vite": "^7.0.4"
   }
 }

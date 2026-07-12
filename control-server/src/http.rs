@@ -7,7 +7,7 @@ use crate::desired::DesiredStateConfigurationDraft;
 use crate::error::{ApiError, REQUEST_ID_HEADER};
 use crate::protocol::RequestId;
 use axum::body::Body;
-use axum::extract::{Extension, Path, Request, State};
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -28,9 +28,13 @@ use control_protocol::node::{
 };
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
 use control_protocol::secret::Secret;
+use control_protocol::telemetry::{
+    TelemetryBatch, TelemetryBatchAcknowledgement, TelemetryCursor, TrafficAggregate,
+    MAX_TELEMETRY_BATCH_BYTES,
+};
 use http_body_util::BodyExt as _;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
@@ -99,6 +103,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/admin/nodes/{node_id}/disable", post(disable_node))
         .route("/v1/admin/nodes/{node_id}/revoke", post(revoke_node))
         .route(
+            "/v1/admin/nodes/{node_id}/protocol-canary/rotate",
+            post(rotate_protocol_canary),
+        )
+        .route(
             "/v1/admin/nodes/{node_id}/reconcile",
             put(reconcile_node_desired_state),
         )
@@ -106,6 +114,12 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/admin/nodes/{node_id}/desired-state",
             post(publish_desired_state),
         )
+        .route("/v1/admin/telemetry/usage", get(get_traffic_usage))
+        .route(
+            "/v1/admin/telemetry/retention/run",
+            post(run_telemetry_retention),
+        )
+        .route("/v1/admin/support-bundle", get(get_support_bundle))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let authenticated_node_routes = Router::new()
         .route("/v1/nodes/{node_id}/heartbeat", post(node_heartbeat))
@@ -114,6 +128,11 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/nodes/{node_id}/revisions/{revision}/result",
             put(report_revision_result),
         )
+        .route(
+            "/v1/nodes/{node_id}/telemetry/cursor",
+            get(get_node_telemetry_cursor),
+        )
+        .route("/v1/nodes/{node_id}/telemetry", put(upload_node_telemetry))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authenticate_node,
@@ -164,7 +183,8 @@ async fn authenticate_node(
         .path_and_query()
         .map_or_else(|| request.uri().path().to_owned(), ToString::to_string);
     let (mut parts, body) = request.into_parts();
-    let body = match read_bounded_body(body, request_id).await {
+    let body_limit = request_body_limit(&path_and_query);
+    let body = match read_bounded_body_with_limit(body, request_id, body_limit).await {
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
@@ -307,6 +327,72 @@ async fn report_revision_result(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn rotate_protocol_canary(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<DesiredStatePublicationResponse>, ApiError> {
+    let node_id = path_node_id
+        .parse::<NodeId>()
+        .map_err(|_| ApiError::not_found(request_id))?;
+    let desired = state
+        .database
+        .rotate_protocol_canary(node_id)
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(Json(DesiredStatePublicationResponse::from_desired(
+        &desired, true,
+    )))
+}
+
+async fn get_node_telemetry_cursor(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(authenticated): Extension<AuthenticatedNode>,
+) -> Result<Json<TelemetryCursor>, ApiError> {
+    require_matching_node(&path_node_id, authenticated.node_id, request_id)?;
+    state
+        .database
+        .telemetry_cursor(authenticated.node_id)
+        .await
+        .map(Json)
+        .map_err(|error| database_api_error(error, request_id))
+}
+
+async fn upload_node_telemetry(
+    State(state): State<AppState>,
+    Path(path_node_id): Path<String>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(authenticated): Extension<AuthenticatedNode>,
+    Extension(body): Extension<SignedBody>,
+) -> Result<Json<TelemetryBatchAcknowledgement>, ApiError> {
+    require_matching_node(&path_node_id, authenticated.node_id, request_id)?;
+    let batch: TelemetryBatch =
+        serde_json::from_slice(&body.0).map_err(|_| ApiError::validation_failed(request_id))?;
+    batch
+        .validate(&[control_protocol::version::TELEMETRY_SCHEMA_VERSION])
+        .map_err(|_| ApiError::validation_failed(request_id))?;
+    state
+        .database
+        .ingest_telemetry(authenticated.node_id, batch)
+        .await
+        .map(Json)
+        .map_err(|error| database_api_error(error, request_id))
+}
+
+fn require_matching_node(
+    path_node_id: &str,
+    authenticated_node_id: NodeId,
+    request_id: RequestId,
+) -> Result<(), ApiError> {
+    if path_node_id == authenticated_node_id.to_string() {
+        Ok(())
+    } else {
+        Err(ApiError::authentication_failed(request_id))
+    }
+}
+
 async fn create_node_invitation(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
@@ -391,7 +477,15 @@ where
     serde_json::from_slice(&bytes).map_err(|_| ApiError::validation_failed(request_id))
 }
 
-async fn read_bounded_body(mut body: Body, request_id: RequestId) -> Result<Vec<u8>, ApiError> {
+async fn read_bounded_body(body: Body, request_id: RequestId) -> Result<Vec<u8>, ApiError> {
+    read_bounded_body_with_limit(body, request_id, MAX_REQUEST_BODY_BYTES).await
+}
+
+async fn read_bounded_body_with_limit(
+    mut body: Body,
+    request_id: RequestId,
+    limit: usize,
+) -> Result<Vec<u8>, ApiError> {
     let mut bytes = Vec::new();
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| ApiError::validation_failed(request_id))?;
@@ -400,7 +494,7 @@ async fn read_bounded_body(mut body: Body, request_id: RequestId) -> Result<Vec<
                 .len()
                 .checked_add(data.len())
                 .ok_or_else(|| ApiError::body_too_large(request_id))?;
-            if next_length > MAX_REQUEST_BODY_BYTES {
+            if next_length > limit {
                 return Err(ApiError::body_too_large(request_id));
             }
             bytes.extend_from_slice(&data);
@@ -409,14 +503,29 @@ async fn read_bounded_body(mut body: Body, request_id: RequestId) -> Result<Vec<
     Ok(bytes)
 }
 
+fn request_body_limit(path_and_query: &str) -> usize {
+    if path_and_query
+        .split('?')
+        .next()
+        .is_some_and(|path| path.starts_with("/v1/nodes/") && path.ends_with("/telemetry"))
+    {
+        MAX_TELEMETRY_BATCH_BYTES
+    } else {
+        MAX_REQUEST_BODY_BYTES
+    }
+}
+
 fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
     match error {
         DatabaseError::Validation(_)
         | DatabaseError::EnrollmentDisplayNameMismatch
         | DatabaseError::NodePublicMaterialRequired
-        | DatabaseError::NodeBootstrapCapabilitiesRequired => {
-            ApiError::validation_failed(request_id)
-        }
+        | DatabaseError::NodeBootstrapCapabilitiesRequired
+        | DatabaseError::TelemetryNodeMismatch
+        | DatabaseError::TelemetryUserNotAssigned
+        | DatabaseError::DetailedTelemetryDisabled
+        | DatabaseError::TelemetryClockSkew
+        | DatabaseError::InvalidTelemetryQuery => ApiError::validation_failed(request_id),
         DatabaseError::InvitationInvalid => ApiError::invitation_invalid(request_id),
         DatabaseError::InvitationExpired => ApiError::invitation_expired(request_id),
         DatabaseError::InvitationConsumed => ApiError::invitation_consumed(request_id),
@@ -444,6 +553,9 @@ fn database_api_error(error: DatabaseError, request_id: RequestId) -> ApiError {
         | DatabaseError::EndpointCandidateRevisionConflict
         | DatabaseError::DesiredStatePublicationConflict { .. } => {
             ApiError::state_conflict(request_id)
+        }
+        DatabaseError::TelemetrySequenceGap { .. } | DatabaseError::TelemetryCursorConflict => {
+            ApiError::telemetry_sequence_gap(request_id)
         }
         DatabaseError::NodeNotFound
         | DatabaseError::RevisionTargetNotFound
@@ -518,6 +630,21 @@ struct AccountListResponse {
     accounts: Vec<AccountSummary>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrafficUsageQuery {
+    bucket_seconds: u32,
+    since: i64,
+    user_id: Option<UserId>,
+    node_id: Option<NodeId>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrafficUsageResponse {
+    aggregates: Vec<TrafficAggregate>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NodeInvitationDeliveryResponse {
@@ -554,7 +681,7 @@ impl DesiredStatePublicationResponse {
             revision: desired.document.revision,
             schema_version: desired.document.schema_version,
             created_at: desired.document.created_at,
-            user_count: desired.document.users.len(),
+            user_count: desired.document.users.len().saturating_sub(1),
             created,
         }
     }
@@ -688,6 +815,48 @@ async fn get_accounts(
         .await
         .map_err(|error| database_api_error(error, request_id))?;
     Ok(Json(AccountListResponse { accounts }))
+}
+
+async fn get_traffic_usage(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(query): Query<TrafficUsageQuery>,
+) -> Result<Json<TrafficUsageResponse>, ApiError> {
+    let aggregates = state
+        .database
+        .traffic_aggregates(
+            query.bucket_seconds,
+            query.user_id,
+            query.node_id,
+            query.since,
+        )
+        .await
+        .map_err(|error| database_api_error(error, request_id))?;
+    Ok(Json(TrafficUsageResponse { aggregates }))
+}
+
+async fn run_telemetry_retention(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<control_protocol::telemetry::TelemetryRetentionResult>, ApiError> {
+    state
+        .database
+        .enforce_telemetry_retention()
+        .await
+        .map(Json)
+        .map_err(|error| database_api_error(error, request_id))
+}
+
+async fn get_support_bundle(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .database
+        .support_bundle()
+        .await
+        .map(Json)
+        .map_err(|error| database_api_error(error, request_id))
 }
 
 async fn create_account(
@@ -1076,12 +1245,13 @@ async fn require_admin(State(state): State<AppState>, request: Request, next: Ne
 
 async fn enforce_limits(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let request_id = request_id(&request);
+    let body_limit = request_body_limit(request.uri().path());
     let content_length = request
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    if content_length.is_some_and(|length| length > MAX_REQUEST_BODY_BYTES as u64) {
+    if content_length.is_some_and(|length| length > body_limit as u64) {
         return ApiError::body_too_large(request_id).into_response();
     }
 

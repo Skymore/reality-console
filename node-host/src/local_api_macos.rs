@@ -286,6 +286,7 @@ impl Drop for SocketPathGuard {
 mod tests {
     use super::*;
     use crate::local_api::{LocalServicePhase, NodeSetupPhase, LOCAL_API_SOCKET_FILE};
+    use crate::{RelayAssignmentState, RelayAssignmentStatus, RelayRuntimeState};
     use crate::{RouterMappingState, RouterMappingStatus};
     use control_protocol::id::{
         ControllerInstanceId, EndpointId, NodeId, Revision, SequenceNumber, SigningKeyId, Timestamp,
@@ -332,6 +333,15 @@ mod tests {
                 lease_expires_at: None,
                 last_error_code: None,
             },
+            relay_assignment: RelayAssignmentStatus {
+                state: RelayAssignmentState::NotConfigured,
+                endpoint_id: None,
+                public_address: None,
+                public_port: None,
+                expires_at: None,
+                consented_at: None,
+            },
+            relay_runtime: RelayRuntimeState::NotConfigured,
             last_error: None,
         }
     }

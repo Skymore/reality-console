@@ -421,10 +421,10 @@ pub enum RuntimeError {
     EmptyVersionOutput,
 }
 
-struct CapturedOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct CapturedOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 enum ReadFailure {
@@ -432,7 +432,7 @@ enum ReadFailure {
     Io(io::Error),
 }
 
-async fn revalidate_binary(binary: &VerifiedXrayBinary) -> Result<(), RuntimeError> {
+pub(crate) async fn revalidate_binary(binary: &VerifiedXrayBinary) -> Result<(), RuntimeError> {
     let binary = binary.clone();
     tokio::task::spawn_blocking(move || binary.revalidate())
         .await
@@ -464,7 +464,7 @@ fn write_private_config(config: &RenderedXrayConfig) -> Result<NamedTempFile, Ru
     Ok(file)
 }
 
-fn configure_command(command: &mut Command, current_directory: Option<&Path>) {
+pub(crate) fn configure_command(command: &mut Command, current_directory: Option<&Path>) {
     command
         .env_clear()
         .stdin(Stdio::null())
@@ -476,7 +476,7 @@ fn configure_command(command: &mut Command, current_directory: Option<&Path>) {
     }
 }
 
-async fn run_bounded(
+pub(crate) async fn run_bounded(
     mut command: Command,
     operation: &'static str,
     limits: ExecutionLimits,
@@ -597,7 +597,7 @@ async fn terminate_child(child: &mut Child, already_exited: bool) {
     let _ = timeout(CHILD_REAP_TIMEOUT, child.wait()).await;
 }
 
-fn non_zero_error(operation: &'static str, output: &CapturedOutput) -> RuntimeError {
+pub(crate) fn non_zero_error(operation: &'static str, output: &CapturedOutput) -> RuntimeError {
     RuntimeError::NonZeroExit {
         operation,
         exit_code: output.status.code(),

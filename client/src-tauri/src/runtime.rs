@@ -300,7 +300,7 @@ impl ConnectRuntimeRegistry {
         self.lazy_restore().await?;
         self.active()
             .await?
-            .select_and_connect(app, self.started_at.elapsed(), proxy_mode)
+            .select_and_connect(app, now_timestamp(), self.started_at.elapsed(), proxy_mode)
             .await
     }
 
@@ -348,7 +348,10 @@ impl ConnectRuntimeRegistry {
             }
         }
         if due.health {
-            match service.maintain_connection(app, monotonic_now).await {
+            match service
+                .maintain_connection(app, wall_now, monotonic_now)
+                .await
+            {
                 Ok(snapshot) => latest = Some(snapshot),
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}

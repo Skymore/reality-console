@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum number of telemetry events accepted in one protocol batch.
 pub const MAX_TELEMETRY_BATCH_EVENTS: usize = 1_000;
+/// Maximum accepted serialized telemetry request size.
+pub const MAX_TELEMETRY_BATCH_BYTES: usize = 256 * 1024;
+/// Current telemetry upload schema.
+pub const TELEMETRY_SCHEMA_VERSION: u16 = 1;
 
 /// Network protocol retained by opt-in detailed connection analytics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,7 +137,7 @@ impl TelemetryEventKind {
 
 /// One durably sequenced node telemetry event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct TelemetryEvent {
     /// Node-local monotonic sequence number.
     pub sequence: SequenceNumber,
@@ -186,6 +190,13 @@ impl TelemetryBatch {
                 "telemetry batch must contain between 1 and 1000 events",
             ));
         }
+        if self.first_sequence.get() == 0 {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "firstSequence",
+                "telemetry event sequences begin at one",
+            ));
+        }
         if self.events.first().map(|event| event.sequence) != Some(self.first_sequence)
             || self.events.last().map(|event| event.sequence) != Some(self.last_sequence)
         {
@@ -228,6 +239,89 @@ pub struct TelemetryBatchAcknowledgement {
     pub acknowledged_sequence: SequenceNumber,
     /// Next sequence expected by the controller.
     pub expected_sequence: SequenceNumber,
+}
+
+/// Controller-owned durable cursor used to resume or replay a node spool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TelemetryCursor {
+    /// Highest sequence durably committed, or zero before the first event.
+    pub acknowledged_sequence: SequenceNumber,
+    /// Exact next sequence accepted for a new event.
+    pub expected_sequence: SequenceNumber,
+}
+
+impl TelemetryCursor {
+    /// Validates the adjacent durable cursor pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the expected sequence does not immediately follow
+    /// the acknowledgement.
+    pub fn validate(self) -> Result<(), ProtocolValidationError> {
+        TelemetryBatchAcknowledgement {
+            acknowledged_sequence: self.acknowledged_sequence,
+            expected_sequence: self.expected_sequence,
+        }
+        .validate()
+    }
+}
+
+/// One privacy-bounded aggregate returned to an operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TrafficAggregate {
+    /// Stable logical member identity.
+    pub user_id: UserId,
+    /// Stable reporting node identity.
+    pub node_id: NodeId,
+    /// UTC Unix bucket start in seconds.
+    pub bucket_start: i64,
+    /// Bucket width in seconds.
+    pub bucket_seconds: u32,
+    /// Sum of normalized upload deltas.
+    pub bytes_up: Count,
+    /// Sum of normalized download deltas.
+    pub bytes_down: Count,
+    /// Sum of normalized connection deltas.
+    pub connection_count: Count,
+}
+
+impl TrafficAggregate {
+    /// Validates one aggregate without claiming destination-level accuracy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported bucket width or misaligned bucket.
+    pub fn validate(&self) -> Result<(), ProtocolValidationError> {
+        if !matches!(self.bucket_seconds, 3_600 | 86_400)
+            || self.bucket_start < 0
+            || self.bucket_start % i64::from(self.bucket_seconds) != 0
+        {
+            return Err(ProtocolValidationError::new(
+                ValidationCode::OutOfRange,
+                "bucketStart",
+                "traffic aggregate bucket is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Result of one age-based telemetry retention pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TelemetryRetentionResult {
+    /// Raw traffic delta rows removed after hourly aggregation retention.
+    pub traffic_events_deleted: u64,
+    /// Detailed connection rows removed.
+    pub detailed_events_deleted: u64,
+    /// Transient health and quality rows removed.
+    pub health_events_deleted: u64,
+    /// Hourly aggregate rows removed.
+    pub hourly_aggregates_deleted: u64,
+    /// Daily aggregate rows removed.
+    pub daily_aggregates_deleted: u64,
 }
 
 impl TelemetryBatchAcknowledgement {

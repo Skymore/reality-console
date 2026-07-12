@@ -1,0 +1,298 @@
+name: Release build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.88.0"
+  NODE_VERSION: "22.17.0"
+
+jobs:
+  component-gates:
+    name: Component gate (${{ matrix.name }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release-manifest
+            manifest: crates/release-manifest/Cargo.toml
+          - name: release-manifest-tool
+            manifest: scripts/release-manifest-tool/Cargo.toml
+          - name: node-host-app
+            manifest: node-host-app/src-tauri/Cargo.toml
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Prepare Node Host test sidecars
+        if: matrix.name == 'node-host-app'
+        run: scripts/release/prepare-sidecars.sh --product node-host --target aarch64-apple-darwin
+      - name: Format
+        run: cargo fmt --manifest-path "${{ matrix.manifest }}" -- --check
+      - name: Test
+        run: cargo test --locked --manifest-path "${{ matrix.manifest }}" --all-targets
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path "${{ matrix.manifest }}" --all-targets -- -D warnings
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --manifest-path "${{ matrix.manifest }}" --no-deps
+
+  packaging-gates:
+    name: Packaging configuration and lifecycle
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Validate scripts and configuration
+        run: |
+          python3 -m json.tool packaging/release-config.json >/dev/null
+          python3 -m json.tool packaging/release-trust.json >/dev/null
+          python3 -m py_compile scripts/release/*.py
+          find scripts packaging -type f \( -name '*.sh' -o -path '*/pkg-scripts/*' \) -print0 | xargs -0 -n1 sh -n
+          plutil -lint packaging/macos/com.sky.realitynode.agent.plist
+      - name: Validate unsigned configuration path
+        run: |
+          for target in connect-macos-aarch64 connect-macos-x86_64 connect-windows-x86_64 node-host-macos-aarch64 node-host-macos-x86_64; do
+            python3 scripts/release/verify-release-config.py --target "$target" --mode validation --output "$RUNNER_TEMP/$target.json"
+          done
+      - name: Lifecycle smoke
+        run: |
+          scripts/smoke/run-unix-lifecycle.sh
+          scripts/smoke/release-manifest.sh
+
+  build:
+    name: Build ${{ matrix.release_target }}
+    needs: [component-gates, packaging-gates]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release_target: connect-macos-aarch64
+            product: connect
+            product_slug: connect
+            platform: macos
+            architecture: aarch64
+            triple: aarch64-apple-darwin
+            runner: macos-14
+            project: client
+            cargo_lock: client/src-tauri/Cargo.lock
+            npm_lock: client/package-lock.json
+          - release_target: connect-macos-x86_64
+            product: connect
+            product_slug: connect
+            platform: macos
+            architecture: x86_64
+            triple: x86_64-apple-darwin
+            runner: macos-15-intel
+            project: client
+            cargo_lock: client/src-tauri/Cargo.lock
+            npm_lock: client/package-lock.json
+          - release_target: connect-windows-x86_64
+            product: connect
+            product_slug: connect
+            platform: windows
+            architecture: x86_64
+            triple: x86_64-pc-windows-msvc
+            runner: windows-2022
+            project: client
+            cargo_lock: client/src-tauri/Cargo.lock
+            npm_lock: client/package-lock.json
+          - release_target: node-host-macos-aarch64
+            product: nodeHost
+            product_slug: node-host
+            platform: macos
+            architecture: aarch64
+            triple: aarch64-apple-darwin
+            runner: macos-14
+            project: node-host-app
+            cargo_lock: node-host-app/src-tauri/Cargo.lock
+            npm_lock: node-host-app/package-lock.json
+          - release_target: node-host-macos-x86_64
+            product: nodeHost
+            product_slug: node-host
+            platform: macos
+            architecture: x86_64
+            triple: x86_64-apple-darwin
+            runner: macos-15-intel
+            project: node-host-app
+            cargo_lock: node-host-app/src-tauri/Cargo.lock
+            npm_lock: node-host-app/package-lock.json
+    runs-on: ${{ matrix.runner }}
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'artifact-signing' || null }}
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      MACOS_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+      WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+      WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.npm_lock }}
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup target add "${{ matrix.triple }}" --toolchain "$RUST_TOOLCHAIN"
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Select validation or signed-release mode
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "MODE=release" >> "$GITHUB_ENV"
+            echo "REQUIRE_SIGNING=1" >> "$GITHUB_ENV"
+            echo "SIGNATURE_STATUS=signed" >> "$GITHUB_ENV"
+            echo "ARTIFACT_SUFFIX=" >> "$GITHUB_ENV"
+          else
+            echo "MODE=validation" >> "$GITHUB_ENV"
+            echo "REQUIRE_SIGNING=0" >> "$GITHUB_ENV"
+            echo "SIGNATURE_STATUS=unsigned-validation" >> "$GITHUB_ENV"
+            echo "ARTIFACT_SUFFIX=-unsigned-validation" >> "$GITHUB_ENV"
+          fi
+      - name: Validate release and secret configuration
+        shell: bash
+        run: python3 scripts/release/verify-release-config.py --target "${{ matrix.release_target }}" --mode "$MODE" --scope artifact --output "$RUNNER_TEMP/signing-config.json"
+      - name: Prepare verified sidecars
+        shell: bash
+        run: |
+          scripts/release/prepare-sidecars.sh --product "${{ matrix.product_slug }}" --target "${{ matrix.triple }}" --release
+          mkdir -p "$RUNNER_TEMP/xray-bin"
+          ext=""; [[ "${{ matrix.platform }}" == windows ]] && ext=.exe
+          cp "${{ matrix.project }}/src-tauri/binaries/xray-${{ matrix.triple }}$ext" "$RUNNER_TEMP/xray-bin/xray$ext"
+          echo "$RUNNER_TEMP/xray-bin" >> "$GITHUB_PATH"
+      - name: Install frontend build dependencies
+        working-directory: ${{ matrix.project }}
+        run: npm ci
+      - name: Build Tauri package
+        working-directory: ${{ matrix.project }}
+        shell: bash
+        run: |
+          bundle=dmg
+          [[ "${{ matrix.platform }}" == windows ]] && bundle=nsis
+          [[ "${{ matrix.product }}" == nodeHost ]] && bundle=app
+          npm run tauri -- build --target "${{ matrix.triple }}" --bundles "$bundle"
+      - name: Assemble primary artifact
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import json; print(json.load(open("${{ matrix.project }}/src-tauri/tauri.conf.json"))["version"])')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p release-output
+          bundle="${{ matrix.project }}/src-tauri/target/${{ matrix.triple }}/release/bundle"
+          if [[ "${{ matrix.product }}" == nodeHost ]]; then
+            app=$(find "$bundle/macos" -maxdepth 1 -name '*.app' -type d -print -quit)
+            ext=""; agent="node-host-${{ matrix.triple }}"; xray="xray-${{ matrix.triple }}"
+            packaging/macos/build-node-host-pkg.sh --app "$app" --agent "node-host-app/src-tauri/binaries/$agent" --xray "node-host-app/src-tauri/binaries/$xray" --target "${{ matrix.triple }}" --version "$VERSION" --output release-output
+            primary=$(find release-output -maxdepth 1 -name '*.pkg' -type f -print -quit)
+          elif [[ "${{ matrix.platform }}" == macos ]]; then
+            source=$(find "$bundle/dmg" -maxdepth 1 -name '*.dmg' -type f -print -quit)
+            primary="release-output/connect-$VERSION-macos-${{ matrix.architecture }}$ARTIFACT_SUFFIX.dmg"
+            cp "$source" "$primary"
+          else
+            source=$(find "$bundle/nsis" -maxdepth 1 -name '*-setup.exe' -type f -print -quit)
+            primary="release-output/connect-$VERSION-windows-${{ matrix.architecture }}$ARTIFACT_SUFFIX.exe"
+            cp "$source" "$primary"
+          fi
+          [ -f "$primary" ] || { echo "primary package was not produced" >&2; exit 1; }
+          printf '%s\n' "$primary" > "$RUNNER_TEMP/primary-artifact"
+      - name: Sign Windows package
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: scripts/release/sign-windows.ps1 -ArtifactDirectory release-output -StatusFile release-output/${{ matrix.release_target }}.windows-signing-status.json
+      - name: Notarize macOS package
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: scripts/release/notarize-macos.sh "$(cat "$RUNNER_TEMP/primary-artifact")" release-output/${{ matrix.release_target }}.notarization-status.json
+      - name: Generate deterministic SBOM and artifact metadata
+        shell: bash
+        run: |
+          primary=$(cat "$RUNNER_TEMP/primary-artifact")
+          name=$(basename "$primary")
+          xray_sha=$(python3 -c 'import json; c=json.load(open("packaging/release-config.json")); print(c["xray"]["assets"]["${{ matrix.triple }}"]["binarySha256"])')
+          python3 scripts/release/generate-sbom.py --product "${{ matrix.product }}" --version "$VERSION" --target "${{ matrix.triple }}" --cargo-lock "${{ matrix.cargo_lock }}" --npm-lock "${{ matrix.npm_lock }}" --xray-version 26.3.27 --xray-sha256 "$xray_sha" --output "release-output/$name.cdx.json"
+          python3 scripts/release/write-artifact-metadata.py --product "${{ matrix.product }}" --platform "${{ matrix.platform }}" --architecture "${{ matrix.architecture }}" --version "$VERSION" --artifact "$primary" --sbom "release-output/$name.cdx.json" --xray-version 26.3.27 --signature-status "$SIGNATURE_STATUS" --output "release-output/$name.artifact.json"
+          cp "${{ matrix.project }}/src-tauri/binaries/sidecars-${{ matrix.triple }}.json" "release-output/$name.sidecars.json"
+          cp "$RUNNER_TEMP/signing-config.json" "release-output/${{ matrix.release_target }}.signing-config.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.release_target }}-${{ startsWith(github.ref, 'refs/tags/v') && 'signed-release' || 'unsigned-validation' }}
+          path: release-output/
+          if-no-files-found: error
+
+  release-manifest:
+    name: Release manifest and evidence
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'release-signing' || null }}
+    env:
+      RELEASE_SIGNING_KEY_ID: ${{ secrets.RELEASE_SIGNING_KEY_ID }}
+      RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: release-inputs
+          merge-multiple: true
+      - name: Install pinned Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Generate crate-aligned manifest and evidence
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export REQUIRE_SIGNING=1; mode=release; signed=--require-signed; else export REQUIRE_SIGNING=0; mode=validation; signed=; fi
+          key_id=${RELEASE_SIGNING_KEY_ID:-unsigned_validation_key}
+          python3 scripts/release/verify-release-config.py --target connect-macos-aarch64 --mode "$mode" --scope manifest --output manifest-signing-config.json
+          expected=; [[ "$GITHUB_REF" == refs/tags/v* ]] && expected="--expected-version ${GITHUB_REF_NAME#v}"
+          issued=$(git show -s --format=%ct "$GITHUB_SHA")
+          python3 scripts/release/create-manifest-input.py --artifacts release-inputs --source-commit "$GITHUB_SHA" --issued-at "$issued" $signed $expected --output release-input.json
+          cargo run --locked --manifest-path scripts/release-manifest-tool/Cargo.toml -- generate release-input.json release-manifest.json release-evidence.json "$key_id" packaging/release-trust.json
+          if [[ "$REQUIRE_SIGNING" == 1 ]]; then
+            cargo run --locked --manifest-path scripts/release-manifest-tool/Cargo.toml -- verify release-manifest.json release-input.json packaging/release-trust.json
+          fi
+          python3 scripts/release/generate-checksums.py --output SHA256SUMS release-inputs/*.{dmg,pkg,exe,json} release-manifest.json release-evidence.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-manifest-${{ startsWith(github.ref, 'refs/tags/v') && 'signed' || 'unsigned-validation' }}
+          path: |
+            release-manifest.json
+            release-evidence.json
+            SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    name: Publish signed tag artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-manifest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: publish
+          merge-multiple: true
+      - name: Publish immutable GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" publish/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

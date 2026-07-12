@@ -37,6 +37,7 @@ use control_protocol::secret::Secret;
 use control_server::probe::{
     TcpProbeCompletion, TcpProbeErrorCode, TcpProbeLoopOptions, TcpProbeResult,
 };
+use control_server::protocol_canary::{ProtocolCanaryLoopOptions, ProtocolCanaryResult};
 use control_server::{build_router, AppState, Database, ServiceConfig};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use futures_util::stream;
@@ -674,7 +675,10 @@ async fn fetch_published_desired(
     let desired: SignedDesiredState = serde_json::from_value(json(response).await).unwrap();
     assert_eq!(desired.document.revision, publication.revision);
     assert_eq!(desired.document.schema_version, publication.schema_version);
-    assert_eq!(desired.document.users.len(), publication.user_count);
+    assert_eq!(
+        desired.document.users.len(),
+        publication.user_count.saturating_add(1)
+    );
     desired
 }
 
@@ -1458,7 +1462,7 @@ async fn setup_code_automatically_enrolls_approves_and_publishes_one_initial_sta
     let desired_response = fetch_desired(&app, &node, 0, 231).await;
     assert_eq!(desired_response.status(), StatusCode::OK);
     let desired: SignedDesiredState = serde_json::from_value(json(desired_response).await).unwrap();
-    assert!(desired.document.users.is_empty());
+    assert_eq!(desired.document.users.len(), 1);
     assert_eq!(desired.document.xray.listen_port, 10_443);
     assert_eq!(desired.document.xray.public_port, Some(8_443));
 
@@ -1932,6 +1936,145 @@ async fn tcp_preflight_is_durable_and_cannot_mark_an_endpoint_verified() {
             [node.node_id.to_string()],
         )
         .is_err());
+}
+
+#[tokio::test]
+async fn protocol_canary_is_the_only_worker_path_that_marks_an_endpoint_verified() {
+    let app = TestApp::new();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 230).await).await;
+    let tcp = app
+        .database
+        .claim_tcp_probe(Uuid::new_v4(), TcpProbeLoopOptions::default())
+        .await
+        .unwrap()
+        .unwrap();
+    app.database
+        .complete_tcp_probe(
+            tcp,
+            TcpProbeResult::connected(
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                Duration::from_millis(7),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let canary = app
+        .database
+        .claim_protocol_canary(Uuid::new_v4(), ProtocolCanaryLoopOptions::default())
+        .await
+        .unwrap()
+        .expect("TCP-reachable applied endpoint should be due for protocol verification");
+    let debug = format!("{canary:?}");
+    assert!(debug.contains("[REDACTED]"));
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let raw_canary: String = connection
+        .query_row(
+            "SELECT vless_uuid FROM endpoint_canary_credentials WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!debug.contains(&raw_canary));
+    drop(connection);
+
+    assert_eq!(
+        app.database
+            .complete_protocol_canary(
+                canary,
+                ProtocolCanaryResult::Connected {
+                    latency: Duration::from_millis(13),
+                },
+            )
+            .await
+            .unwrap(),
+        TcpProbeCompletion::Recorded
+    );
+    let verified =
+        accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 231).await).await;
+    assert_eq!(
+        verified.document.endpoints[0].readiness,
+        EndpointReadiness::Verified
+    );
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let protocol_attempt: (String, String) = connection
+        .query_row(
+            "SELECT status, result_code FROM endpoint_probe_attempts
+             WHERE node_id = ?1 AND phase = 'protocol'",
+            [node.node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        protocol_attempt,
+        (
+            "succeeded".to_string(),
+            "direct_protocol_connected".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn registered_relay_candidate_uses_the_same_end_to_end_protocol_gate() {
+    let app = TestApp::new();
+    let (node, mut current) = setup_applied_heartbeat(&app).await;
+    let revision = current.endpoints[0].applied_revision;
+    let relay_endpoint_id = EndpointId::new();
+    current.endpoints = vec![EndpointCandidate {
+        endpoint_id: relay_endpoint_id,
+        mode: EndpointMode::Relay,
+        source: EndpointSource::Relay,
+        address: "relay.example.test".to_string(),
+        port: 44_443,
+        applied_revision: revision,
+        observed_at: Timestamp::from_datetime(OffsetDateTime::now_utc()),
+        expires_at: Some(Timestamp::from_datetime(
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )),
+    }];
+    accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 240).await).await;
+
+    let tcp = app
+        .database
+        .claim_tcp_probe(Uuid::new_v4(), TcpProbeLoopOptions::default())
+        .await
+        .unwrap()
+        .expect("registered relay listener should receive external TCP preflight");
+    app.database
+        .complete_tcp_probe(
+            tcp,
+            TcpProbeResult::connected(
+                IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+                Duration::from_millis(9),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let canary = app
+        .database
+        .claim_protocol_canary(Uuid::new_v4(), ProtocolCanaryLoopOptions::default())
+        .await
+        .unwrap()
+        .expect("TCP-reachable relay must still prove VLESS and REALITY end to end");
+    app.database
+        .complete_protocol_canary(
+            canary,
+            ProtocolCanaryResult::Connected {
+                latency: Duration::from_millis(17),
+            },
+        )
+        .await
+        .unwrap();
+
+    let status = accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 241).await).await;
+    assert_eq!(status.document.endpoints.len(), 1);
+    assert_eq!(status.document.endpoints[0].endpoint_id, relay_endpoint_id);
+    assert_eq!(
+        status.document.endpoints[0].readiness,
+        EndpointReadiness::Verified
+    );
 }
 
 #[tokio::test]
@@ -2498,7 +2641,7 @@ async fn desired_publication_is_signed_canonical_monotonic_and_immutable() {
         first.document.xray.server_names,
         vec!["a.example.test".to_string(), "z.example.test".to_string()]
     );
-    assert!(first.document.users.is_empty());
+    assert_eq!(first.document.users.len(), 1);
 
     let second = publish_and_fetch_desired(&app, &node, &body).await;
     assert_eq!(second.document.revision.get(), 2);
@@ -3185,23 +3328,24 @@ async fn multi_node_assignments_publish_distinct_snapshots_and_converge_independ
     let first_desired = fetch_desired_ok(&app, &first, first_baseline.document.revision, 200).await;
     let second_desired =
         fetch_desired_ok(&app, &second, second_baseline.document.revision, 204).await;
-    assert_eq!(first_desired.document.users.len(), 1);
-    assert_eq!(second_desired.document.users.len(), 1);
-    assert_eq!(
-        first_desired.document.users[0].user_id,
-        account.account.user_id
-    );
-    assert_eq!(
-        second_desired.document.users[0].user_id,
-        account.account.user_id
-    );
+    assert_eq!(first_desired.document.users.len(), 2);
+    assert_eq!(second_desired.document.users.len(), 2);
+    let first_member = first_desired
+        .document
+        .users
+        .iter()
+        .find(|user| user.user_id == account.account.user_id)
+        .unwrap();
+    let second_member = second_desired
+        .document
+        .users
+        .iter()
+        .find(|user| user.user_id == account.account.user_id)
+        .unwrap();
+    assert_ne!(first_member.credential_id, second_member.credential_id);
     assert_ne!(
-        first_desired.document.users[0].credential_id,
-        second_desired.document.users[0].credential_id
-    );
-    assert_ne!(
-        first_desired.document.users[0].vless_uuid.expose_secret(),
-        second_desired.document.users[0].vless_uuid.expose_secret()
+        first_member.vless_uuid.expose_secret(),
+        second_member.vless_uuid.expose_secret()
     );
 
     report_applied_revision(
@@ -3260,8 +3404,8 @@ async fn multi_node_assignments_publish_distinct_snapshots_and_converge_independ
             |row| row.get(0),
         )
         .unwrap();
-    assert!(!audit.contains(first_desired.document.users[0].vless_uuid.expose_secret()));
-    assert!(!audit.contains(second_desired.document.users[0].vless_uuid.expose_secret()));
+    assert!(!audit.contains(first_member.vless_uuid.expose_secret()));
+    assert!(!audit.contains(second_member.vless_uuid.expose_secret()));
 }
 
 #[tokio::test]
@@ -3626,7 +3770,7 @@ async fn applied_account_disable_exposes_removal_pending_and_rotates_on_restore(
     let desired_response = fetch_desired(&app, &node, baseline.document.revision.get(), 180).await;
     assert_eq!(desired_response.status(), StatusCode::OK);
     let desired: SignedDesiredState = serde_json::from_value(json(desired_response).await).unwrap();
-    assert_eq!(desired.document.users.len(), 1);
+    assert_eq!(desired.document.users.len(), 2);
     report_applied_revision(&app, &node, desired.document.revision, 44, [181, 182, 183]).await;
 
     let listed = json(admin_accounts(&app).await).await;
@@ -3703,7 +3847,7 @@ async fn rejected_removal_stays_pending_until_a_later_revision_applies() {
         AccountNodeProvisioningState::RemovalPending
     );
     let removal = fetch_desired_ok(&app, &node, assigned.document.revision, 214).await;
-    assert!(removal.document.users.is_empty());
+    assert_eq!(removal.document.users.len(), 1);
     assert_eq!(
         report_result(
             &app,
@@ -3957,7 +4101,7 @@ async fn desired_state_and_result_journal_survive_restart() {
             },
         )
         .unwrap();
-    assert_eq!(durable, (12, 12, 1, 1, 1));
+    assert_eq!(durable, (13, 13, 1, 1, 1));
 }
 
 fn unsigned_device(signing_key: &SigningKey, marker: u8) -> DeviceEnrollment {

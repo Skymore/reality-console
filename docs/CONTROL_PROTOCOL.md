@@ -513,10 +513,13 @@ same cross-node rotation fence.
 
 ## 7. Telemetry Protocol
 
-`POST /v1/nodes/{nodeId}/telemetry-batches`
+`GET /v1/nodes/{nodeId}/telemetry/cursor` returns the next controller-required sequence.
 
-Each batch has `firstSequence`, `lastSequence`, and ordered events. The server transaction accepts a
-new contiguous suffix, ignores exact duplicates, and rejects gaps with `expectedSequence`.
+`PUT /v1/nodes/{nodeId}/telemetry`
+
+Each signed batch has `firstSequence`, `lastSequence`, and ordered events. The server transaction
+accepts the exact next contiguous batch, acknowledges an exact committed retry without inserting
+again, and rejects gaps with the durable `expectedSequence`.
 
 Traffic events contain deltas, never cumulative values after normalization. Connection events are
 optional and exclude payloads and full URLs. The response acknowledges the highest durably
@@ -559,7 +562,16 @@ Control migration 12 implements idempotent member setup delivery, activation/pas
 sessions, refresh-family replay/reuse handling, member authentication, device revoke/reset, and
 signed per-device HPKE bundles. Connect implements process-local setup handles, native credential
 storage, an authenticated two-generation offline cache, bounded node probes, selection policy, the
-existing Xray supervisor path, automatic six-hour sync, and offline registry reconstruction. The
-production protocol-aware endpoint canary, relay, telemetry aggregation, system-proxy recovery,
-and signed packages remain later work. An `applied` assignment still cannot enter a Connect bundle
-until that endpoint is controller-verified.
+existing Xray supervisor path, automatic six-hour sync, and offline registry reconstruction.
+
+Control migration 13 adds dedicated per-node canary credentials, ordered telemetry cursors/events,
+hourly/daily aggregates, independent retention policy, and allowlisted support data. External TCP
+success remains non-publishable. A checksum-pinned Xray client must then complete VLESS + REALITY
+and a SOCKS destination connect for the same current candidate. The same gate applies to direct and
+registered relay listeners before an `applied` assignment can enter a Connect bundle.
+
+Node Host migrations 13-15 add the bounded seven-day replay spool, owner-managed relay assignment
+generations, and restart-safe Xray cumulative-counter normalization. Signed requests upload a
+bounded batch only after local durability; Control acknowledges only after its cursor, event rows,
+and aggregates commit together. Detailed connection events disabled by policy are represented by
+a sequence-preserving dropped-policy row instead of blocking the node cursor.

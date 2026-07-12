@@ -272,7 +272,10 @@ The implemented registry performs this account/cache restoration lazily before e
 account operation. It runs bounded backend-owned TCP probes only for signed bundle endpoints,
 refreshes bundles approximately every six hours, and maintains connected health every 30 seconds.
 Neither background path starts Xray when the member left it disconnected. Durable system-proxy
-recovery remains a Stage 5 boundary.
+recovery is implemented through a serialized, owner-only, size-bounded journal. Platform commands
+run off the desktop thread without a shell; macOS captures each enabled network service and Windows
+uses WinINet per-connection settings. Startup and every Xray mutation join the same recovery gate,
+so an immediate connect cannot race crash restoration.
 
 ## 9. Packaging
 

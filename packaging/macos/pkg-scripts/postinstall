@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+BASE="/Library/Application Support/Private Network Node"
+STATE="$BASE/state"
+LOGS="/Library/Logs/Private Network Node"
+PLIST="/Library/LaunchDaemons/com.sky.realitynode.agent.plist"
+
+if ! /usr/bin/dscl . -read /Users/_privnetnode >/dev/null 2>&1; then
+  uid=399
+  while /usr/bin/dscl . -search /Users UniqueID "$uid" | /usr/bin/grep -q .; do uid=$((uid + 1)); done
+  /usr/bin/dscl . -create /Groups/_privnetnode
+  /usr/bin/dscl . -create /Groups/_privnetnode PrimaryGroupID "$uid"
+  /usr/bin/dscl . -create /Users/_privnetnode
+  /usr/bin/dscl . -create /Users/_privnetnode UniqueID "$uid"
+  /usr/bin/dscl . -create /Users/_privnetnode PrimaryGroupID "$uid"
+  /usr/bin/dscl . -create /Users/_privnetnode UserShell /usr/bin/false
+  /usr/bin/dscl . -create /Users/_privnetnode NFSHomeDirectory /var/empty
+fi
+
+/bin/mkdir -p "$STATE" "$LOGS"
+/usr/sbin/chown -R _privnetnode:_privnetnode "$STATE" "$LOGS"
+/bin/chmod 700 "$STATE"
+/bin/chmod 755 "$BASE" "$BASE/bin" "$BASE/releases"
+/bin/chmod 644 "$PLIST"
+/usr/sbin/chown root:wheel "$PLIST"
+/usr/sbin/chown -R root:wheel "$BASE/bin" "$BASE/releases"
+
+/bin/launchctl bootstrap system "$PLIST"
+/bin/launchctl enable system/com.sky.realitynode.agent
+exit 0

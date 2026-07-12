@@ -2,10 +2,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use control_protocol::node::NodeRuntimeState;
 use node_host::{
-    bootstrap, bootstrap_and_install_user_service, configure_xray, initialize,
-    install_user_service, join, query_local_service_status, remove_user_service, run, status,
-    sync_once, user_service_status, BackgroundServiceStatus, BootstrapRequest, HostStatus,
-    LocalServiceStatus, SyncLoopOptions, UserServiceInstallRequest,
+    bootstrap, bootstrap_and_install_user_service, configure_relay, configure_xray, initialize,
+    install_user_service, join, query_local_service_status, remove_user_service, revoke_relay, run,
+    status, support_bundle, sync_once, uninstall_local, user_service_status,
+    BackgroundServiceStatus, BootstrapRequest, HostStatus, LocalServiceStatus, SyncLoopOptions,
+    UserServiceInstallRequest,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -106,6 +107,30 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Install or rotate one controller-issued relay assignment.
+    ConfigureRelay {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Owner-only JSON assignment file with owner-only referenced secrets.
+        #[arg(long)]
+        assignment_file: PathBuf,
+        /// Confirms this host may maintain an outbound relay tunnel and serve as an exit node.
+        #[arg(long)]
+        accept_relay: bool,
+        /// Explicitly replace a different active relay assignment.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Revoke this host's assigned relay route and delete its local relay credentials.
+    RevokeRelay {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Exact active endpoint ID used as destructive-operation confirmation.
+        #[arg(long)]
+        confirm_endpoint_id: control_protocol::id::EndpointId,
+    },
     /// Run resilient outbound synchronization until the process is stopped.
     Run {
         /// Persistent state directory.
@@ -125,6 +150,21 @@ enum Command {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    /// Print an allowlisted JSON support bundle with no credentials or endpoints.
+    SupportBundle {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    /// Stop the user service and irreversibly remove this node's local state.
+    Uninstall {
+        /// Persistent state directory.
+        #[arg(long)]
+        data_dir: PathBuf,
+        /// Exact enrolled node ID used as destructive-operation confirmation.
+        #[arg(long)]
+        confirm_node_id: control_protocol::id::NodeId,
     },
 }
 
@@ -152,6 +192,7 @@ enum ServiceCommand {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let status = match Cli::parse().command {
         Command::Bootstrap {
@@ -217,6 +258,22 @@ async fn main() -> Result<()> {
             sha256,
             replace,
         } => configure_xray(&data_dir, &binary_path, &sha256, replace).await?,
+        Command::ConfigureRelay {
+            data_dir,
+            assignment_file,
+            accept_relay,
+            replace,
+        } => {
+            configure_relay(&data_dir, &assignment_file, accept_relay, replace).await?;
+            status(&data_dir)?
+        }
+        Command::RevokeRelay {
+            data_dir,
+            confirm_endpoint_id,
+        } => {
+            revoke_relay(&data_dir, confirm_endpoint_id)?;
+            status(&data_dir)?
+        }
         Command::Run {
             data_dir,
             sync_interval_seconds,
@@ -237,6 +294,22 @@ async fn main() -> Result<()> {
         }
         Command::Service { command } => {
             handle_service_command(command).await?;
+            return Ok(());
+        }
+        Command::SupportBundle { data_dir } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&support_bundle(&data_dir)?)?
+            );
+            return Ok(());
+        }
+        Command::Uninstall {
+            data_dir,
+            confirm_node_id,
+        } => {
+            let _ = remove_user_service().await?;
+            uninstall_local(&data_dir, confirm_node_id)?;
+            println!("uninstalled_node_id: {confirm_node_id}");
             return Ok(());
         }
     };
@@ -292,6 +365,7 @@ fn print_local_service_status(status: &LocalServiceStatus) {
         Some(error) => println!("last_error: {} at {}", error.code, error.occurred_at),
         None => println!("last_error: none"),
     }
+    println!("relay_runtime: {:?}", status.relay_runtime);
 }
 
 const fn runtime_state_name(state: NodeRuntimeState) -> &'static str {
@@ -390,6 +464,11 @@ fn print_status(status: &HostStatus) {
         "router_mapping: {} ({:?})",
         status.router_mapping.enabled, status.router_mapping.state
     );
+    println!("relay_assignment: {:?}", status.relay.state);
+    match status.relay.endpoint_id {
+        Some(endpoint_id) => println!("relay_endpoint_id: {endpoint_id}"),
+        None => println!("relay_endpoint_id: none"),
+    }
 }
 
 fn print_controller_status(status: Option<&control_protocol::node::NodeHeartbeatStatus>) {

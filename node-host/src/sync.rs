@@ -11,10 +11,11 @@ use control_protocol::desired::{desired_state_transcript, verify_desired_state_s
 use control_protocol::error::ErrorEnvelope;
 use control_protocol::id::{Revision, SequenceNumber, Timestamp};
 use control_protocol::node::{
-    NodeHeartbeat, NodeRuntimeState, RevisionProgress, RevisionResult, RevisionResultState,
-    SignedDesiredState,
+    EndpointCandidate, NodeHeartbeat, NodeRuntimeState, RevisionProgress, RevisionResult,
+    RevisionResultState, SignedDesiredState,
 };
 use control_protocol::request_auth::{NodeRequestAuthHeaders, NodeRequestSigningInput};
+use control_protocol::telemetry::{TelemetryBatchAcknowledgement, TelemetryCursor};
 use rand_core::{OsRng, RngCore as _};
 use reqwest::{Method, StatusCode};
 use rusqlite::{params, Connection, OptionalExtension as _, TransactionBehavior};
@@ -28,6 +29,7 @@ const NONCE_BYTES: usize = 32;
 const SUPPORTED_DESIRED_SCHEMAS: &[u16] =
     control_protocol::version::SUPPORTED_DESIRED_STATE_SCHEMA_VERSIONS;
 const MAX_PENDING_REPORTS_PER_SYNC: i64 = 64;
+const MAX_TELEMETRY_BATCHES_PER_SYNC: usize = 8;
 const NODE_ID_HEADER: &str = "X-Node-Id";
 const NODE_KEY_ID_HEADER: &str = "X-Node-Key-Id";
 const NODE_TIMESTAMP_HEADER: &str = "X-Node-Timestamp";
@@ -71,6 +73,27 @@ pub(crate) async fn sync_once_locked_with_runtime_probe<F>(
 where
     F: FnMut() -> Result<NodeRuntimeState>,
 {
+    sync_once_locked_with_runtime_snapshot(data_dir, || {
+        Ok(RuntimeHeartbeatSnapshot {
+            runtime_state: runtime_probe()?,
+            relay_candidate: None,
+        })
+    })
+    .await
+}
+
+pub(crate) struct RuntimeHeartbeatSnapshot {
+    pub runtime_state: NodeRuntimeState,
+    pub relay_candidate: Option<EndpointCandidate>,
+}
+
+pub(crate) async fn sync_once_locked_with_runtime_snapshot<F>(
+    data_dir: &Path,
+    mut runtime_probe: F,
+) -> Result<HostStatus>
+where
+    F: FnMut() -> Result<RuntimeHeartbeatSnapshot>,
+{
     let mut connection = open_database(data_dir, false)?;
     migrate(&mut connection)?;
     let controller_value: String = connection
@@ -94,10 +117,18 @@ where
         &identity,
     )
     .await?;
+    sync_telemetry(
+        &client,
+        &controller,
+        &mut connection,
+        &registration,
+        &identity,
+    )
+    .await?;
     let sync_state = crate::load_sync_status(&connection)?;
     // Observe the managed child immediately before constructing the heartbeat;
     // earlier network/report work may have taken long enough for it to exit.
-    let runtime_state = runtime_probe()?;
+    let runtime = runtime_probe()?;
     send_heartbeat(
         &client,
         &controller,
@@ -105,7 +136,7 @@ where
         &registration,
         &identity,
         sync_state.desired_revision_cursor,
-        runtime_state,
+        runtime,
     )
     .await?;
     fetch_and_process_desired(
@@ -201,16 +232,17 @@ async fn send_heartbeat(
     registration: &SyncRegistration,
     identity: &Identity,
     desired_revision_cursor: i64,
-    runtime_state: NodeRuntimeState,
+    runtime: RuntimeHeartbeatSnapshot,
 ) -> Result<()> {
     // Allocate before I/O. A failed attempt may leave a gap, but a generation
     // can never identify two different snapshots after a crash or retry.
     let heartbeat_generation = allocate_heartbeat_generation(connection)?;
-    let heartbeat = current_heartbeat(
+    let heartbeat = current_heartbeat_with_relay(
         connection,
         desired_revision_cursor,
-        runtime_state,
+        runtime.runtime_state,
         heartbeat_generation,
+        runtime.relay_candidate,
     )?;
     let heartbeat_body =
         serde_json::to_vec(&heartbeat).context("failed to serialize node heartbeat")?;
@@ -309,11 +341,28 @@ async fn fetch_and_process_desired(
     Ok(())
 }
 
+#[cfg(test)]
 fn current_heartbeat(
     connection: &Connection,
     desired_revision_cursor: i64,
     runtime_state: NodeRuntimeState,
     heartbeat_generation: SequenceNumber,
+) -> Result<NodeHeartbeat> {
+    current_heartbeat_with_relay(
+        connection,
+        desired_revision_cursor,
+        runtime_state,
+        heartbeat_generation,
+        None,
+    )
+}
+
+fn current_heartbeat_with_relay(
+    connection: &Connection,
+    desired_revision_cursor: i64,
+    runtime_state: NodeRuntimeState,
+    heartbeat_generation: SequenceNumber,
+    relay_candidate: Option<EndpointCandidate>,
 ) -> Result<NodeHeartbeat> {
     let (received_revision_value, validated_revision_value): (i64, i64) = connection.query_row(
         "SELECT
@@ -339,11 +388,19 @@ fn current_heartbeat(
         |row| row.get(0),
     )?;
     let applied_revision = optional_revision(applied_revision_value, "applied")?;
-    let endpoints = if runtime_state == NodeRuntimeState::Serving {
+    let mut endpoints = if runtime_state == NodeRuntimeState::Serving {
         crate::mapping::load_heartbeat_candidates(connection, applied_revision)?
     } else {
         Vec::new()
     };
+    if runtime_state == NodeRuntimeState::Serving {
+        if let Some(candidate) = relay_candidate {
+            if Some(candidate.applied_revision) != applied_revision {
+                bail!("relay candidate revision does not match the active Xray revision");
+            }
+            endpoints.push(candidate);
+        }
+    }
     let heartbeat = NodeHeartbeat {
         heartbeat_generation,
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -357,12 +414,92 @@ fn current_heartbeat(
         },
         provider_paused: false,
         endpoints,
-        telemetry_cursor: SequenceNumber::new(0).context("zero telemetry cursor must be valid")?,
+        telemetry_cursor: crate::telemetry::highest_sequence(connection)?,
     };
     heartbeat
         .validate()
         .context("generated node heartbeat is invalid")?;
     Ok(heartbeat)
+}
+
+async fn sync_telemetry(
+    client: &reqwest::Client,
+    controller: &Url,
+    connection: &mut Connection,
+    registration: &SyncRegistration,
+    identity: &Identity,
+) -> Result<()> {
+    let cursor_target = format!("/v1/nodes/{}/telemetry/cursor", registration.node);
+    let response = send_signed_request(
+        client,
+        controller,
+        Method::GET,
+        &cursor_target,
+        Vec::new(),
+        registration,
+        identity,
+    )
+    .await
+    .context("controller telemetry cursor request failed")?;
+    let status = response.status();
+    let is_json = response_is_json(&response);
+    let body = read_bounded_response(response).await?;
+    if !status.is_success() {
+        return Err(controller_error("telemetry cursor", status, &body));
+    }
+    if !is_json {
+        bail!("controller telemetry cursor response is not JSON");
+    }
+    let mut cursor: TelemetryCursor =
+        serde_json::from_slice(&body).context("controller telemetry cursor is invalid")?;
+    cursor
+        .validate()
+        .context("controller telemetry cursor is inconsistent")?;
+
+    for _ in 0..MAX_TELEMETRY_BATCHES_PER_SYNC {
+        let Some(batch) =
+            crate::telemetry::batch_from(connection, registration.node, cursor.expected_sequence)?
+        else {
+            break;
+        };
+        let batch_last = batch.last_sequence;
+        let body = serde_json::to_vec(&batch).context("failed to serialize telemetry batch")?;
+        let target = format!("/v1/nodes/{}/telemetry", registration.node);
+        let response = send_signed_request(
+            client,
+            controller,
+            Method::PUT,
+            &target,
+            body,
+            registration,
+            identity,
+        )
+        .await
+        .context("controller telemetry upload failed")?;
+        let status = response.status();
+        let is_json = response_is_json(&response);
+        let body = read_bounded_response(response).await?;
+        if !status.is_success() {
+            return Err(controller_error("telemetry upload", status, &body));
+        }
+        if !is_json {
+            bail!("controller telemetry acknowledgement is not JSON");
+        }
+        let acknowledgement: TelemetryBatchAcknowledgement = serde_json::from_slice(&body)
+            .context("controller telemetry acknowledgement is invalid")?;
+        acknowledgement
+            .validate()
+            .context("controller telemetry acknowledgement is inconsistent")?;
+        if acknowledgement.acknowledged_sequence != batch_last {
+            bail!("controller telemetry acknowledgement does not match the uploaded batch");
+        }
+        crate::telemetry::acknowledge(connection, acknowledgement)?;
+        cursor = TelemetryCursor {
+            acknowledged_sequence: acknowledgement.acknowledged_sequence,
+            expected_sequence: acknowledgement.expected_sequence,
+        };
+    }
+    Ok(())
 }
 
 fn allocate_heartbeat_generation(connection: &Connection) -> Result<SequenceNumber> {
@@ -808,10 +945,13 @@ fn controller_error(operation: &str, status: StatusCode, body: &[u8]) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::{
-        current_heartbeat, load_unreported_results, ReportScope, MAX_PENDING_REPORTS_PER_SYNC,
+        current_heartbeat, current_heartbeat_with_relay, load_unreported_results, ReportScope,
+        MAX_PENDING_REPORTS_PER_SYNC,
     };
-    use control_protocol::id::{EndpointId, Revision, SequenceNumber};
-    use control_protocol::node::NodeRuntimeState;
+    use control_protocol::id::{EndpointId, Revision, SequenceNumber, Timestamp};
+    use control_protocol::node::{
+        EndpointCandidate, EndpointMode, EndpointSource, NodeRuntimeState,
+    };
     use rusqlite::{params, Connection};
 
     #[test]
@@ -939,10 +1079,49 @@ mod tests {
             &connection,
             1,
             NodeRuntimeState::Idle,
-            SequenceNumber::new(8).unwrap(),
+            SequenceNumber::new(9).unwrap(),
         )
         .unwrap();
         assert!(idle.endpoints.is_empty());
+
+        assert_direct_and_relay_fail_independently(&connection, endpoint_id, now);
+    }
+
+    fn assert_direct_and_relay_fail_independently(
+        connection: &Connection,
+        direct_id: EndpointId,
+        now: i64,
+    ) {
+        let relay_id = EndpointId::new();
+        let relay_candidate = EndpointCandidate {
+            endpoint_id: relay_id,
+            mode: EndpointMode::Relay,
+            source: EndpointSource::Relay,
+            address: "relay.example".to_owned(),
+            port: 8443,
+            applied_revision: Revision::new(1).unwrap(),
+            observed_at: Timestamp::from_datetime(time::OffsetDateTime::now_utc()),
+            expires_at: Some(Timestamp::from_datetime(
+                time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            )),
+        };
+        let both = current_heartbeat_with_relay(
+            connection,
+            1,
+            NodeRuntimeState::Serving,
+            SequenceNumber::new(8).unwrap(),
+            Some(relay_candidate.clone()),
+        )
+        .unwrap();
+        assert_eq!(both.endpoints.len(), 2);
+        assert!(both
+            .endpoints
+            .iter()
+            .any(|candidate| candidate.endpoint_id == direct_id));
+        assert!(both
+            .endpoints
+            .iter()
+            .any(|candidate| candidate.endpoint_id == relay_id));
 
         connection
             .execute(
@@ -950,13 +1129,31 @@ mod tests {
                 [now - 1],
             )
             .unwrap();
-        let expired = current_heartbeat(
-            &connection,
+        let direct_failed = current_heartbeat_with_relay(
+            connection,
             1,
             NodeRuntimeState::Serving,
-            SequenceNumber::new(9).unwrap(),
+            SequenceNumber::new(10).unwrap(),
+            Some(relay_candidate),
         )
         .unwrap();
-        assert!(expired.endpoints.is_empty());
+        assert_eq!(direct_failed.endpoints.len(), 1);
+        assert_eq!(direct_failed.endpoints[0].endpoint_id, relay_id);
+
+        connection
+            .execute(
+                "UPDATE router_mapping_leases SET lease_expires_at = ?1",
+                [now + 3_600],
+            )
+            .unwrap();
+        let relay_failed = current_heartbeat(
+            connection,
+            1,
+            NodeRuntimeState::Serving,
+            SequenceNumber::new(11).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(relay_failed.endpoints.len(), 1);
+        assert_eq!(relay_failed.endpoints[0].endpoint_id, direct_id);
     }
 }

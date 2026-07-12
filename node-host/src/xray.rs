@@ -25,7 +25,7 @@ use x25519_dalek::{PublicKey as X25519DalekPublicKey, StaticSecret};
 use xray_runtime::{
     probe_version, test_config, ExecutionLimits, RealityPrivateKey, RealityTarget,
     RenderedXrayConfig, RuntimeError, ServerName, Sha256Digest as RuntimeSha256Digest, ShortId,
-    UserEmail, VlessRealityConfigBuilder, VlessUser, XrayBinarySpec,
+    StatsApiConfig, UserEmail, VlessRealityConfigBuilder, VlessUser, XrayBinarySpec,
 };
 use zeroize::Zeroizing;
 
@@ -91,6 +91,10 @@ pub async fn configure_xray(
         .to_owned();
     let expected_sha256 = digest.to_string();
     let existing = load_runtime_row(&connection)?;
+    let stats_api_port = match existing.as_ref() {
+        Some(runtime) => runtime.stats_api_port,
+        None => reserve_stats_api_port()?,
+    };
     let pin_changed = existing.as_ref().is_some_and(|stored| {
         stored.binary_path != binary_path || stored.expected_sha256 != expected_sha256
     });
@@ -143,9 +147,10 @@ pub async fn configure_xray(
         None => {
             transaction.execute(
                 "INSERT INTO xray_runtime_config(
-                    singleton, binary_path, expected_sha256, version, configured_at, updated_at
-                 ) VALUES (1, ?1, ?2, ?3, ?4, ?4)",
-                params![binary_path, expected_sha256, version, now],
+                    singleton, binary_path, expected_sha256, version, configured_at, updated_at,
+                    stats_api_port
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?4, ?5)",
+                params![binary_path, expected_sha256, version, now, stats_api_port],
             )?;
         }
     }
@@ -190,7 +195,8 @@ pub(crate) async fn validate_desired_state(
     let reality_seed = load_seed(&data_dir.join(REALITY_X25519_SEED_FILE))
         .context("stored REALITY identity is unavailable")?;
     validate_reality_seed(&reality_seed)?;
-    let Ok(rendered) = render_desired_config(envelope, &reality_seed) else {
+    let Ok(rendered) = render_desired_config(envelope, &reality_seed, runtime.stats_api_port)
+    else {
         append_rejected_result(
             connection,
             revision,
@@ -312,6 +318,7 @@ struct StoredRuntimeRow {
     binary_path: String,
     expected_sha256: String,
     version: String,
+    stats_api_port: u16,
 }
 
 fn load_runtime_row(connection: &Connection) -> Result<Option<StoredRuntimeRow>> {
@@ -327,7 +334,7 @@ fn load_runtime_row(connection: &Connection) -> Result<Option<StoredRuntimeRow>>
     }
     connection
         .query_row(
-            "SELECT binary_path, expected_sha256, version
+            "SELECT binary_path, expected_sha256, version, stats_api_port
              FROM xray_runtime_config WHERE singleton = 1",
             [],
             |row| {
@@ -335,6 +342,13 @@ fn load_runtime_row(connection: &Connection) -> Result<Option<StoredRuntimeRow>>
                     binary_path: row.get(0)?,
                     expected_sha256: row.get(1)?,
                     version: row.get(2)?,
+                    stats_api_port: row.get::<_, i64>(3)?.try_into().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
                 })
             },
         )
@@ -354,6 +368,7 @@ fn minimum_agent_version_error(required: &str) -> Result<Option<ErrorCode>> {
 fn render_desired_config(
     envelope: &SignedDesiredState,
     reality_seed: &SecretSeed,
+    stats_api_port: u16,
 ) -> Result<RenderedXrayConfig> {
     let encoded_private_key = Zeroizing::new(URL_SAFE_NO_PAD.encode(reality_seed.0));
     let private_key = RealityPrivateKey::parse(&encoded_private_key)
@@ -377,7 +392,8 @@ fn render_desired_config(
         target,
         private_key,
     )?
-    .short_id(short_id);
+    .short_id(short_id)
+    .stats_api(StatsApiConfig::loopback(stats_api_port)?);
 
     for server_name in &envelope.document.xray.server_names {
         builder = builder.server_name(
@@ -394,6 +410,17 @@ fn render_desired_config(
     builder
         .build()
         .context("desired state cannot be rendered as an Xray configuration")
+}
+
+fn reserve_stats_api_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .context("failed to reserve a loopback Xray Stats API port")?;
+    let port = listener
+        .local_addr()
+        .context("failed to inspect the reserved Xray Stats API port")?
+        .port();
+    drop(listener);
+    Ok(port)
 }
 
 fn validation_is_complete(

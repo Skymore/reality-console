@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fmt,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -223,6 +223,34 @@ pub struct VlessUser {
     enabled: bool,
 }
 
+/// A loopback-only Xray Stats API listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatsApiConfig {
+    address: SocketAddrV4,
+}
+
+impl StatsApiConfig {
+    /// Creates an API listener fixed to IPv4 loopback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigBuildError::InvalidStatsApiPort`] when `port` is zero.
+    pub fn loopback(port: u16) -> Result<Self, ConfigBuildError> {
+        if port == 0 {
+            return Err(ConfigBuildError::InvalidStatsApiPort);
+        }
+        Ok(Self {
+            address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+        })
+    }
+
+    /// Returns the private API endpoint.
+    #[must_use]
+    pub const fn address(self) -> SocketAddrV4 {
+        self.address
+    }
+}
+
 impl VlessUser {
     /// Creates a validated VLESS user.
     ///
@@ -276,6 +304,7 @@ pub struct VlessRealityConfigBuilder {
     server_names: Vec<ServerName>,
     short_ids: Vec<ShortId>,
     users: Vec<VlessUser>,
+    stats_api: Option<StatsApiConfig>,
 }
 
 impl VlessRealityConfigBuilder {
@@ -305,6 +334,7 @@ impl VlessRealityConfigBuilder {
             server_names: Vec::new(),
             short_ids: Vec::new(),
             users: Vec::new(),
+            stats_api: None,
         })
     }
 
@@ -327,6 +357,13 @@ impl VlessRealityConfigBuilder {
     #[must_use]
     pub fn user(mut self, user: VlessUser) -> Self {
         self.users.push(user);
+        self
+    }
+
+    /// Enables per-user cumulative traffic counters through a loopback-only API.
+    #[must_use]
+    pub fn stats_api(mut self, stats_api: StatsApiConfig) -> Self {
+        self.stats_api = Some(stats_api);
         self
     }
 
@@ -357,41 +394,83 @@ impl VlessRealityConfigBuilder {
 
         let target = self.target.authority();
         let encoded_private_key = self.private_key.encoded();
+        if self.stats_api.is_some_and(|stats| {
+            self.listen_address == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                && self.listen_port == stats.address().port()
+        }) {
+            return Err(ConfigBuildError::StatsApiPortConflict);
+        }
+        let stats_api = self.stats_api.map(|_| ApiSettings {
+            tag: "stats-api",
+            services: ["StatsService"],
+        });
+        let routing = self.stats_api.map(|_| RoutingSettings {
+            rules: [RoutingRule {
+                rule_type: "field",
+                inbound_tag: ["stats-api"],
+                outbound_tag: "stats-api",
+            }],
+        });
+        let mut inbounds = vec![Inbound::Vless(VlessInbound {
+            tag: "vless-reality-in",
+            listen: self.listen_address,
+            port: self.listen_port,
+            protocol: "vless",
+            settings: VlessInboundSettings {
+                users: enabled_users
+                    .into_iter()
+                    .map(|user| Client {
+                        id: user.id,
+                        email: user.email.as_str(),
+                        level: 0,
+                        flow: "xtls-rprx-vision",
+                    })
+                    .collect(),
+                decryption: "none",
+            },
+            stream_settings: StreamSettings {
+                network: "raw",
+                security: "reality",
+                reality_settings: RealitySettings {
+                    show: false,
+                    target: &target,
+                    xver: 0,
+                    server_names: self.server_names.iter().map(ServerName::as_str).collect(),
+                    private_key: encoded_private_key.as_str(),
+                    short_ids: self.short_ids.iter().map(ShortId::as_str).collect(),
+                },
+            },
+        })];
+        if let Some(stats) = self.stats_api {
+            inbounds.push(Inbound::Api(ApiInbound {
+                tag: "stats-api",
+                listen: *stats.address().ip(),
+                port: stats.address().port(),
+                protocol: "dokodemo-door",
+                settings: ApiInboundSettings {
+                    address: Ipv4Addr::LOCALHOST,
+                },
+            }));
+        }
         let config = XrayConfig {
             log: LogSettings {
                 access: "none",
                 dns_log: false,
                 log_level: "warning",
             },
-            inbounds: vec![Inbound {
-                tag: "vless-reality-in",
-                listen: self.listen_address,
-                port: self.listen_port,
-                protocol: "vless",
-                settings: InboundSettings {
-                    users: enabled_users
-                        .into_iter()
-                        .map(|user| Client {
-                            id: user.id,
-                            email: user.email.as_str(),
-                            flow: "xtls-rprx-vision",
-                        })
-                        .collect(),
-                    decryption: "none",
-                },
-                stream_settings: StreamSettings {
-                    network: "raw",
-                    security: "reality",
-                    reality_settings: RealitySettings {
-                        show: false,
-                        target: &target,
-                        xver: 0,
-                        server_names: self.server_names.iter().map(ServerName::as_str).collect(),
-                        private_key: encoded_private_key.as_str(),
-                        short_ids: self.short_ids.iter().map(ShortId::as_str).collect(),
+            api: stats_api,
+            routing,
+            stats: self.stats_api.map(|_| EmptySettings {}),
+            policy: self.stats_api.map(|_| PolicySettings {
+                levels: PolicyLevels {
+                    default: UserLevelPolicy {
+                        stats_user_uplink: true,
+                        stats_user_downlink: true,
                     },
                 },
-            }],
+                system: SystemPolicy {},
+            }),
+            inbounds,
             outbounds: vec![Outbound {
                 tag: "direct",
                 protocol: "freedom",
@@ -450,6 +529,12 @@ pub enum ConfigBuildError {
     /// The listen address cannot be used as a local socket address.
     #[error("Xray listen address must not be multicast or broadcast")]
     InvalidListenAddress,
+    /// The Stats API listen port was zero.
+    #[error("Xray Stats API port must be non-zero")]
+    InvalidStatsApiPort,
+    /// The data and API listeners would bind the same loopback socket.
+    #[error("Xray Stats API port conflicts with the VLESS listen port")]
+    StatsApiPortConflict,
     /// The REALITY target port was zero.
     #[error("REALITY target port must be non-zero")]
     InvalidTargetPort,
@@ -581,9 +666,62 @@ fn validate_duplicates(builder: &VlessRealityConfigBuilder) -> Result<(), Config
 #[derive(Serialize)]
 struct XrayConfig<'a> {
     log: LogSettings<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api: Option<ApiSettings<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    routing: Option<RoutingSettings<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<EmptySettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<PolicySettings>,
     inbounds: Vec<Inbound<'a>>,
     outbounds: Vec<Outbound<'a>>,
 }
+
+#[derive(Serialize)]
+struct ApiSettings<'a> {
+    tag: &'a str,
+    services: [&'a str; 1],
+}
+
+#[derive(Serialize)]
+struct RoutingSettings<'a> {
+    rules: [RoutingRule<'a>; 1],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutingRule<'a> {
+    #[serde(rename = "type")]
+    rule_type: &'a str,
+    inbound_tag: [&'a str; 1],
+    outbound_tag: &'a str,
+}
+
+#[derive(Serialize)]
+struct EmptySettings {}
+
+#[derive(Serialize)]
+struct PolicySettings {
+    levels: PolicyLevels,
+    system: SystemPolicy,
+}
+
+#[derive(Serialize)]
+struct PolicyLevels {
+    #[serde(rename = "0")]
+    default: UserLevelPolicy,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserLevelPolicy {
+    stats_user_uplink: bool,
+    stats_user_downlink: bool,
+}
+
+#[derive(Serialize)]
+struct SystemPolicy {}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -596,17 +734,40 @@ struct LogSettings<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Inbound<'a> {
+#[serde(untagged)]
+enum Inbound<'a> {
+    Vless(VlessInbound<'a>),
+    Api(ApiInbound<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VlessInbound<'a> {
     tag: &'a str,
     listen: IpAddr,
     port: u16,
     protocol: &'a str,
-    settings: InboundSettings<'a>,
+    settings: VlessInboundSettings<'a>,
     stream_settings: StreamSettings<'a>,
 }
 
 #[derive(Serialize)]
-struct InboundSettings<'a> {
+#[serde(rename_all = "camelCase")]
+struct ApiInbound<'a> {
+    tag: &'a str,
+    listen: Ipv4Addr,
+    port: u16,
+    protocol: &'a str,
+    settings: ApiInboundSettings,
+}
+
+#[derive(Serialize)]
+struct ApiInboundSettings {
+    address: Ipv4Addr,
+}
+
+#[derive(Serialize)]
+struct VlessInboundSettings<'a> {
     users: Vec<Client<'a>>,
     decryption: &'a str,
 }
@@ -615,6 +776,7 @@ struct InboundSettings<'a> {
 struct Client<'a> {
     id: Uuid,
     email: &'a str,
+    level: u8,
     flow: &'a str,
 }
 
@@ -652,8 +814,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ConfigBuildError, RealityPrivateKey, RealityTarget, ServerName, ShortId, UserEmail,
-        VlessRealityConfigBuilder, VlessUser,
+        ConfigBuildError, RealityPrivateKey, RealityTarget, ServerName, ShortId, StatsApiConfig,
+        UserEmail, VlessRealityConfigBuilder, VlessUser,
     };
 
     fn private_key() -> RealityPrivateKey {
@@ -751,6 +913,80 @@ mod tests {
                 .map(Vec::len),
             Some(2)
         );
+    }
+
+    #[test]
+    fn renders_minimal_loopback_stats_api_and_per_user_policy() {
+        let rendered = builder()
+            .server_name(ServerName::parse("www.example.com").unwrap())
+            .short_id(ShortId::parse("aabbccdd").unwrap())
+            .user(user(
+                "11111111-1111-4111-8111-111111111111",
+                "friend@example.com",
+                true,
+            ))
+            .stats_api(StatsApiConfig::loopback(31_337).unwrap())
+            .build()
+            .unwrap();
+        let json: Value = serde_json::from_str(rendered.expose_json()).unwrap();
+
+        assert!(json.pointer("/api/listen").is_none());
+        assert_eq!(
+            json.pointer("/api/services"),
+            Some(&serde_json::json!(["StatsService"]))
+        );
+        assert_eq!(json.pointer("/stats"), Some(&serde_json::json!({})));
+        assert_eq!(json.pointer("/policy/system"), Some(&serde_json::json!({})));
+        assert_eq!(
+            json.pointer("/policy/levels/0/statsUserUplink"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            json.pointer("/inbounds/0/settings/users/0/level"),
+            Some(&Value::from(0))
+        );
+        assert_eq!(
+            json.pointer("/inbounds/1/listen"),
+            Some(&Value::from("127.0.0.1"))
+        );
+        assert_eq!(json.pointer("/inbounds/1/port"), Some(&Value::from(31_337)));
+        assert_eq!(
+            json.pointer("/inbounds/1/protocol"),
+            Some(&Value::from("dokodemo-door"))
+        );
+        assert_eq!(
+            json.pointer("/inbounds/1/settings/address"),
+            Some(&Value::from("127.0.0.1"))
+        );
+        assert!(json.pointer("/inbounds/1/settings/users").is_none());
+        assert!(json.pointer("/inbounds/1/streamSettings").is_none());
+        assert_eq!(
+            json.pointer("/routing/rules/0/inboundTag"),
+            Some(&serde_json::json!(["stats-api"]))
+        );
+        assert_eq!(
+            json.pointer("/routing/rules/0/outboundTag"),
+            Some(&Value::from("stats-api"))
+        );
+        assert_eq!(json["inbounds"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rejects_a_loopback_stats_api_port_collision() {
+        let error = VlessRealityConfigBuilder::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            31_337,
+            RealityTarget::new("www.example.com", 443).unwrap(),
+            private_key(),
+        )
+        .unwrap()
+        .server_name(ServerName::parse("www.example.com").unwrap())
+        .short_id(ShortId::parse("aabbccdd").unwrap())
+        .stats_api(StatsApiConfig::loopback(31_337).unwrap())
+        .build()
+        .unwrap_err();
+
+        assert_eq!(error, ConfigBuildError::StatsApiPortConflict);
     }
 
     #[test]

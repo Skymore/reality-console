@@ -36,6 +36,9 @@ uuid = { version = "1", features = ["serde", "v4"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinInet"] }
+
 [dev-dependencies]
 axum = "0.8"
 control-server = { path = "../../control-server" }

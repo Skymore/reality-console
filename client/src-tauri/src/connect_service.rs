@@ -261,7 +261,13 @@ impl ConnectService {
     ) -> Result<ConnectSnapshot, ClientError> {
         let _operation = self.operations.lock().await;
         let runtime_before = self.supervisor.snapshot()?;
-        let modified = self.refresh_bundle_locked(now).await?;
+        let modified = match self.refresh_bundle_locked(now).await {
+            Ok(modified) => modified,
+            Err(error) => {
+                self.stop_if_bundle_expired(now).await?;
+                return Err(error);
+            }
+        };
         if let Some((mode, force_restart)) = refresh_recovery(&runtime_before, modified) {
             if modified {
                 self.probe_nodes_locked().await?;
@@ -357,10 +363,14 @@ impl ConnectService {
     pub async fn select_and_connect(
         &self,
         app: &AppHandle,
+        wall_now: Timestamp,
         monotonic_now: Duration,
         proxy_mode: ProxyMode,
     ) -> Result<ConnectSnapshot, ClientError> {
         let _operation = self.operations.lock().await;
+        if self.stop_if_bundle_expired(wall_now).await? {
+            return Err(connect_error("connect_bundle_offline_expired"));
+        }
         self.probe_nodes_locked().await?;
         self.apply_selection(app, monotonic_now, proxy_mode, false, true)
             .await?;
@@ -371,9 +381,13 @@ impl ConnectService {
     pub async fn maintain_connection(
         &self,
         app: &AppHandle,
+        wall_now: Timestamp,
         monotonic_now: Duration,
     ) -> Result<ConnectSnapshot, ClientError> {
         let _operation = self.operations.lock().await;
+        if self.stop_if_bundle_expired(wall_now).await? {
+            return Err(connect_error("connect_bundle_offline_expired"));
+        }
         let runtime = self.supervisor.snapshot()?;
         let Some((mode, force_restart)) = active_recovery(&runtime) else {
             return self.snapshot_locked().await;
@@ -393,7 +407,7 @@ impl ConnectService {
             .await
             .binding
             .ok_or_else(|| connect_error("connect_session_missing"))?;
-        self.supervisor.stop()?;
+        self.supervisor.stop().await?;
         let remote_logout = match self.session.ensure_fresh(now).await {
             Ok(_) => self.session.logout().await,
             Err(error) => Err(error),
@@ -425,7 +439,7 @@ impl ConnectService {
     /// Stops the account-owned Xray process without changing account or selection state.
     pub async fn stop(&self) -> Result<ConnectSnapshot, ClientError> {
         let _operation = self.operations.lock().await;
-        self.supervisor.stop()?;
+        self.supervisor.stop().await?;
         self.snapshot_locked().await
     }
 
@@ -433,7 +447,7 @@ impl ConnectService {
     pub(crate) async fn abort_setup(&self) -> Result<(), ClientError> {
         let _operation = self.operations.lock().await;
         let binding = self.session.snapshot().await.binding;
-        self.supervisor.stop()?;
+        self.supervisor.stop().await?;
         if let Some(binding) = binding {
             let cache = BundleCache::new(self.app_data_dir.clone(), binding)?;
             tokio::task::spawn_blocking(move || cache.purge())
@@ -528,12 +542,12 @@ impl ConnectService {
         };
         if decision.node_id.is_none() {
             if stop_when_unavailable {
-                self.supervisor.stop()?;
+                self.supervisor.stop().await?;
             }
             return Ok(decision);
         }
         if decision.changed || force_restart {
-            self.supervisor.stop()?;
+            self.supervisor.stop().await?;
             let profile = profile.ok_or_else(|| connect_error("connect_profile_missing"))?;
             self.supervisor
                 .start(
@@ -545,6 +559,21 @@ impl ConnectService {
                 .await?;
         }
         Ok(decision)
+    }
+
+    async fn stop_if_bundle_expired(&self, now: Timestamp) -> Result<bool, ClientError> {
+        let expired = self
+            .inner
+            .lock()
+            .await
+            .bundle
+            .as_ref()
+            .map(|bundle| bundle.signed().manifest.offline_expires_at)
+            .is_some_and(|deadline| offline_deadline_elapsed(deadline, now));
+        if expired {
+            self.supervisor.stop().await?;
+        }
+        Ok(expired)
     }
 
     async fn snapshot_locked(&self) -> Result<ConnectSnapshot, ClientError> {
@@ -605,6 +634,10 @@ fn active_recovery(runtime: &ClientState) -> Option<(ProxyMode, bool)> {
 fn refresh_recovery(runtime: &ClientState, modified: bool) -> Option<(ProxyMode, bool)> {
     let (mode, failed) = active_recovery(runtime)?;
     (modified || failed).then_some((mode, true))
+}
+
+fn offline_deadline_elapsed(deadline: Timestamp, now: Timestamp) -> bool {
+    deadline.as_datetime() <= now.as_datetime()
 }
 
 fn connect_error(code: &str) -> ClientError {
@@ -758,6 +791,14 @@ mod tests {
         );
         runtime.active_profile_id = None;
         assert!(refresh_recovery(&runtime, true).is_none());
+    }
+
+    #[test]
+    fn offline_deadline_is_closed_at_the_exact_boundary() {
+        let deadline: Timestamp = "2030-01-01T00:00:00Z".parse().unwrap();
+        let before: Timestamp = "2029-12-31T23:59:59Z".parse().unwrap();
+        assert!(!offline_deadline_elapsed(deadline, before));
+        assert!(offline_deadline_elapsed(deadline, deadline));
     }
 
     #[tokio::test]

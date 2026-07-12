@@ -27,7 +27,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": [],
+    "category": "Utility",
+    "shortDescription": "Private network access for invited members.",
+    "longDescription": "Connects an invited member device to assigned private network nodes.",
+    "icon": ["icons/icon.png", "icons/icon.icns", "icons/icon.ico"],
     "externalBin": ["binaries/xray"]
   }
 }

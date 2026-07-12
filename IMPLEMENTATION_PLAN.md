@@ -62,7 +62,11 @@ Deliverables:
 
 ## Stage 5: Packaging, Operations, And Release
 
-Status: pending.
+Status: implementation complete; signed release acceptance pending.
+
+The production code, package definitions, and release gates are implemented. Promotion remains
+blocked until the platform-specific signed evidence in `docs/RELEASE_ACCEPTANCE.md` exists for one
+immutable candidate. An unsigned local package or a cross-compile check cannot close that gate.
 
 Deliverables:
 

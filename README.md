@@ -10,8 +10,11 @@ Connect. The final public brand is intentionally not encoded into the protocol o
 - `client/`: independent macOS/Windows Connect application with a bundled Xray supervisor.
 - `control-server/`: standalone lightweight Control Service with authoritative SQLite storage.
 - `node-host/`: headless Node Host core with local identity, state, and CLI foundations.
+- `node-host-app/`: dedicated packageable Node Host setup/status shell.
+- `relay-server/`: bounded raw-TCP relay and reusable node connector.
 - `probe-worker/`: optional privacy-minimized Cloudflare Worker for external TCP preflight.
-- `crates/`: shared versioned protocol/domain types plus the verified Xray runtime boundary.
+- `crates/`: shared protocol, verified Xray runtime, and signed release-manifest boundaries.
+- `packaging/`, `scripts/`, and `.github/`: service assets, lifecycle smoke tests, and release CI.
 - `docs/`: authoritative architecture, protocol, security, and component designs.
 
 ## Current Status
@@ -70,8 +73,31 @@ in the native credential store; signed bundles use a crash-safe two-generation c
 automatic, and pinned-fallback selection share the existing Xray supervisor. A real
 Control-to-Connect test covers setup-link activation, bundle verification/cache, and offline
 registry reconstruction. Automatic bundle refresh and bounded backend-owned node probes never
-start Xray when the member left it disconnected. The production VLESS + REALITY endpoint canary,
-system-proxy recovery, signed installers, and relay reachability remain Stage 5 work.
+start Xray when the member left it disconnected. System mode now captures and atomically journals
+macOS/Windows proxy state and restores it after stop, logout, failure, expiry, crash recovery, and
+app exit; manual loopback mode remains independent.
+
+Control migration 13 and Node Host migrations 13-15 implement the production operations slice.
+Control owns a two-phase TCP plus Xray-backed VLESS/REALITY canary; direct and relay endpoints enter
+bundles only after the exact revision, endpoint, and dedicated canary credential succeed. Node Host
+normalizes loopback-only Xray Stats counters into restart-safe deltas, spools ordered telemetry,
+and Control ingests it idempotently into per-user/per-node hourly and daily aggregates with
+class-specific retention. Detailed connection metadata remains disabled by default. Both sides
+emit allowlisted support bundles.
+
+`relay-server` provides mTLS route registration, bounded multiplexing, flow control, revocation,
+reconnect backoff, loopback-only metrics, and a reusable connector. Node Host stores an explicitly
+consented relay assignment in owner-only generations, starts it with the managed runtime, and
+reports a relay candidate only while registered. Relay and direct failures remain independent and
+both pass the same end-to-end publication canary.
+
+Control also has signed, digest-bound, high-water-checked SQLite backup/verify/restore commands;
+because the controller identity sidecar is not encrypted by the application, backup creation
+requires an explicit externally encrypted destination contract. Release tooling pins Xray assets,
+generates SBOM/checksum evidence, validates a separately signed update manifest and emergency
+rollback authorization, and defines macOS/Windows CI plus Node Host service packages. The first
+signed release is not yet accepted: production trust roots, Developer ID/Authenticode credentials,
+notarization, Intel/Windows runners, and the full clean-machine matrix remain required evidence.
 
 The optional probe-worker contract is implemented and dry-run deployable. Control Service can now
 invoke it in explicit `remote-http` mode. Node Host also has a macOS private-preview user
@@ -79,8 +105,9 @@ invoke it in explicit `remote-http` mode. Node Host also has a macOS private-pre
 operation, service replacement rolls back on failure, and status/removal never expose or delete
 node credentials. Its same-user, status-only Unix IPC lets the UI read live service, runtime,
 revision, mapping, and stable error state without opening the service-owned database. This preview
-path requires a logged-in user and does not prevent sleep; signed system packages and the
-end-to-end VLESS + REALITY publication canary remain operational gaps.
+path requires a logged-in user and does not prevent sleep. The dedicated Node Host package instead
+defines a system LaunchDaemon; its signed/notarized clean-machine behavior remains a release-lab
+gate rather than a claimed local result.
 
 ## Authoritative Documentation
 
@@ -94,6 +121,8 @@ end-to-end VLESS + REALITY publication canary remain operational gaps.
 - [docs/SECURITY.md](./docs/SECURITY.md): trust boundaries, credentials, privacy, and release security.
 - [docs/client/REQUIREMENTS.md](./docs/client/REQUIREMENTS.md): account-first Connect behavior.
 - [docs/client/ARCHITECTURE.md](./docs/client/ARCHITECTURE.md): Connect runtime and storage design.
+- [docs/RELEASE_ACCEPTANCE.md](./docs/RELEASE_ACCEPTANCE.md): immutable evidence and platform matrix.
+- [RELEASE.md](./RELEASE.md): package, signing, sidecar, SBOM, and lifecycle tooling.
 - [DESIGN.md](./DESIGN.md): non-authoritative visual design reference.
 
 `docs/MULTI_NODE_AND_ANALYTICS.md` remains supporting rationale. If it conflicts with the documents
@@ -117,8 +146,10 @@ cargo test --manifest-path client/src-tauri/Cargo.toml
 
 cargo test --manifest-path crates/control-protocol/Cargo.toml
 cargo test --manifest-path crates/xray-runtime/Cargo.toml --locked
+cargo test --manifest-path crates/release-manifest/Cargo.toml --locked
 cargo test --manifest-path control-server/Cargo.toml
 cargo test --manifest-path node-host/Cargo.toml
+cargo test --manifest-path relay-server/Cargo.toml --locked
 
 npm --prefix probe-worker run check
 npm --prefix probe-worker test

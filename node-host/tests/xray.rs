@@ -3,6 +3,7 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use node_host::{configure_xray, initialize, status};
+use rusqlite::Connection;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
 use std::fs;
@@ -55,7 +56,7 @@ async fn configures_a_pinned_runtime_and_keeps_reality_identity_out_of_sqlite() 
     let configured = configure_xray(&data_dir, &fake.path, &fake.digest, false)
         .await
         .unwrap();
-    assert_eq!(configured.schema_version, 12);
+    assert_eq!(configured.schema_version, 15);
     assert!(configured.xray_configured);
     assert_eq!(
         configured.xray_binary_path.as_deref(),
@@ -68,6 +69,16 @@ async fn configures_a_pinned_runtime_and_keeps_reality_identity_out_of_sqlite() 
     assert_eq!(configured.xray_version.as_deref(), Some("Xray 25.7.1"));
     assert!(configured.reality_public_key.is_some());
     assert_eq!(configured.reality_short_id.as_deref().unwrap().len(), 16);
+    let database_path = data_dir.join("node-host.sqlite3");
+    let stats_api_port: i64 = Connection::open(&database_path)
+        .unwrap()
+        .query_row(
+            "SELECT stats_api_port FROM xray_runtime_config WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!((1..=65_535).contains(&stats_api_port));
 
     let seed_path = data_dir.join("reality.x25519.seed");
     let seed = fs::read(&seed_path).unwrap();
@@ -76,7 +87,7 @@ async fn configures_a_pinned_runtime_and_keeps_reality_identity_out_of_sqlite() 
         fs::metadata(&seed_path).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    let database = fs::read(data_dir.join("node-host.sqlite3")).unwrap();
+    let database = fs::read(&database_path).unwrap();
     assert!(!contains_bytes(&database, &seed));
     assert!(!contains_bytes(
         &database,
@@ -88,6 +99,15 @@ async fn configures_a_pinned_runtime_and_keeps_reality_identity_out_of_sqlite() 
         .unwrap();
     assert_eq!(repeated.reality_public_key, configured.reality_public_key);
     assert_eq!(repeated.reality_short_id, configured.reality_short_id);
+    let repeated_stats_api_port: i64 = Connection::open(&database_path)
+        .unwrap()
+        .query_row(
+            "SELECT stats_api_port FROM xray_runtime_config WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(repeated_stats_api_port, stats_api_port);
     assert_eq!(
         status(&data_dir).unwrap().xray_version.as_deref(),
         Some("Xray 25.7.1")

@@ -131,6 +131,26 @@ The Xray API and metrics listeners bind to loopback or a private inherited socke
 public HTTP server, SSH server, or inbound control endpoint. The public data listener and external
 reachability probe are data-plane surfaces and do not violate the outbound-only management rule.
 
+### 5.3 Current Executable Operations Slice
+
+Node Host migrations 13-15 implement the bounded telemetry spool, owner-managed relay assignment,
+and Xray Stats normalization described below. The managed service queries the checksum-verified
+Xray binary through a loopback-only Stats API, turns cumulative per-user counters into restart-safe
+deltas, and never fabricates connection counts. Upload resumes from the controller cursor after an
+outage.
+
+Relay configuration is an explicit provider action. `configure-relay` validates an owner-only
+assignment and mTLS material, copies secrets into a private generation, and records consent before
+the service can connect. The connector multiplexes only to the active loopback admission gate; an
+assignment cannot name an arbitrary local target. Heartbeat advertises the relay endpoint only
+while the connector is registered. Control then applies the same external TCP and VLESS/REALITY
+canary required for direct publication. `revoke-relay` requires the exact endpoint ID, retires the
+assignment, and removes its local credential generation.
+
+The dedicated `node-host-app/` and system-service package assets exist, but signed/notarized
+clean-machine installation is still governed by `docs/RELEASE_ACCEPTANCE.md`; a local unsigned
+package is validation evidence only.
+
 ## 6. One-Time Pairing
 
 ### 6.1 Pairing Artifact
@@ -345,10 +365,11 @@ Service now durably claims and records an external, public-address-only TCP pref
 in-process runner is valid only when that controller process is outside the node's LAN. A home
 controller probing its own public endpoint measures NAT loopback behavior, not outside
 reachability. The implemented `remote-http` mode can instead invoke the privacy-minimized external
-TCP executor. The protocol-aware VLESS + REALITY canary, IPv6 admission, relay fallback, bandwidth
-shaping, and durable quota counters are not implemented in this milestone. Until protocol-probe
-convergence lands, Control makes no claim that a mapped node is externally reachable; unsupported
-routers still require a valid manual TCP forwarding rule.
+TCP executor. Control now follows successful TCP preflight with a checksum-pinned Xray VLESS +
+REALITY canary for the exact candidate/revision. The same gate applies to a registered raw-TCP relay
+route. Bare TCP still makes no publishability claim. IPv6 admission, complete provider bandwidth
+shaping, and offline quota enforcement remain later hardening; unsupported routers still require a
+valid manual TCP forwarding rule or an explicitly consented relay assignment.
 
 ## 7. Outbound-Only Control Sync
 

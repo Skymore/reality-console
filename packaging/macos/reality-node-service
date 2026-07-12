@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+BASE="/Library/Application Support/Private Network Node"
+STATE="$BASE/state"
+AGENT="$BASE/current/node-host"
+
+# An unpaired installation is intentionally dormant. Setup kicks launchd after
+# enrollment creates the database, avoiding a pre-enrollment crash loop.
+[ -f "$STATE/node-host.sqlite3" ] || exit 0
+[ -x "$AGENT" ] || { echo "installed Node Host agent is missing" >&2; exit 70; }
+
+exec "$AGENT" run --data-dir "$STATE"

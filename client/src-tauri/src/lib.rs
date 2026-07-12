@@ -10,6 +10,7 @@ mod runtime;
 pub mod selection;
 pub mod session;
 mod state;
+mod system_proxy;
 pub mod vault;
 
 use core::config::{build_xray_config, DEFAULT_HTTP_PORT, DEFAULT_SOCKS_PORT};
@@ -60,8 +61,8 @@ async fn client_start(
 }
 
 #[tauri::command]
-fn client_stop(supervisor: State<'_, XraySupervisor>) -> Result<ClientState, ClientError> {
-    supervisor.stop()
+async fn client_stop(supervisor: State<'_, XraySupervisor>) -> Result<ClientState, ClientError> {
+    supervisor.stop().await
 }
 
 #[tauri::command]
@@ -226,6 +227,12 @@ pub fn run() {
             let supervisor = XraySupervisor::new(app_data_dir.clone())
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(supervisor.clone());
+            tauri::async_runtime::spawn({
+                let supervisor = supervisor.clone();
+                async move {
+                    let _ = supervisor.startup_recovery().await;
+                }
+            });
             app.manage(SetupSessionStore::new());
             app.manage(ConnectRuntimeRegistry::new(app_data_dir, supervisor));
             tauri::async_runtime::spawn(runtime::run_background_maintenance(app.handle().clone()));
@@ -261,7 +268,7 @@ pub fn run() {
             event,
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
         ) {
-            let _ = app.state::<XraySupervisor>().stop();
+            let _ = app.state::<XraySupervisor>().stop_blocking();
         }
     });
 }

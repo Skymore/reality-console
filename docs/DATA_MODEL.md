@@ -422,35 +422,28 @@ body. Migration 12 extends the contract to setup delivery, login, and generation
 
 ### 3.8 Telemetry and audit
 
-`telemetry_cursors` has one row per node: `(network_id, node_id)` primary key,
-`committed_through INTEGER NOT NULL DEFAULT 0`, `last_batch_at`, and `updated_at`.
+Control migration 13 implements `node_telemetry_cursors`, keyed by `(network_id, node_id)`, with
+the highest acknowledged sequence and update time. `node_telemetry_events` is keyed by the same
+identity plus sequence and stores event type, optional user, occurred/received times, canonical
+event digest, and only the closed optional fields permitted for that event. It never stores
+payloads, URL paths, queries, or destination byte claims. When detailed collection is disabled, a
+connection event becomes a `droppedPolicy` row with no destination/client fields so sequencing can
+advance without retaining opted-out data.
 
-`telemetry_batch_receipts` stores `(network_id, node_id, first_sequence, last_sequence)` as its
-primary key, `batch_digest`, `accepted_first`, `accepted_last`, `received_at`, and event counts. It
-is diagnostic replay evidence, not the cursor source of truth.
-
-`traffic_samples` stores `(network_id, node_id, sequence)` as its primary key, `user_id`,
-`bucket_start`, non-negative `uplink_bytes` and `downlink_bytes`, and `received_at`. Values are
-deltas. Indexes cover `(network_id, user_id, bucket_start)` and `(network_id, node_id, bucket_start)`.
-
-`connection_events` stores `(network_id, node_id, sequence)` as its primary key, `user_id`,
-`occurred_at`, optional `client_ip`, `network`, `destination_host`, optional `destination_port`, and
-`received_at`. It never stores payloads, URL paths, query strings, or destination byte claims.
-
-`user_daily_usage` is the durable aggregate keyed by `(network_id, node_id, user_id, day_start)` and
-contains uplink/downlink bytes, connection count, first/last event times, and `updated_at`. Daily
-rows are updated only in the same transaction that advances a telemetry cursor.
+`traffic_hourly_aggregates` and `traffic_daily_aggregates` are keyed by
+`(network_id, user_id, node_id, bucket_start)` and contain non-negative upload/download deltas,
+connection count, and update time. Both are updated in the same transaction that inserts the raw
+event and advances the cursor. `telemetry_policy` is a singleton opt-in plus a detailed-event
+retention period from 1 to 90 days.
 
 Telemetry ingestion uses `BEGIN IMMEDIATE` on the node cursor:
 
 1. Verify ordering, bounds, and the batch digest before opening the write transaction.
-2. Lock/read `committed_through`; the expected sequence is `committed_through + 1`.
+2. Lock/read `acknowledged_sequence`; the expected sequence is `acknowledged_sequence + 1`.
 3. If the whole batch is at or below the cursor, acknowledge the cursor without inserting data.
-4. For an overlapping batch, verify any retained overlap, ignore it, and accept only a contiguous
-   suffix beginning at the expected sequence.
-5. Reject a gap without changing data and return `expectedSequence`.
-6. Insert event rows, update daily aggregates, insert the receipt, and advance the cursor in one
-   commit. A uniqueness conflict is accepted only when the existing event digest/content matches.
+4. Require every new batch to begin exactly at `acknowledged_sequence + 1`; reject overlap or a gap
+   without changing data and return `expectedSequence`.
+5. Insert event rows, update hourly/daily aggregates, and advance the cursor in one commit.
 
 `audit_events` is append-only and keyed by `(network_id, audit_id)`. It contains `occurred_at`,
 `actor_type`, nullable `actor_id`, `action`, `target_type`, nullable `target_id`, `result`,
@@ -460,7 +453,7 @@ revocation, purge, migration, backup restore, and recovery-fence actions are man
 
 ## 4. Node Host Local Schema
 
-The implemented Node Host migration version is 12. The database is owner-only and bound to one
+The implemented Node Host migration version is 15. The database is owner-only and bound to one
 enrolled `node_id`; it uses the same SQLite contract and migration table. The list below includes
 implemented tables and later planned policy/telemetry expansions.
 
@@ -481,7 +474,8 @@ implemented tables and later planned policy/telemetry expansions.
 - `controller_status_state`: latest signature-verified controller lifecycle and endpoint-readiness
   snapshot, with immutable transcript/envelope digests and non-regressing heartbeat generation.
 - `xray_runtime_config`: installer-supplied absolute binary path, trusted SHA-256, bounded version
-  probe result, and configuration/update times. The separate REALITY private seed remains in the
+  probe result, a persisted loopback-only Stats API port, and configuration/update times. The
+  separate REALITY private seed remains in the
   owner-only secret store; only its public key and derived short ID are exposed by safe status.
 - `desired_state_artifacts` and `local_revision_results`: the current receive/validation journal.
   Signed envelopes and lifecycle result payloads are immutable; only a result's nullable delivery
@@ -513,13 +507,20 @@ implemented tables and later planned policy/telemetry expansions.
   decreases, including after rollback.
 - `config_backups`: `(revision, config_digest)` primary key, owner-only artifact reference, created
   time, last successful health time, and pin reason. Artifact hashes are verified before use.
-- `telemetry_queue`: `sequence INTEGER PRIMARY KEY`, event kind, occurred time, canonical payload,
-  payload digest, created time, nullable acknowledged time, and byte size. Sequence allocation and
-  insertion are one transaction; unacknowledged quota traffic is never silently dropped.
+- `telemetry_spool_state` allocates the next monotonic sequence. `telemetry_spool` stores immutable
+  canonical event JSON/digest, event type, occurred/created time, and nullable acknowledgement.
+  Sequence allocation and insertion are one transaction; unacknowledged aggregate traffic is never
+  silently dropped. Acknowledged rows remain replayable for seven days.
+- `xray_traffic_collection_state` and `xray_user_traffic_counters` bind the previous cumulative
+  counters to an applied revision/runtime generation. Counter restart or rollback emits a bounded
+  collection-status transition and establishes a new baseline; only positive differences become
+  `TrafficDelta`, and connection count remains zero when Xray cannot prove it.
 - `reachability_results`: append-only attempt ID, endpoint candidate, local test result, mapping
   protocol, started/completed times, error code, and expiry.
-- `relay_assignment`: singleton relay ID/endpoint, public relay key, tunnel credential `secret_ref`,
-  assignment version, status, and expiry.
+- `relay_provider_consent` records the local disclosure version and acceptance time.
+  `relay_assignment` stores only endpoint/route metadata, expiry, owner-only material generation,
+  and digest. Token, client certificate/private key, and relay CA bytes live under a 0700
+  generation directory as 0600 files and are deleted on explicit revoke.
 
 Node-local REALITY private keys and raw controller credentials are outside SQLite. The database may
 be restored only when its node identity matches the credential-store identity; otherwise Node Host
@@ -545,8 +546,10 @@ retained. An invalid, expired, interrupted, or rollback candidate never replaces
 bundle. Offline use is allowed only through `offline_expires_at`.
 
 Selection health is bounded process state rebuilt by backend-owned probes after restart. System
-proxy and durable proxy-recovery records are intentionally deferred to Stage 5; manual loopback
-proxy mode is the current implemented path.
+proxy mode stores one owner-only, size-bounded, atomic recovery journal containing the exact prior
+macOS/Windows proxy settings. Startup, stop, logout, failure, expiry, and app-exit paths serialize
+restoration before clearing the journal. Manual loopback mode never captures or mutates OS proxy
+state.
 
 ## 6. Deletion and Referential Rules
 

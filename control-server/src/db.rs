@@ -8,6 +8,7 @@ use crate::identity::{set_owner_only, ControllerIdentity, IdentityError};
 use crate::probe::{
     ProbeSchedule, TcpProbeCompletion, TcpProbeJob, TcpProbeLoopOptions, TcpProbeResult,
 };
+use crate::protocol_canary::{ProtocolCanaryJob, ProtocolCanaryLoopOptions, ProtocolCanaryResult};
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -50,6 +51,10 @@ use control_protocol::request_auth::{
     verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
 };
 use control_protocol::secret::Secret;
+use control_protocol::telemetry::{
+    NetworkProtocol, TelemetryBatch, TelemetryBatchAcknowledgement, TelemetryCursor,
+    TelemetryEventKind, TelemetryRetentionResult, TrafficAggregate, TELEMETRY_SCHEMA_VERSION,
+};
 use control_protocol::validation::ProtocolValidationError;
 use fs2::FileExt;
 use rand_core::{OsRng, RngCore as _};
@@ -58,6 +63,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,8 +72,8 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 12;
-const APPLICATION_ID: i64 = 0x5243_4F4E;
+pub const SCHEMA_VERSION: i64 = 13;
+pub(crate) const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
 const IDEMPOTENCY_LIFETIME_SECONDS: i64 = 24 * 60 * 60;
@@ -85,6 +91,9 @@ const ACCESS_TOKEN_LIFETIME_SECONDS: i64 = 15 * 60;
 const REFRESH_TOKEN_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 const BUNDLE_REFRESH_SECONDS: i64 = 6 * 60 * 60;
 const BUNDLE_OFFLINE_SECONDS: i64 = 7 * 24 * 60 * 60;
+const TELEMETRY_HEALTH_RETENTION_DAYS: i64 = 30;
+const TELEMETRY_HOURLY_RETENTION_DAYS: i64 = 90;
+const TELEMETRY_DAILY_RETENTION_DAYS: i64 = 365;
 
 const MIGRATION_1_SQL: &str = r"
 CREATE TABLE networks (
@@ -1055,6 +1064,141 @@ CREATE INDEX profile_bundles_current_device
     ON profile_bundles(network_id, device_id, generation DESC) WHERE superseded_at IS NULL;
 ";
 
+const MIGRATION_13_SQL: &str = r"
+CREATE TABLE node_telemetry_cursors (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    acknowledged_sequence INTEGER NOT NULL DEFAULT 0
+        CHECK(acknowledged_sequence >= 0),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, node_id),
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE node_telemetry_events (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK(sequence > 0),
+    event_type TEXT NOT NULL CHECK(event_type IN (
+        'trafficDelta', 'connection', 'collectionStatus', 'quotaState'
+    )),
+    user_id TEXT,
+    occurred_at INTEGER NOT NULL,
+    received_at INTEGER NOT NULL,
+    event_sha256 BLOB NOT NULL CHECK(length(event_sha256) = 32),
+    disposition TEXT NOT NULL CHECK(disposition IN ('stored', 'droppedPolicy')),
+    protocol TEXT CHECK(protocol IS NULL OR protocol IN ('tcp', 'udp')),
+    destination_host TEXT CHECK(
+        destination_host IS NULL OR length(destination_host) BETWEEN 1 AND 253
+    ),
+    destination_port INTEGER CHECK(
+        destination_port IS NULL OR destination_port BETWEEN 1 AND 65535
+    ),
+    client_identifier TEXT CHECK(
+        client_identifier IS NULL OR length(client_identifier) BETWEEN 1 AND 128
+    ),
+    status_code TEXT CHECK(status_code IS NULL OR length(status_code) BETWEEN 1 AND 64),
+    PRIMARY KEY(network_id, node_id, sequence),
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE CASCADE,
+    FOREIGN KEY(network_id, user_id)
+        REFERENCES users(network_id, user_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX node_telemetry_events_retention
+    ON node_telemetry_events(event_type, received_at);
+CREATE INDEX node_telemetry_events_user
+    ON node_telemetry_events(network_id, user_id, received_at);
+
+CREATE TABLE traffic_hourly_aggregates (
+    network_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    bucket_start INTEGER NOT NULL CHECK(bucket_start >= 0 AND bucket_start % 3600 = 0),
+    bytes_up INTEGER NOT NULL CHECK(bytes_up >= 0),
+    bytes_down INTEGER NOT NULL CHECK(bytes_down >= 0),
+    connection_count INTEGER NOT NULL CHECK(connection_count >= 0),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, user_id, node_id, bucket_start),
+    FOREIGN KEY(network_id, user_id)
+        REFERENCES users(network_id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE traffic_daily_aggregates (
+    network_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    bucket_start INTEGER NOT NULL CHECK(bucket_start >= 0 AND bucket_start % 86400 = 0),
+    bytes_up INTEGER NOT NULL CHECK(bytes_up >= 0),
+    bytes_down INTEGER NOT NULL CHECK(bytes_down >= 0),
+    connection_count INTEGER NOT NULL CHECK(connection_count >= 0),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(network_id, user_id, node_id, bucket_start),
+    FOREIGN KEY(network_id, user_id)
+        REFERENCES users(network_id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE telemetry_policy (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    detailed_enabled INTEGER NOT NULL CHECK(detailed_enabled IN (0, 1)),
+    detailed_retention_days INTEGER NOT NULL
+        CHECK(detailed_retention_days BETWEEN 1 AND 90),
+    updated_at INTEGER NOT NULL
+) STRICT;
+INSERT INTO telemetry_policy(singleton, detailed_enabled, detailed_retention_days, updated_at)
+VALUES (1, 0, 30, 0);
+
+CREATE TABLE endpoint_canary_credentials (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+    credential_id TEXT NOT NULL CHECK(length(credential_id) = 36),
+    vless_uuid TEXT NOT NULL CHECK(length(vless_uuid) = 36),
+    generation INTEGER NOT NULL CHECK(generation > 0),
+    status TEXT NOT NULL CHECK(status IN ('active', 'retired')),
+    created_at INTEGER NOT NULL,
+    retired_at INTEGER,
+    PRIMARY KEY(network_id, node_id, credential_id),
+    UNIQUE(network_id, node_id, generation),
+    UNIQUE(network_id, node_id, vless_uuid),
+    CHECK((status = 'active' AND retired_at IS NULL)
+        OR (status = 'retired' AND retired_at IS NOT NULL)),
+    FOREIGN KEY(network_id, node_id)
+        REFERENCES nodes(network_id, node_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID;
+CREATE UNIQUE INDEX endpoint_canary_credentials_active
+    ON endpoint_canary_credentials(network_id, node_id) WHERE status = 'active';
+
+CREATE TABLE node_revision_canary_credentials (
+    network_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision > 0),
+    credential_id TEXT NOT NULL,
+    PRIMARY KEY(network_id, node_id, revision),
+    FOREIGN KEY(network_id, node_id, revision)
+        REFERENCES node_revision_targets(network_id, node_id, revision) ON DELETE RESTRICT,
+    FOREIGN KEY(network_id, node_id, credential_id)
+        REFERENCES endpoint_canary_credentials(network_id, node_id, credential_id)
+        ON DELETE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER node_revision_canary_credentials_no_update
+BEFORE UPDATE ON node_revision_canary_credentials
+BEGIN
+    SELECT RAISE(ABORT, 'revision canary credentials are immutable');
+END;
+CREATE TRIGGER node_revision_canary_credentials_no_delete
+BEFORE DELETE ON node_revision_canary_credentials
+BEGIN
+    SELECT RAISE(ABORT, 'revision canary credentials are immutable');
+END;
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -1121,6 +1265,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "member_devices_sessions_and_bundles",
         sql: MIGRATION_12_SQL,
+    },
+    Migration {
+        version: 13,
+        name: "protocol_canary_and_telemetry",
+        sql: MIGRATION_13_SQL,
     },
 ];
 
@@ -1768,6 +1917,69 @@ impl Database {
         .map_err(DatabaseError::Worker)?
     }
 
+    /// Claims one endpoint whose latest TCP preflight succeeded but whose
+    /// VLESS+REALITY identity is not currently verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds, clock failure, corrupt state, or storage failure.
+    pub async fn claim_protocol_canary(
+        &self,
+        runner_id: Uuid,
+        options: ProtocolCanaryLoopOptions,
+    ) -> Result<Option<ProtocolCanaryJob>, DatabaseError> {
+        options
+            .validate()
+            .map_err(|_| DatabaseError::InvalidProbeSchedule)?;
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            claim_protocol_canary(&mut guard.connection, runner_id, options)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Commits one claimed protocol result and changes publication readiness
+    /// only after a successful data-plane canary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a forged, expired, stale, or uncommittable claim.
+    pub async fn complete_protocol_canary(
+        &self,
+        job: ProtocolCanaryJob,
+        result: ProtocolCanaryResult,
+    ) -> Result<TcpProbeCompletion, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            complete_protocol_canary(&mut guard.connection, &job, result)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Rotates the node-scoped canary bearer and publishes a replacement
+    /// revision before the old credential can be used again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node is unavailable or publication cannot commit atomically.
+    pub async fn rotate_protocol_canary(
+        &self,
+        node_id: NodeId,
+    ) -> Result<SignedDesiredState, DatabaseError> {
+        let identity = self.controller_identity.clone();
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            rotate_protocol_canary(&mut guard.connection, &identity, node_id)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
     /// Publishes one immutable signed desired-state revision for an active node.
     pub(crate) async fn publish_desired_state(
         &self,
@@ -1832,10 +2044,650 @@ impl Database {
         .map_err(DatabaseError::Worker)?
     }
 
+    /// Returns the controller-owned durable telemetry cursor for one node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node is unavailable or durable state is corrupt.
+    pub async fn telemetry_cursor(
+        &self,
+        node_id: NodeId,
+    ) -> Result<TelemetryCursor, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            load_telemetry_cursor(&guard.connection, node_id)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Atomically ingests, aggregates, and acknowledges one contiguous node batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity, sequence, policy, aggregate, or storage state.
+    pub async fn ingest_telemetry(
+        &self,
+        node_id: NodeId,
+        batch: TelemetryBatch,
+    ) -> Result<TelemetryBatchAcknowledgement, DatabaseError> {
+        batch.validate(&[TELEMETRY_SCHEMA_VERSION])?;
+        if batch.node_id != node_id {
+            return Err(DatabaseError::TelemetryNodeMismatch);
+        }
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            ingest_telemetry(&mut guard.connection, node_id, &batch)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Loads hourly or daily aggregates, optionally scoped by member or node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid query bounds or corrupt durable aggregates.
+    pub async fn traffic_aggregates(
+        &self,
+        bucket_seconds: u32,
+        user_id: Option<UserId>,
+        node_id: Option<NodeId>,
+        since: i64,
+    ) -> Result<Vec<TrafficAggregate>, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            load_traffic_aggregates(&guard.connection, bucket_seconds, user_id, node_id, since)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Deletes telemetry classes by their independent age policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retention transaction or audit write fails.
+    pub async fn enforce_telemetry_retention(
+        &self,
+    ) -> Result<TelemetryRetentionResult, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            enforce_telemetry_retention(&mut guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
+    /// Builds an allowlisted, credential-free support document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when allowlisted state cannot be read or serialized.
+    pub async fn support_bundle(&self) -> Result<serde_json::Value, DatabaseError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock().map_err(|_| DatabaseError::LockPoisoned)?;
+            build_support_bundle(&guard.connection)
+        })
+        .await
+        .map_err(DatabaseError::Worker)?
+    }
+
     #[must_use]
     pub fn controller_identity(&self) -> ControllerIdentity {
         self.controller_identity.clone()
     }
+}
+
+fn load_telemetry_cursor(
+    connection: &Connection,
+    node_id: NodeId,
+) -> Result<TelemetryCursor, DatabaseError> {
+    let network = load_network(connection)?;
+    let node_exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nodes
+         WHERE network_id = ?1 AND node_id = ?2 AND status IN ('pending', 'active'))",
+        params![network.network_id, node_id.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !node_exists {
+        return Err(DatabaseError::NodeRevoked);
+    }
+    let acknowledged = connection
+        .query_row(
+            "SELECT acknowledged_sequence FROM node_telemetry_cursors
+             WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    telemetry_cursor_from_acknowledged(acknowledged)
+}
+
+fn telemetry_cursor_from_acknowledged(acknowledged: i64) -> Result<TelemetryCursor, DatabaseError> {
+    let acknowledged_sequence =
+        SequenceNumber::new(acknowledged).map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let expected_sequence = acknowledged_sequence
+        .checked_next()
+        .ok_or(DatabaseError::TelemetrySequenceExhausted)?;
+    let cursor = TelemetryCursor {
+        acknowledged_sequence,
+        expected_sequence,
+    };
+    cursor.validate()?;
+    Ok(cursor)
+}
+
+fn ingest_telemetry(
+    connection: &mut Connection,
+    node_id: NodeId,
+    batch: &TelemetryBatch,
+) -> Result<TelemetryBatchAcknowledgement, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let network = load_network(&transaction)?;
+    let node_id_text = node_id.to_string();
+    let node_status = transaction
+        .query_row(
+            "SELECT status FROM nodes WHERE network_id = ?1 AND node_id = ?2",
+            params![network.network_id, node_id_text],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(DatabaseError::NodeNotFound)?;
+    if matches!(node_status.as_str(), "disabled" | "revoked") {
+        return Err(DatabaseError::NodeRevoked);
+    }
+    transaction.execute(
+        "INSERT INTO node_telemetry_cursors(
+            network_id, node_id, acknowledged_sequence, updated_at
+         ) VALUES (?1, ?2, 0, ?3)
+         ON CONFLICT(network_id, node_id) DO NOTHING",
+        params![network.network_id, node_id_text, now],
+    )?;
+    let acknowledged: i64 = transaction.query_row(
+        "SELECT acknowledged_sequence FROM node_telemetry_cursors
+         WHERE network_id = ?1 AND node_id = ?2",
+        params![network.network_id, node_id_text],
+        |row| row.get(0),
+    )?;
+    if batch.last_sequence.get() <= acknowledged {
+        transaction.commit()?;
+        let cursor = telemetry_cursor_from_acknowledged(acknowledged)?;
+        return Ok(TelemetryBatchAcknowledgement {
+            acknowledged_sequence: cursor.acknowledged_sequence,
+            expected_sequence: cursor.expected_sequence,
+        });
+    }
+    let expected = acknowledged
+        .checked_add(1)
+        .ok_or(DatabaseError::TelemetrySequenceExhausted)?;
+    if batch.first_sequence.get() != expected {
+        return Err(DatabaseError::TelemetrySequenceGap { expected });
+    }
+    let detailed_enabled: bool = transaction.query_row(
+        "SELECT detailed_enabled FROM telemetry_policy WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    for event in &batch.events {
+        persist_telemetry_event(
+            &transaction,
+            &network.network_id,
+            node_id,
+            event,
+            detailed_enabled,
+            now,
+        )?;
+    }
+    let updated = transaction.execute(
+        "UPDATE node_telemetry_cursors
+         SET acknowledged_sequence = ?1, updated_at = ?2
+         WHERE network_id = ?3 AND node_id = ?4 AND acknowledged_sequence = ?5",
+        params![
+            batch.last_sequence.get(),
+            now,
+            network.network_id,
+            node_id_text,
+            acknowledged,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(DatabaseError::TelemetryCursorConflict);
+    }
+    transaction.commit()?;
+    let cursor = telemetry_cursor_from_acknowledged(batch.last_sequence.get())?;
+    Ok(TelemetryBatchAcknowledgement {
+        acknowledged_sequence: cursor.acknowledged_sequence,
+        expected_sequence: cursor.expected_sequence,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn persist_telemetry_event(
+    connection: &Connection,
+    network_id: &str,
+    node_id: NodeId,
+    event: &control_protocol::telemetry::TelemetryEvent,
+    detailed_enabled: bool,
+    received_at: i64,
+) -> Result<(), DatabaseError> {
+    let occurred_at = event.occurred_at.as_datetime().unix_timestamp();
+    if occurred_at > received_at.saturating_add(86_400) {
+        return Err(DatabaseError::TelemetryClockSkew);
+    }
+    let serialized = serde_json::to_vec(event)?;
+    let event_digest: [u8; 32] = Sha256::digest(&serialized).into();
+    let node_id_text = node_id.to_string();
+    let (
+        event_type,
+        user_id,
+        disposition,
+        protocol,
+        destination_host,
+        destination_port,
+        client_identifier,
+        status_code,
+    ) = match &event.kind {
+        TelemetryEventKind::TrafficDelta { user_id, .. } => {
+            validate_telemetry_user(connection, network_id, node_id, *user_id)?;
+            (
+                "trafficDelta",
+                Some(user_id.to_string()),
+                "stored",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        TelemetryEventKind::Connection {
+            user_id,
+            protocol,
+            destination_host,
+            destination_port,
+            client_identifier,
+        } => {
+            validate_telemetry_user(connection, network_id, node_id, *user_id)?;
+            if detailed_enabled {
+                (
+                    "connection",
+                    Some(user_id.to_string()),
+                    "stored",
+                    Some(match protocol {
+                        NetworkProtocol::Tcp => "tcp",
+                        NetworkProtocol::Udp => "udp",
+                    }),
+                    Some(destination_host.as_str()),
+                    Some(*destination_port),
+                    client_identifier.as_deref(),
+                    None,
+                )
+            } else {
+                (
+                    "connection",
+                    Some(user_id.to_string()),
+                    "droppedPolicy",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+        }
+        TelemetryEventKind::CollectionStatus { code, .. } => (
+            "collectionStatus",
+            None,
+            "stored",
+            None,
+            None,
+            None,
+            None,
+            Some(code.as_str()),
+        ),
+        TelemetryEventKind::QuotaState { user_id, .. } => {
+            validate_telemetry_user(connection, network_id, node_id, *user_id)?;
+            (
+                "quotaState",
+                Some(user_id.to_string()),
+                "stored",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+    };
+    connection.execute(
+        "INSERT INTO node_telemetry_events(
+            network_id, node_id, sequence, event_type, user_id, occurred_at,
+            received_at, event_sha256, disposition, protocol, destination_host,
+            destination_port, client_identifier, status_code
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            network_id,
+            node_id_text,
+            event.sequence.get(),
+            event_type,
+            user_id,
+            occurred_at,
+            received_at,
+            event_digest.as_slice(),
+            disposition,
+            protocol,
+            destination_host,
+            destination_port,
+            client_identifier,
+            status_code,
+        ],
+    )?;
+    if let TelemetryEventKind::TrafficDelta {
+        user_id,
+        bytes_up,
+        bytes_down,
+        connection_count,
+    } = event.kind
+    {
+        upsert_traffic_aggregate(
+            connection,
+            "traffic_hourly_aggregates",
+            network_id,
+            user_id,
+            node_id,
+            occurred_at - occurred_at.rem_euclid(3_600),
+            bytes_up,
+            bytes_down,
+            connection_count,
+            received_at,
+        )?;
+        upsert_traffic_aggregate(
+            connection,
+            "traffic_daily_aggregates",
+            network_id,
+            user_id,
+            node_id,
+            occurred_at - occurred_at.rem_euclid(86_400),
+            bytes_up,
+            bytes_down,
+            connection_count,
+            received_at,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_telemetry_user(
+    connection: &Connection,
+    network_id: &str,
+    node_id: NodeId,
+    user_id: UserId,
+) -> Result<(), DatabaseError> {
+    let assigned: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM user_node_assignments
+         WHERE network_id = ?1 AND node_id = ?2 AND user_id = ?3)",
+        params![network_id, node_id.to_string(), user_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if !assigned {
+        return Err(DatabaseError::TelemetryUserNotAssigned);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_traffic_aggregate(
+    connection: &Connection,
+    table: &'static str,
+    network_id: &str,
+    user_id: UserId,
+    node_id: NodeId,
+    bucket_start: i64,
+    bytes_up: control_protocol::id::Count,
+    bytes_down: control_protocol::id::Count,
+    connection_count: control_protocol::id::Count,
+    updated_at: i64,
+) -> Result<(), DatabaseError> {
+    let sql = format!(
+        "INSERT INTO {table}(
+            network_id, user_id, node_id, bucket_start, bytes_up,
+            bytes_down, connection_count, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(network_id, user_id, node_id, bucket_start) DO UPDATE SET
+            bytes_up = bytes_up + excluded.bytes_up,
+            bytes_down = bytes_down + excluded.bytes_down,
+            connection_count = connection_count + excluded.connection_count,
+            updated_at = excluded.updated_at"
+    );
+    connection.execute(
+        &sql,
+        params![
+            network_id,
+            user_id.to_string(),
+            node_id.to_string(),
+            bucket_start,
+            bytes_up.get(),
+            bytes_down.get(),
+            connection_count.get(),
+            updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_traffic_aggregates(
+    connection: &Connection,
+    bucket_seconds: u32,
+    user_id: Option<UserId>,
+    node_id: Option<NodeId>,
+    since: i64,
+) -> Result<Vec<TrafficAggregate>, DatabaseError> {
+    if !matches!(bucket_seconds, 3_600 | 86_400) || since < 0 {
+        return Err(DatabaseError::InvalidTelemetryQuery);
+    }
+    let table = if bucket_seconds == 3_600 {
+        "traffic_hourly_aggregates"
+    } else {
+        "traffic_daily_aggregates"
+    };
+    let network = load_network(connection)?;
+    let sql = format!(
+        "SELECT user_id, node_id, bucket_start, bytes_up, bytes_down, connection_count
+         FROM {table}
+         WHERE network_id = ?1 AND bucket_start >= ?2
+           AND (?3 IS NULL OR user_id = ?3)
+           AND (?4 IS NULL OR node_id = ?4)
+         ORDER BY bucket_start, user_id, node_id LIMIT 10000"
+    );
+    let user_filter = user_id.map(|value| value.to_string());
+    let node_filter = node_id.map(|value| value.to_string());
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(
+        params![network.network_id, since, user_filter, node_filter],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        },
+    )?;
+    rows.map(|row| {
+        let row = row?;
+        let aggregate = TrafficAggregate {
+            user_id: row
+                .0
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            node_id: row
+                .1
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            bucket_start: row.2,
+            bucket_seconds,
+            bytes_up: control_protocol::id::Count::new(row.3)
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            bytes_down: control_protocol::id::Count::new(row.4)
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            connection_count: control_protocol::id::Count::new(row.5)
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+        };
+        aggregate.validate()?;
+        Ok(aggregate)
+    })
+    .collect()
+}
+
+fn enforce_telemetry_retention(
+    connection: &mut Connection,
+) -> Result<TelemetryRetentionResult, DatabaseError> {
+    enforce_telemetry_retention_at(connection, unix_timestamp()?)
+}
+
+fn enforce_telemetry_retention_at(
+    connection: &mut Connection,
+    now: i64,
+) -> Result<TelemetryRetentionResult, DatabaseError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let detailed_days: i64 = transaction.query_row(
+        "SELECT detailed_retention_days FROM telemetry_policy WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let detailed_events_deleted = transaction.execute(
+        "DELETE FROM node_telemetry_events
+         WHERE event_type = 'connection' AND received_at < ?1",
+        [now.saturating_sub(detailed_days.saturating_mul(86_400))],
+    )?;
+    let traffic_events_deleted = transaction.execute(
+        "DELETE FROM node_telemetry_events
+         WHERE event_type = 'trafficDelta' AND received_at < ?1",
+        [now.saturating_sub(TELEMETRY_HOURLY_RETENTION_DAYS * 86_400)],
+    )?;
+    let health_events_deleted = transaction.execute(
+        "DELETE FROM node_telemetry_events
+         WHERE event_type IN ('collectionStatus', 'quotaState') AND received_at < ?1",
+        [now.saturating_sub(TELEMETRY_HEALTH_RETENTION_DAYS * 86_400)],
+    )?;
+    let hourly_aggregates_deleted = transaction.execute(
+        "DELETE FROM traffic_hourly_aggregates WHERE bucket_start < ?1",
+        [aligned_retention_cutoff(
+            now,
+            TELEMETRY_HOURLY_RETENTION_DAYS,
+            3_600,
+        )],
+    )?;
+    let daily_aggregates_deleted = transaction.execute(
+        "DELETE FROM traffic_daily_aggregates WHERE bucket_start < ?1",
+        [aligned_retention_cutoff(
+            now,
+            TELEMETRY_DAILY_RETENTION_DAYS,
+            86_400,
+        )],
+    )?;
+    let result = TelemetryRetentionResult {
+        traffic_events_deleted: u64::try_from(traffic_events_deleted)
+            .map_err(|_| DatabaseError::TelemetryResultOverflow)?,
+        detailed_events_deleted: u64::try_from(detailed_events_deleted)
+            .map_err(|_| DatabaseError::TelemetryResultOverflow)?,
+        health_events_deleted: u64::try_from(health_events_deleted)
+            .map_err(|_| DatabaseError::TelemetryResultOverflow)?,
+        hourly_aggregates_deleted: u64::try_from(hourly_aggregates_deleted)
+            .map_err(|_| DatabaseError::TelemetryResultOverflow)?,
+        daily_aggregates_deleted: u64::try_from(daily_aggregates_deleted)
+            .map_err(|_| DatabaseError::TelemetryResultOverflow)?,
+    };
+    let network = load_network(&transaction)?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "system",
+        None,
+        "telemetry.retention-enforced",
+        "telemetry",
+        None,
+        "success",
+        &serde_json::to_value(result)?,
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(result)
+}
+
+fn aligned_retention_cutoff(now: i64, retention_days: i64, bucket_seconds: i64) -> i64 {
+    let cutoff = now.saturating_sub(retention_days.saturating_mul(86_400));
+    cutoff - cutoff.rem_euclid(bucket_seconds)
+}
+
+fn build_support_bundle(connection: &Connection) -> Result<serde_json::Value, DatabaseError> {
+    let network = load_network(connection)?;
+    let policy: (bool, i64) = connection.query_row(
+        "SELECT detailed_enabled, detailed_retention_days
+         FROM telemetry_policy WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let counts: (i64, i64, i64, i64) = connection.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM nodes),
+            (SELECT COUNT(*) FROM users WHERE status != 'deleted'),
+            (SELECT COUNT(*) FROM node_telemetry_events),
+            (SELECT COUNT(*) FROM audit_events)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let mut statement = connection.prepare(
+        "SELECT node_id, status, agent_version, xray_version, runtime_state,
+                desired_revision, applied_revision, last_seen_at
+         FROM nodes ORDER BY node_id",
+    )?;
+    let nodes = statement
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "nodeId": row.get::<_, String>(0)?,
+                "status": row.get::<_, String>(1)?,
+                "agentVersion": row.get::<_, String>(2)?,
+                "xrayVersion": row.get::<_, Option<String>>(3)?,
+                "runtimeState": row.get::<_, Option<String>>(4)?,
+                "desiredRevision": row.get::<_, Option<i64>>(5)?,
+                "appliedRevision": row.get::<_, Option<i64>>(6)?,
+                "lastSeenAt": row.get::<_, Option<i64>>(7)?,
+            }))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(serde_json::json!({
+        "schemaVersion": 1,
+        "generatedAt": unix_timestamp()?,
+        "control": {
+            "databaseSchemaVersion": SCHEMA_VERSION,
+            "networkStatus": network.status,
+            "lastRevision": network.last_revision,
+        },
+        "counts": {
+            "nodes": counts.0,
+            "accounts": counts.1,
+            "retainedTelemetryEvents": counts.2,
+            "auditEvents": counts.3,
+        },
+        "telemetryPolicy": {
+            "detailedEnabled": policy.0,
+            "detailedRetentionDays": policy.1,
+            "hourlyRetentionDays": TELEMETRY_HOURLY_RETENTION_DAYS,
+            "dailyRetentionDays": TELEMETRY_DAILY_RETENTION_DAYS,
+        },
+        "nodes": nodes,
+    }))
 }
 
 fn authenticate_node_request(
@@ -2229,10 +3081,13 @@ WHERE network.status = 'active'
   AND n.last_seen_at IS NOT NULL AND n.last_seen_at >= ?1
   AND n.applied_revision = c.applied_revision
   AND n.last_heartbeat_generation = c.last_report_generation
-  AND revision.schema_version = 2
-  AND json_type(revision.artifact_json, '$.document.xray.publicPort') = 'integer'
-  AND json_extract(revision.artifact_json, '$.document.xray.publicPort') = c.port
-  AND c.mode = 'direct'
+  AND (
+      (c.mode = 'direct'
+       AND revision.schema_version = 2
+       AND json_type(revision.artifact_json, '$.document.xray.publicPort') = 'integer'
+       AND json_extract(revision.artifact_json, '$.document.xray.publicPort') = c.port)
+      OR (c.mode = 'relay' AND c.source = 'relay')
+  )
   AND c.withdrawn_at IS NULL
   AND (c.expires_at IS NULL OR c.expires_at > ?2)
   AND verification.status != 'withdrawn'
@@ -2340,6 +3195,184 @@ fn claim_tcp_probe(
         candidate_generation: candidate.candidate_generation,
         claim_expires_at,
         claim_token: Secret::new(claim_token),
+    }))
+}
+
+#[allow(clippy::too_many_lines)]
+fn claim_protocol_canary(
+    connection: &mut Connection,
+    runner_id: Uuid,
+    options: ProtocolCanaryLoopOptions,
+) -> Result<Option<ProtocolCanaryJob>, DatabaseError> {
+    let now = unix_timestamp()?;
+    let claim_expires_at = now
+        .checked_add(probe_duration_seconds(options.claim_lease)?)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let online_cutoff = now
+        .checked_sub(probe_duration_seconds(options.node_online_window)?)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let tcp_cutoff = now
+        .checked_sub(probe_duration_seconds(options.success_interval)?)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let success_interval = probe_duration_seconds(options.success_interval)?;
+    let failure_interval = probe_duration_seconds(options.failure_interval)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    expire_stale_probe_claims(&transaction, now)?;
+    let stored = transaction
+        .query_row(
+            "SELECT c.network_id, c.node_id, c.endpoint_id, c.address, c.port,
+                    c.applied_revision, c.last_report_generation,
+                    tcp.resolved_address, credential.vless_uuid,
+                    node.reality_public_key, node.reality_short_id,
+                    json_extract(revision.artifact_json, '$.document.xray.serverNames[0]')
+             FROM node_endpoint_candidates AS c
+             JOIN nodes AS node ON node.network_id = c.network_id AND node.node_id = c.node_id
+             JOIN config_revisions AS revision
+               ON revision.network_id = c.network_id AND revision.node_id = c.node_id
+              AND revision.revision = c.applied_revision
+             JOIN node_revision_canary_credentials AS snapshot
+               ON snapshot.network_id = c.network_id AND snapshot.node_id = c.node_id
+              AND snapshot.revision = c.applied_revision
+             JOIN endpoint_canary_credentials AS credential
+               ON credential.network_id = snapshot.network_id
+              AND credential.node_id = snapshot.node_id
+              AND credential.credential_id = snapshot.credential_id
+             JOIN endpoint_probe_attempts AS tcp ON tcp.attempt_id = (
+                 SELECT latest.attempt_id FROM endpoint_probe_attempts AS latest
+                 WHERE latest.network_id = c.network_id AND latest.node_id = c.node_id
+                   AND latest.endpoint_id = c.endpoint_id AND latest.phase = 'tcp'
+                   AND latest.status = 'succeeded'
+                   AND latest.applied_revision = c.applied_revision
+                   AND latest.address = c.address AND latest.port = c.port
+                 ORDER BY latest.attempt_id DESC LIMIT 1
+             )
+             JOIN node_endpoint_verifications AS verification
+               ON verification.network_id = c.network_id
+              AND verification.node_id = c.node_id
+              AND verification.endpoint_id = c.endpoint_id
+             WHERE c.mode IN ('direct', 'relay') AND c.withdrawn_at IS NULL
+               AND (c.expires_at IS NULL OR c.expires_at > ?1)
+               AND node.status = 'active' AND node.runtime_state = 'serving'
+               AND node.provider_paused = 0 AND node.last_seen_at >= ?2
+               AND node.applied_revision = c.applied_revision
+               AND node.last_heartbeat_generation = c.last_report_generation
+               AND credential.status = 'active'
+               AND tcp.completed_at >= ?3 AND tcp.resolved_address IS NOT NULL
+               AND verification.status != 'withdrawn'
+               AND NOT EXISTS(
+                   SELECT 1 FROM endpoint_probe_attempts AS active
+                   WHERE active.network_id = c.network_id
+                     AND active.node_id = c.node_id AND active.status = 'claimed'
+               )
+               AND COALESCE((
+                   SELECT previous.started_at + CASE
+                       WHEN previous.status = 'succeeded' THEN ?4 ELSE ?5 END
+                   FROM endpoint_probe_attempts AS previous
+                   WHERE previous.network_id = c.network_id
+                     AND previous.node_id = c.node_id
+                     AND previous.endpoint_id = c.endpoint_id
+                     AND previous.phase = 'protocol'
+                   ORDER BY previous.attempt_id DESC LIMIT 1
+               ), 0) <= ?1
+             ORDER BY COALESCE((
+                 SELECT MAX(previous.attempt_id) FROM endpoint_probe_attempts AS previous
+                 WHERE previous.network_id = c.network_id
+                   AND previous.node_id = c.node_id
+                   AND previous.endpoint_id = c.endpoint_id
+                   AND previous.phase = 'protocol'
+             ), 0), c.first_reported_at, c.endpoint_id
+             LIMIT 1",
+            params![
+                now,
+                online_cutoff,
+                tcp_cutoff,
+                success_interval,
+                failure_interval
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        transaction.commit()?;
+        return Ok(None);
+    };
+    let network_id = stored
+        .0
+        .parse::<NetworkId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let node_id = stored
+        .1
+        .parse::<NodeId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let endpoint_id = stored
+        .2
+        .parse::<EndpointId>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let port = u16::try_from(stored.4).map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let applied_revision =
+        Revision::new(stored.5).map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let resolved_address = stored
+        .7
+        .parse::<IpAddr>()
+        .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let probe_id = Uuid::new_v4();
+    let mut claim_token = [0_u8; 32];
+    OsRng.fill_bytes(&mut claim_token);
+    let claim_token_digest: [u8; 32] = Sha256::digest(claim_token).into();
+    transaction.execute(
+        "INSERT INTO endpoint_probe_attempts(
+            network_id, probe_id, node_id, endpoint_id, phase, status, runner_id,
+            claim_token_sha256, candidate_generation, address, port,
+            applied_revision, started_at, claim_expires_at
+         ) VALUES (?1, ?2, ?3, ?4, 'protocol', 'claimed', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            network_id.to_string(),
+            probe_id.to_string(),
+            node_id.to_string(),
+            endpoint_id.to_string(),
+            runner_id.to_string(),
+            claim_token_digest.as_slice(),
+            stored.6,
+            stored.3,
+            i64::from(port),
+            applied_revision.get(),
+            now,
+            claim_expires_at,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(Some(ProtocolCanaryJob {
+        probe_id,
+        runner_id,
+        network_id,
+        node_id,
+        endpoint_id,
+        address: stored.3,
+        resolved_address,
+        port,
+        applied_revision,
+        candidate_generation: stored.6,
+        claim_expires_at,
+        claim_token: Secret::new(claim_token),
+        vless_uuid: Secret::new(stored.8),
+        reality_public_key: stored.9,
+        reality_short_id: stored.10,
+        server_name: stored.11,
     }))
 }
 
@@ -2488,6 +3521,23 @@ impl StoredProbeClaim {
             "succeeded" | "failed" | "cancelled" | "expired"
         )
     }
+
+    fn authenticates_protocol(&self, job: &ProtocolCanaryJob) -> bool {
+        let submitted_digest: [u8; 32] = Sha256::digest(job.claim_token.expose_secret()).into();
+        bool::from(
+            self.claim_digest
+                .as_slice()
+                .ct_eq(submitted_digest.as_slice()),
+        ) && self.node_id == job.node_id.to_string()
+            && self.endpoint_id == job.endpoint_id.to_string()
+            && self.phase == "protocol"
+            && self.runner_id == job.runner_id.to_string()
+            && self.candidate_generation == job.candidate_generation
+            && self.address == job.address
+            && self.port == i64::from(job.port)
+            && self.applied_revision == job.applied_revision.get()
+            && self.claim_expires_at == job.claim_expires_at
+    }
 }
 
 struct ProbeTerminalResult {
@@ -2555,6 +3605,211 @@ fn complete_tcp_probe(
     finish_probe_attempt(&transaction, job, &prepared, now)?;
     transaction.commit()?;
     Ok(TcpProbeCompletion::Recorded)
+}
+
+fn complete_protocol_canary(
+    connection: &mut Connection,
+    job: &ProtocolCanaryJob,
+    result: ProtocolCanaryResult,
+) -> Result<TcpProbeCompletion, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stored = load_protocol_claim(&transaction, job)?;
+    if !stored.authenticates_protocol(job) {
+        return Err(DatabaseError::ProbeClaimConflict);
+    }
+    if stored.status != "claimed" {
+        if stored.is_terminal() {
+            transaction.commit()?;
+            return Ok(TcpProbeCompletion::AlreadyRecorded);
+        }
+        return Err(DatabaseError::StoredProtocolValue);
+    }
+    if now >= stored.claim_expires_at {
+        finish_protocol_attempt(&transaction, job, &ProbeTerminalResult::expired(), now)?;
+        transaction.commit()?;
+        return Ok(TcpProbeCompletion::ClaimExpired);
+    }
+    let tcp_shape = TcpProbeJob {
+        probe_id: job.probe_id,
+        runner_id: job.runner_id,
+        network_id: job.network_id,
+        node_id: job.node_id,
+        endpoint_id: job.endpoint_id,
+        address: job.address.clone(),
+        port: job.port,
+        applied_revision: job.applied_revision,
+        candidate_generation: job.candidate_generation,
+        claim_expires_at: job.claim_expires_at,
+        claim_token: job.claim_token.clone(),
+    };
+    if !probe_candidate_is_current(&transaction, &tcp_shape, now)?
+        || !protocol_canary_credential_is_current(&transaction, job)?
+    {
+        finish_protocol_attempt(
+            &transaction,
+            job,
+            &ProbeTerminalResult::candidate_changed(),
+            now,
+        )?;
+        transaction.commit()?;
+        return Ok(TcpProbeCompletion::CandidateChanged);
+    }
+    let terminal = match result {
+        ProtocolCanaryResult::Connected { latency } => ProbeTerminalResult {
+            status: "succeeded",
+            resolved_address: Some(job.resolved_address.to_string()),
+            latency_ms: Some(probe_duration_millis(latency)?),
+            result_code: "direct_protocol_connected",
+        },
+        ProtocolCanaryResult::Failed { code } => ProbeTerminalResult {
+            status: "failed",
+            resolved_address: Some(job.resolved_address.to_string()),
+            latency_ms: None,
+            result_code: code.as_str(),
+        },
+    };
+    finish_protocol_attempt(&transaction, job, &terminal, now)?;
+    update_protocol_verification(&transaction, job, &terminal, now)?;
+    transaction.commit()?;
+    Ok(TcpProbeCompletion::Recorded)
+}
+
+fn load_protocol_claim(
+    transaction: &rusqlite::Transaction<'_>,
+    job: &ProtocolCanaryJob,
+) -> Result<StoredProbeClaim, DatabaseError> {
+    transaction
+        .query_row(
+            "SELECT status, node_id, endpoint_id, phase, runner_id,
+                    claim_token_sha256, candidate_generation, address, port,
+                    applied_revision, claim_expires_at
+             FROM endpoint_probe_attempts
+             WHERE network_id = ?1 AND probe_id = ?2",
+            params![job.network_id.to_string(), job.probe_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(DatabaseError::ProbeClaimNotFound)
+        .and_then(decode_probe_claim)
+}
+
+fn protocol_canary_credential_is_current(
+    connection: &Connection,
+    job: &ProtocolCanaryJob,
+) -> Result<bool, DatabaseError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM node_revision_canary_credentials AS snapshot
+                JOIN endpoint_canary_credentials AS credential
+                  ON credential.network_id = snapshot.network_id
+                 AND credential.node_id = snapshot.node_id
+                 AND credential.credential_id = snapshot.credential_id
+                WHERE snapshot.network_id = ?1 AND snapshot.node_id = ?2
+                  AND snapshot.revision = ?3 AND credential.status = 'active'
+                  AND credential.vless_uuid = ?4
+            )",
+            params![
+                job.network_id.to_string(),
+                job.node_id.to_string(),
+                job.applied_revision.get(),
+                job.vless_uuid.expose_secret(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(DatabaseError::from)
+}
+
+fn finish_protocol_attempt(
+    transaction: &rusqlite::Transaction<'_>,
+    job: &ProtocolCanaryJob,
+    result: &ProbeTerminalResult,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let updated = transaction.execute(
+        "UPDATE endpoint_probe_attempts
+         SET status = ?1, completed_at = ?2, resolved_address = ?3,
+             latency_ms = ?4, result_code = ?5
+         WHERE network_id = ?6 AND probe_id = ?7 AND status = 'claimed'",
+        params![
+            result.status,
+            now,
+            result.resolved_address.as_deref(),
+            result.latency_ms,
+            result.result_code,
+            job.network_id.to_string(),
+            job.probe_id.to_string(),
+        ],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(DatabaseError::ProbeClaimConflict)
+    }
+}
+
+fn update_protocol_verification(
+    connection: &Connection,
+    job: &ProtocolCanaryJob,
+    result: &ProbeTerminalResult,
+    now: i64,
+) -> Result<(), DatabaseError> {
+    let verification_expires_at = now
+        .checked_add(15 * 60)
+        .ok_or(DatabaseError::TimestampOverflow)?;
+    let updated = if result.status == "succeeded" {
+        connection.execute(
+            "UPDATE node_endpoint_verifications
+             SET status = 'verified', probe_attempts = probe_attempts + 1,
+                 last_probe_at = ?1, last_success_at = ?1, latency_ms = ?2,
+                 error_code = NULL, verification_expires_at = ?3, updated_at = ?1
+             WHERE network_id = ?4 AND node_id = ?5 AND endpoint_id = ?6
+               AND status != 'withdrawn'",
+            params![
+                now,
+                result.latency_ms,
+                verification_expires_at,
+                job.network_id.to_string(),
+                job.node_id.to_string(),
+                job.endpoint_id.to_string(),
+            ],
+        )?
+    } else {
+        connection.execute(
+            "UPDATE node_endpoint_verifications
+             SET status = 'failed', probe_attempts = probe_attempts + 1,
+                 last_probe_at = ?1, latency_ms = NULL, error_code = ?2,
+                 verification_expires_at = NULL, updated_at = ?1
+             WHERE network_id = ?3 AND node_id = ?4 AND endpoint_id = ?5
+               AND status != 'withdrawn'",
+            params![
+                now,
+                result.result_code,
+                job.network_id.to_string(),
+                job.node_id.to_string(),
+                job.endpoint_id.to_string(),
+            ],
+        )?
+    };
+    if updated != 1 {
+        return Err(DatabaseError::ProbeClaimConflict);
+    }
+    Ok(())
 }
 
 fn load_probe_claim(
@@ -2644,16 +3899,19 @@ fn probe_candidate_is_current(
                   AND verification.node_id = c.node_id
                   AND verification.endpoint_id = c.endpoint_id
                  WHERE c.network_id = ?1 AND c.node_id = ?2 AND c.endpoint_id = ?3
-                   AND c.mode = 'direct'
                    AND c.address = ?4 AND c.port = ?5 AND c.applied_revision = ?6
                    AND c.last_report_generation = ?7
-                   AND revision.schema_version = 2
-                   AND json_type(
-                       revision.artifact_json, '$.document.xray.publicPort'
-                   ) = 'integer'
-                   AND json_extract(
-                       revision.artifact_json, '$.document.xray.publicPort'
-                   ) = c.port
+                   AND (
+                       (c.mode = 'direct'
+                        AND revision.schema_version = 2
+                        AND json_type(
+                            revision.artifact_json, '$.document.xray.publicPort'
+                        ) = 'integer'
+                        AND json_extract(
+                            revision.artifact_json, '$.document.xray.publicPort'
+                        ) = c.port)
+                       OR (c.mode = 'relay' AND c.source = 'relay')
+                   )
                    AND c.withdrawn_at IS NULL
                    AND (c.expires_at IS NULL OR c.expires_at > ?8)
                    AND verification.status != 'withdrawn'
@@ -3141,10 +4399,13 @@ fn reconcile_node_desired_state(
     let mut network = load_network(&transaction)?;
     let current = load_latest_node_desired(&transaction, identity, &network, node_id)?;
     let users = compile_desired_users(&transaction, &network.network_id, node_id)?;
+    let canary =
+        ensure_endpoint_canary_credential(&transaction, &network.network_id, node_id, now)?;
     let mut expected_users = users
         .iter()
         .map(|compiled| compiled.user.clone())
         .collect::<Vec<_>>();
+    expected_users.push(canary.user);
     expected_users.sort_by(|left, right| {
         left.user_id
             .cmp(&right.user_id)
@@ -3201,6 +4462,90 @@ fn reconcile_node_desired_state(
         desired,
         created: true,
     })
+}
+
+fn rotate_protocol_canary(
+    connection: &mut Connection,
+    identity: &ControllerIdentity,
+    node_id: NodeId,
+) -> Result<SignedDesiredState, DatabaseError> {
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut network = load_network(&transaction)?;
+    let current = load_latest_node_desired(&transaction, identity, &network, node_id)?;
+    let current_generation: i64 = transaction
+        .query_row(
+            "SELECT generation FROM endpoint_canary_credentials
+             WHERE network_id = ?1 AND node_id = ?2 AND status = 'active'",
+            params![network.network_id, node_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let next_generation = current_generation
+        .checked_add(1)
+        .ok_or(DatabaseError::CanaryGenerationOverflow)?;
+    transaction.execute(
+        "UPDATE endpoint_canary_credentials
+         SET status = 'retired', retired_at = ?1
+         WHERE network_id = ?2 AND node_id = ?3 AND status = 'active'",
+        params![now, network.network_id, node_id.to_string()],
+    )?;
+    transaction.execute(
+        "INSERT INTO endpoint_canary_credentials(
+            network_id, node_id, user_id, credential_id, vless_uuid,
+            generation, status, created_at, retired_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, NULL)",
+        params![
+            network.network_id,
+            node_id.to_string(),
+            UserId::new().to_string(),
+            CredentialId::new().to_string(),
+            Uuid::new_v4().hyphenated().to_string(),
+            next_generation,
+            now,
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE node_endpoint_verifications
+         SET status = 'pending', probe_attempts = 0, last_probe_at = NULL,
+             last_success_at = NULL, latency_ms = NULL, error_code = NULL,
+             verification_expires_at = NULL, updated_at = ?1
+         WHERE network_id = ?2 AND node_id = ?3 AND status != 'withdrawn'",
+        params![now, network.network_id, node_id.to_string()],
+    )?;
+    let users = compile_desired_users(&transaction, &network.network_id, node_id)?;
+    let configuration = DesiredStateConfigurationDraft {
+        min_agent_version: current.document.min_agent_version,
+        xray: current.document.xray,
+    };
+    let desired = publish_compiled_desired_state(
+        &transaction,
+        identity,
+        &mut network,
+        node_id,
+        configuration,
+        &users,
+        "protocol-canary-rotation",
+        now,
+    )?;
+    insert_audit_event(
+        &transaction,
+        Some(&network.network_id),
+        "admin",
+        None,
+        "endpoint-canary.rotated",
+        "node",
+        Some(&node_id.to_string()),
+        "success",
+        &serde_json::json!({
+            "generation": next_generation,
+            "revision": desired.document.revision,
+        }),
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(desired)
 }
 
 fn member_snapshot_matches(
@@ -3270,6 +4615,9 @@ fn publish_compiled_desired_state(
         .controller_epoch
         .parse::<ControllerInstanceId>()
         .map_err(|_| DatabaseError::StoredProtocolValue)?;
+    let canary = ensure_endpoint_canary_credential(transaction, &network.network_id, node_id, now)?;
+    let mut desired_users: Vec<DesiredUser> = users.iter().map(|user| user.user.clone()).collect();
+    desired_users.push(canary.user.clone());
     let artifact = build_signed_desired_state(
         identity,
         network_id,
@@ -3277,7 +4625,7 @@ fn publish_compiled_desired_state(
         next_revision,
         timestamp(now)?,
         controller_instance_id,
-        configuration.with_users(users.iter().map(|user| user.user.clone()).collect()),
+        configuration.with_users(desired_users),
     )
     .map_err(map_desired_state_publication_error)?;
     let node_id_text = node_id.to_string();
@@ -3289,6 +4637,17 @@ fn publish_compiled_desired_state(
         next_revision,
         users,
         now,
+    )?;
+    transaction.execute(
+        "INSERT INTO node_revision_canary_credentials(
+            network_id, node_id, revision, credential_id
+         ) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            network.network_id,
+            node_id.to_string(),
+            next_revision.get(),
+            canary.user.credential_id.to_string(),
+        ],
     )?;
 
     let revision = next_revision.get();
@@ -3330,12 +4689,78 @@ fn publish_compiled_desired_state(
             "revision": revision,
             "schemaVersion": artifact.envelope.document.schema_version,
             "userCount": users.len(),
+            "protocolCanaryGeneration": canary.generation,
         }),
         now,
     )?;
     network.last_revision = revision;
     network.updated_at = now;
     Ok(artifact.envelope)
+}
+
+#[derive(Clone)]
+struct EndpointCanaryCredential {
+    user: DesiredUser,
+    generation: i64,
+}
+
+fn ensure_endpoint_canary_credential(
+    connection: &Connection,
+    network_id: &str,
+    node_id: NodeId,
+    now: i64,
+) -> Result<EndpointCanaryCredential, DatabaseError> {
+    let stored = connection
+        .query_row(
+            "SELECT user_id, credential_id, vless_uuid, generation
+             FROM endpoint_canary_credentials
+             WHERE network_id = ?1 AND node_id = ?2 AND status = 'active'",
+            params![network_id, node_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (user_id, credential_id, vless_uuid, generation) = if let Some(stored) = stored {
+        stored
+    } else {
+        let user_id = UserId::new().to_string();
+        let credential_id = CredentialId::new().to_string();
+        let vless_uuid = Uuid::new_v4().hyphenated().to_string();
+        connection.execute(
+            "INSERT INTO endpoint_canary_credentials(
+                    network_id, node_id, user_id, credential_id, vless_uuid,
+                    generation, status, created_at, retired_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 'active', ?6, NULL)",
+            params![
+                network_id,
+                node_id.to_string(),
+                user_id,
+                credential_id,
+                vless_uuid,
+                now,
+            ],
+        )?;
+        (user_id, credential_id, vless_uuid, 1)
+    };
+    Ok(EndpointCanaryCredential {
+        user: DesiredUser {
+            user_id: user_id
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            credential_id: credential_id
+                .parse()
+                .map_err(|_| DatabaseError::StoredProtocolValue)?,
+            vless_uuid: Secret::new(vless_uuid),
+            enabled: true,
+        },
+        generation,
+    })
 }
 
 fn compile_desired_users(
@@ -4289,6 +5714,56 @@ fn load_applied_migrations(
         applied.insert(version, (name, checksum));
     }
     Ok(applied)
+}
+
+pub(crate) fn verify_current_migration_history(
+    connection: &Connection,
+) -> Result<(), DatabaseError> {
+    let applied = load_applied_migrations(connection)?;
+    let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let highest_applied = applied.keys().next_back().copied().unwrap_or(0);
+    if user_version != highest_applied {
+        return Err(DatabaseError::MigrationMirrorMismatch {
+            source_version: highest_applied,
+            user_version,
+        });
+    }
+    if highest_applied != SCHEMA_VERSION {
+        return Err(DatabaseError::SchemaNotCurrent {
+            expected: SCHEMA_VERSION,
+            actual: highest_applied,
+        });
+    }
+    if applied.len() != MIGRATIONS.len() {
+        return Err(DatabaseError::UnexpectedMigrationHistory);
+    }
+    for migration in MIGRATIONS {
+        let expected_checksum = migration_checksum(migration);
+        match applied.get(&migration.version) {
+            Some((name, checksum)) if name == migration.name && checksum == &expected_checksum => {}
+            Some(_) => {
+                return Err(DatabaseError::MigrationChecksumMismatch {
+                    version: migration.version,
+                });
+            }
+            None => {
+                return Err(DatabaseError::MigrationGap {
+                    version: migration.version,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn migration_set_sha256() -> String {
+    let mut hasher = Sha256::new();
+    for migration in MIGRATIONS {
+        hasher.update(migration.version.to_be_bytes());
+        hasher.update(migration.name.as_bytes());
+        hasher.update(migration_checksum(migration).as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn migration_checksum(migration: &Migration) -> String {
@@ -8087,6 +9562,8 @@ pub enum DatabaseError {
     WrongApplicationId { expected: i64, actual: i64 },
     #[error("database schema {actual} is newer than supported schema {supported}")]
     SchemaTooNew { supported: i64, actual: i64 },
+    #[error("database schema {actual} is not the required schema {expected}")]
+    SchemaNotCurrent { expected: i64, actual: i64 },
     #[error(
         "schema_migrations version {source_version} does not match PRAGMA user_version {user_version}"
     )]
@@ -8098,6 +9575,8 @@ pub enum DatabaseError {
     MigrationChecksumMismatch { version: i64 },
     #[error("migration history has a gap before version {version}")]
     MigrationGap { version: i64 },
+    #[error("migration history contains an unexpected migration record")]
+    UnexpectedMigrationHistory,
     #[error("expected one network but found {0}")]
     MultipleNetworks(i64),
     #[error("the bootstrapped network is missing")]
@@ -8158,6 +9637,24 @@ pub enum DatabaseError {
     ProbeClaimConflict,
     #[error("the endpoint probe result exceeds durable storage limits")]
     ProbeResultOverflow,
+    #[error("telemetry batch belongs to another node")]
+    TelemetryNodeMismatch,
+    #[error("telemetry sequence is not contiguous; expected {expected}")]
+    TelemetrySequenceGap { expected: i64 },
+    #[error("telemetry sequence space is exhausted")]
+    TelemetrySequenceExhausted,
+    #[error("telemetry cursor changed during ingestion")]
+    TelemetryCursorConflict,
+    #[error("telemetry references a member that was never assigned to this node")]
+    TelemetryUserNotAssigned,
+    #[error("detailed connection telemetry is disabled")]
+    DetailedTelemetryDisabled,
+    #[error("telemetry event time is unreasonably far in the future")]
+    TelemetryClockSkew,
+    #[error("telemetry aggregate query is invalid")]
+    InvalidTelemetryQuery,
+    #[error("telemetry result exceeds protocol limits")]
+    TelemetryResultOverflow,
     #[error("the node request signature is invalid")]
     InvalidNodeRequestSignature,
     #[error("the node was not found")]
@@ -8184,6 +9681,8 @@ pub enum DatabaseError {
     PasswordHash,
     #[error("profile bundle generation sequence is exhausted")]
     BundleGenerationOverflow,
+    #[error("protocol canary credential generation is exhausted")]
+    CanaryGenerationOverflow,
     #[error("the stored profile bundle is corrupt")]
     StoredProfileBundleCorrupt,
     #[error("the idempotency key was already used for a different request")]
@@ -8251,7 +9750,13 @@ impl DatabaseError {
 #[cfg(test)]
 mod tests {
     use super::{
-        lock_path, migration_checksum, Database, DatabaseError, MIGRATIONS, SCHEMA_VERSION,
+        enforce_telemetry_retention_at, ingest_telemetry, lock_path, migration_checksum, Database,
+        DatabaseError, MIGRATIONS, SCHEMA_VERSION,
+    };
+    use control_protocol::id::{NodeId, SequenceNumber, Timestamp, UserId};
+    use control_protocol::telemetry::{
+        NetworkProtocol, TelemetryBatch, TelemetryEvent, TelemetryEventKind,
+        TELEMETRY_SCHEMA_VERSION,
     };
     use rusqlite::{params, Connection, TransactionBehavior};
     use tempfile::TempDir;
@@ -8266,6 +9771,182 @@ mod tests {
 
     fn database_path(temp: &TempDir) -> std::path::PathBuf {
         temp.path().join("control.sqlite3")
+    }
+
+    fn insert_telemetry_subjects(connection: &Connection) -> (String, NodeId, UserId) {
+        let network_id: String = connection
+            .query_row("SELECT network_id FROM networks", [], |row| row.get(0))
+            .unwrap();
+        let node_id = NodeId::new();
+        let user_id = UserId::new();
+        connection
+            .execute(
+                "INSERT INTO nodes(
+                    node_id, network_id, display_name, status, agent_version, platform,
+                    capabilities_json, identity_public_key, encryption_public_key,
+                    consent_policy_version, consent_host_owner, consent_exit_ip,
+                    consent_accepted_at, created_at, updated_at
+                 ) VALUES (?1, ?2, 'node', 'active', '0.1.0', 'macos-arm64',
+                    '[]', ?3, ?4, 'v1', 1, 1, 1, 1, 1)",
+                params![
+                    node_id.to_string(),
+                    network_id,
+                    format!("identity-{node_id}"),
+                    format!("encryption-{node_id}"),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO users(
+                    network_id, user_id, display_name, status, credential_version,
+                    created_at, updated_at, disabled_at, deleted_at
+                 ) VALUES (?1, ?2, 'member', 'active', 1, 1, 1, NULL, NULL)",
+                params![network_id, user_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO user_node_assignments(
+                    network_id, assignment_id, user_id, node_id, status,
+                    created_at, updated_at, disabled_at, deleted_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'enabled', 1, 1, NULL, NULL)",
+                params![
+                    network_id,
+                    uuid::Uuid::new_v4().to_string(),
+                    user_id.to_string(),
+                    node_id.to_string(),
+                ],
+            )
+            .unwrap();
+        (network_id, node_id, user_id)
+    }
+
+    #[test]
+    fn disabled_detailed_policy_drops_fields_without_blocking_the_cursor() {
+        let temp = TempDir::new().unwrap();
+        let path = database_path(&temp);
+        let database = Database::open(&path, "Friends").unwrap();
+        let mut guard = database.inner.lock().unwrap();
+        let (network_id, node_id, user_id) = insert_telemetry_subjects(&guard.connection);
+        guard
+            .connection
+            .execute(
+                "UPDATE telemetry_policy SET detailed_enabled = 1 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        let event = TelemetryEvent {
+            sequence: SequenceNumber::new(1).unwrap(),
+            occurred_at: Timestamp::from_datetime(time::OffsetDateTime::now_utc()),
+            kind: TelemetryEventKind::Connection {
+                user_id,
+                protocol: NetworkProtocol::Tcp,
+                destination_host: "sensitive.example".to_string(),
+                destination_port: 443,
+                client_identifier: Some("client-sensitive".to_string()),
+            },
+        };
+        guard
+            .connection
+            .execute(
+                "UPDATE telemetry_policy SET detailed_enabled = 0 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        let acknowledgement = ingest_telemetry(
+            &mut guard.connection,
+            node_id,
+            &TelemetryBatch {
+                schema_version: TELEMETRY_SCHEMA_VERSION,
+                node_id,
+                first_sequence: event.sequence,
+                last_sequence: event.sequence,
+                events: vec![event],
+            },
+        )
+        .unwrap();
+        assert_eq!(acknowledgement.acknowledged_sequence.get(), 1);
+        let stored: (String, Option<String>, Option<i64>, Option<String>) = guard
+            .connection
+            .query_row(
+                "SELECT disposition, destination_host, destination_port, client_identifier
+                 FROM node_telemetry_events
+                 WHERE network_id = ?1 AND node_id = ?2 AND sequence = 1",
+                params![network_id, node_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("droppedPolicy".to_string(), None, None, None));
+    }
+
+    #[test]
+    fn retention_uses_strict_per_class_time_boundaries() {
+        let temp = TempDir::new().unwrap();
+        let path = database_path(&temp);
+        let database = Database::open(&path, "Friends").unwrap();
+        let mut guard = database.inner.lock().unwrap();
+        let (network_id, node_id, user_id) = insert_telemetry_subjects(&guard.connection);
+        let now = 2_000_000_000_i64;
+        let hourly_cutoff = now - 90 * 86_400;
+        for (sequence, received_at) in [(1, hourly_cutoff - 1), (2, hourly_cutoff)] {
+            guard
+                .connection
+                .execute(
+                    "INSERT INTO node_telemetry_events(
+                    network_id, node_id, sequence, event_type, user_id,
+                    occurred_at, received_at, event_sha256, disposition
+                 ) VALUES (?1, ?2, ?3, 'trafficDelta', ?4, ?5, ?5, ?6, 'stored')",
+                    params![
+                        network_id,
+                        node_id.to_string(),
+                        sequence,
+                        user_id.to_string(),
+                        received_at,
+                        [0_u8; 32].as_slice(),
+                    ],
+                )
+                .unwrap();
+        }
+        for (table, seconds, cutoff) in [
+            ("traffic_hourly_aggregates", 3_600_i64, hourly_cutoff),
+            ("traffic_daily_aggregates", 86_400_i64, now - 365 * 86_400),
+        ] {
+            let aligned = cutoff - cutoff.rem_euclid(seconds);
+            for bucket in [aligned - seconds, aligned] {
+                guard
+                    .connection
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table}(
+                        network_id, user_id, node_id, bucket_start,
+                        bytes_up, bytes_down, connection_count, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, 1, 1, 1, ?5)"
+                        ),
+                        params![
+                            network_id,
+                            user_id.to_string(),
+                            node_id.to_string(),
+                            bucket,
+                            now
+                        ],
+                    )
+                    .unwrap();
+            }
+        }
+        let result = enforce_telemetry_retention_at(&mut guard.connection, now).unwrap();
+        assert_eq!(result.traffic_events_deleted, 1);
+        assert_eq!(result.hourly_aggregates_deleted, 1);
+        assert_eq!(result.daily_aggregates_deleted, 1);
+        let retained_raw: i64 = guard
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM node_telemetry_events WHERE event_type = 'trafficDelta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_raw, 1);
     }
 
     fn create_legacy_v3_database(path: &std::path::Path) -> String {

@@ -1,0 +1,35 @@
+[server]
+# Public mTLS endpoint used only by node-originated reverse tunnels.
+node_listen = "0.0.0.0:7443"
+# Metrics and health are deliberately loopback-only.
+metrics_listen = "127.0.0.1:9090"
+tls_cert_path = "pki/relay-server.pem"
+tls_key_path = "pki/relay-server-key.pem"
+client_ca_path = "pki/relay-ca.pem"
+max_frame_bytes = 65536
+command_queue_frames = 256
+stream_buffer_frames = 16
+initial_window_bytes = 262144
+open_timeout_secs = 10
+no_payload_timeout_secs = 120
+idle_timeout_secs = 1800
+heartbeat_interval_secs = 15
+heartbeat_timeout_secs = 45
+reload_interval_secs = 2
+max_routes = 1024
+max_node_connections = 1024
+
+[[routes]]
+# Opaque control-plane identity. Do not use a person, account, or hostname label.
+route_id = "route_replace_with_opaque_id"
+# Dedicated raw member endpoint for this route.
+public_listen = "0.0.0.0:24443"
+# SHA-256 of the raw route token file, encoded as 64 hexadecimal characters.
+node_token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# SHA-256 of the node leaf certificate DER, encoded as 64 hexadecimal characters.
+node_cert_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+expires_at = "2030-01-01T00:00:00Z"
+enabled = true
+max_concurrent_streams = 16
+max_bytes_per_second = 2500000
+max_bytes_per_connection = 10737418240

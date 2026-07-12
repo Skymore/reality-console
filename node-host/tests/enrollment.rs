@@ -168,7 +168,11 @@ async fn enroll(
     if request.invitation_secret != state.invitation.invitation_secret {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let mut expected_capabilities = vec![NodeCapability::Xray, NodeCapability::DirectTcp];
+    let mut expected_capabilities = vec![
+        NodeCapability::Xray,
+        NodeCapability::DirectTcp,
+        NodeCapability::RelayTcp,
+    ];
     if request.provider_consent.router_mapping_accepted {
         expected_capabilities.extend([
             NodeCapability::Pcp,

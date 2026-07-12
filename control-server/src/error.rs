@@ -246,6 +246,17 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn telemetry_sequence_gap(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::TelemetrySequenceGap,
+            "The telemetry sequence does not match the durable controller cursor.",
+            request_id,
+            true,
+        )
+    }
+
+    #[must_use]
     pub fn conflict(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::CONFLICT,

@@ -556,6 +556,15 @@ Control accepts only the exact configured HTTPS `/v1/tcp-probe` URL, disables re
 proxies, bounds the response body, and validates response schema, request identity, pinned address,
 and latency before recording evidence.
 
+The protocol canary uses a dedicated per-node VLESS credential included in the exact applied
+revision. A checksum-pinned Xray client connects to the controller-resolved candidate IP and port,
+completes REALITY/VLESS, and requires the local SOCKS client to receive a successful destination
+connect response. The credential, generated config, and child output are never logged. Direct and
+relay candidates use this same gate. When Control and a node share a LAN, the remote TCP preflight
+still proves Internet reachability, while the protocol phase may exercise router hairpin behavior;
+the signed release lab therefore runs the complete protocol canary from an external network before
+promotion.
+
 ## Relay Trust Boundary
 
 If a management relay is deployed, it forwards opaque, end-to-end authenticated and encrypted

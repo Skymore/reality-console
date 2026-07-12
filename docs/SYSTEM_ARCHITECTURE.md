@@ -120,9 +120,10 @@ config_revisions
 node_revision_results
 profile_bundles
 refresh_sessions
-telemetry_cursors
-traffic_samples
-connection_events
+node_telemetry_cursors
+node_telemetry_events
+traffic_hourly_aggregates
+traffic_daily_aggregates
 audit_events
 ```
 
@@ -134,8 +135,12 @@ provider_policy
 controller_registration
 applied_revision
 config_backups
-telemetry_queue
+telemetry_spool_state
+telemetry_spool
+xray_traffic_collection_state
+xray_user_traffic_counters
 reachability_results
+relay_provider_consent
 relay_assignment
 ```
 

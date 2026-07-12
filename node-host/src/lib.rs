@@ -12,13 +12,21 @@ mod local_api;
 #[cfg(target_os = "macos")]
 mod local_api_macos;
 mod mapping;
+mod operations;
+mod relay;
 mod router_protocol;
 mod service;
 mod setup_session;
 mod sync;
+mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod xray;
+
+pub use relay::{
+    configure_relay, revoke_relay, RelayAssignmentFile, RelayAssignmentState,
+    RelayAssignmentStatus, RelayRuntimeState,
+};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -49,7 +57,7 @@ const ED25519_SEED_FILE: &str = "identity.ed25519.seed";
 const X25519_SEED_FILE: &str = "identity.x25519.seed";
 const REALITY_X25519_SEED_FILE: &str = "reality.x25519.seed";
 const SEED_LENGTH: usize = 32;
-const CURRENT_SCHEMA_VERSION: i64 = 12;
+const CURRENT_SCHEMA_VERSION: i64 = 15;
 const APPLICATION_ID: i64 = 0x4E48_4F53;
 const MIGRATION_1_NAME: &str = "node_host_foundation";
 const MIGRATION_2_NAME: &str = "node_enrollment_metadata";
@@ -63,6 +71,9 @@ const MIGRATION_9_NAME: &str = "node_router_mapping_state";
 const MIGRATION_10_NAME: &str = "node_router_mapping_supervision";
 const MIGRATION_11_NAME: &str = "verified_controller_status";
 const MIGRATION_12_NAME: &str = "provider_consent_receipt";
+const MIGRATION_13_NAME: &str = "bounded_telemetry_spool";
+const MIGRATION_14_NAME: &str = "owner_managed_relay_assignment";
+const MIGRATION_15_NAME: &str = "xray_traffic_collection";
 
 const MIGRATION_1: &str = "
     CREATE TABLE host_config (
@@ -413,6 +424,120 @@ const MIGRATION_12: &str = "
     ) STRICT;
 ";
 
+const MIGRATION_13: &str = "
+    CREATE TABLE telemetry_spool_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        next_sequence INTEGER NOT NULL CHECK(next_sequence > 0),
+        acknowledged_sequence INTEGER NOT NULL CHECK(acknowledged_sequence >= 0),
+        updated_at INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO telemetry_spool_state(
+        singleton, next_sequence, acknowledged_sequence, updated_at
+    ) VALUES (1, 1, 0, 0);
+
+    CREATE TABLE telemetry_spool (
+        sequence INTEGER PRIMARY KEY CHECK(sequence > 0),
+        event_type TEXT NOT NULL CHECK(event_type IN (
+            'trafficDelta', 'connection', 'collectionStatus', 'quotaState'
+        )),
+        event_json TEXT NOT NULL CHECK(
+            json_valid(event_json) AND length(event_json) BETWEEN 2 AND 16384
+        ),
+        event_sha256 TEXT NOT NULL CHECK(
+            length(event_sha256) = 71
+            AND substr(event_sha256, 1, 7) = 'sha256:'
+            AND substr(event_sha256, 8) NOT GLOB '*[^0-9a-f]*'
+        ),
+        occurred_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        acknowledged_at INTEGER,
+        CHECK(acknowledged_at IS NULL OR acknowledged_at >= created_at)
+    ) STRICT;
+    CREATE INDEX telemetry_spool_unacknowledged
+        ON telemetry_spool(sequence) WHERE acknowledged_at IS NULL;
+    CREATE INDEX telemetry_spool_retention
+        ON telemetry_spool(acknowledged_at) WHERE acknowledged_at IS NOT NULL;
+
+    CREATE TRIGGER telemetry_spool_payload_no_update
+    BEFORE UPDATE OF sequence, event_type, event_json, event_sha256, occurred_at, created_at
+    ON telemetry_spool
+    BEGIN
+        SELECT RAISE(ABORT, 'telemetry spool payloads are immutable');
+    END;
+    CREATE TRIGGER telemetry_spool_no_unacknowledged_delete
+    BEFORE DELETE ON telemetry_spool WHEN OLD.acknowledged_at IS NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'unacknowledged telemetry cannot be deleted');
+    END;
+";
+
+const MIGRATION_14: &str = "
+    CREATE TABLE relay_provider_consent (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        policy_version TEXT NOT NULL CHECK(length(policy_version) BETWEEN 1 AND 64),
+        accepted_at INTEGER NOT NULL
+    ) STRICT;
+
+    CREATE TABLE relay_assignment (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        state TEXT NOT NULL CHECK(state IN ('active', 'revoked')),
+        endpoint_id TEXT NOT NULL CHECK(length(endpoint_id) = 36),
+        route_id TEXT NOT NULL CHECK(length(route_id) BETWEEN 16 AND 128),
+        relay_address TEXT NOT NULL CHECK(length(relay_address) BETWEEN 3 AND 64),
+        relay_server_name TEXT NOT NULL CHECK(length(relay_server_name) BETWEEN 1 AND 253),
+        public_address TEXT NOT NULL CHECK(length(public_address) BETWEEN 1 AND 253),
+        public_port INTEGER NOT NULL CHECK(public_port BETWEEN 1 AND 65535),
+        expires_at INTEGER NOT NULL,
+        material_generation TEXT CHECK(
+            material_generation IS NULL OR length(material_generation) = 36
+        ),
+        material_digest TEXT CHECK(
+            material_digest IS NULL OR (
+                length(material_digest) = 71
+                AND substr(material_digest, 1, 7) = 'sha256:'
+                AND substr(material_digest, 8) NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        installed_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        CHECK(
+            (state = 'active' AND material_generation IS NOT NULL
+                AND material_digest IS NOT NULL AND revoked_at IS NULL)
+            OR
+            (state = 'revoked' AND material_generation IS NULL
+                AND material_digest IS NULL AND revoked_at IS NOT NULL)
+        ),
+        CHECK(updated_at >= installed_at),
+        CHECK(revoked_at IS NULL OR revoked_at >= installed_at)
+    ) STRICT;
+";
+
+const MIGRATION_15: &str = "
+    ALTER TABLE xray_runtime_config
+    ADD COLUMN stats_api_port INTEGER CHECK(stats_api_port BETWEEN 1 AND 65535);
+
+    CREATE TABLE xray_traffic_collection_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        runtime_generation INTEGER CHECK(runtime_generation IS NULL OR runtime_generation > 0),
+        last_status_code TEXT CHECK(
+            last_status_code IS NULL OR length(last_status_code) BETWEEN 1 AND 64
+        ),
+        updated_at INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO xray_traffic_collection_state(
+        singleton, runtime_generation, last_status_code, updated_at
+    ) VALUES (1, NULL, NULL, 0);
+
+    CREATE TABLE xray_user_traffic_counters (
+        user_id TEXT PRIMARY KEY CHECK(length(user_id) = 36),
+        runtime_generation INTEGER NOT NULL CHECK(runtime_generation > 0),
+        uplink_counter INTEGER NOT NULL CHECK(uplink_counter >= 0),
+        downlink_counter INTEGER NOT NULL CHECK(downlink_counter >= 0),
+        updated_at INTEGER NOT NULL
+    ) STRICT;
+";
+
 pub use background::{
     install_user_service, remove_user_service, user_service_status, BackgroundServiceStatus,
     UserServiceInstallRequest, USER_SERVICE_LABEL,
@@ -427,9 +552,11 @@ pub use local_api::{
     LocalServicePhase, LocalServiceStatus, NodeSetupPhase, NodeSetupStatus,
 };
 pub use mapping::{RouterMappingState, RouterMappingStatus};
+pub use operations::{support_bundle, uninstall_local};
 pub use service::{run, run_until, SyncLoopOptions};
 pub use setup_session::{NodeSetupInstallRequest, NodeSetupSession, NodeSetupSessionStore};
 pub use sync::sync_once;
+pub use telemetry::record_telemetry_event;
 pub use xray::configure_xray;
 
 /// Safe enrollment state rendered by the CLI.
@@ -494,6 +621,8 @@ pub struct HostStatus {
     pub reality_short_id: Option<String>,
     /// Provider-owned automatic router-mapping preference and safe current state.
     pub router_mapping: RouterMappingStatus,
+    /// Controller-assigned relay metadata without credential material.
+    pub relay: RelayAssignmentStatus,
 }
 
 /// A seed whose formatting can never reveal its bytes.
@@ -627,7 +756,41 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     apply_migration(&transaction, 10, MIGRATION_10_NAME, MIGRATION_10)?;
     apply_migration(&transaction, 11, MIGRATION_11_NAME, MIGRATION_11)?;
     apply_migration(&transaction, 12, MIGRATION_12_NAME, MIGRATION_12)?;
+    apply_migration(&transaction, 13, MIGRATION_13_NAME, MIGRATION_13)?;
+    apply_migration(&transaction, 14, MIGRATION_14_NAME, MIGRATION_14)?;
+    apply_migration(&transaction, 15, MIGRATION_15_NAME, MIGRATION_15)?;
     transaction.commit()?;
+    ensure_stats_api_port(connection)?;
+    Ok(())
+}
+
+fn ensure_stats_api_port(connection: &Connection) -> Result<()> {
+    let missing: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM xray_runtime_config
+            WHERE singleton = 1 AND stats_api_port IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !missing {
+        return Ok(());
+    }
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .context("failed to reserve a loopback Xray Stats API port")?;
+    let port = listener
+        .local_addr()
+        .context("failed to inspect the reserved Xray Stats API port")?
+        .port();
+    drop(listener);
+    let changed = connection.execute(
+        "UPDATE xray_runtime_config SET stats_api_port = ?1, updated_at = ?2
+         WHERE singleton = 1 AND stats_api_port IS NULL",
+        params![port, unix_timestamp()?],
+    )?;
+    if changed != 1 {
+        bail!("Xray Stats API port allocation raced with another writer");
+    }
     Ok(())
 }
 
@@ -697,6 +860,9 @@ fn validate_migration_state(connection: &Connection) -> Result<()> {
         (10, MIGRATION_10_NAME, MIGRATION_10),
         (11, MIGRATION_11_NAME, MIGRATION_11),
         (12, MIGRATION_12_NAME, MIGRATION_12),
+        (13, MIGRATION_13_NAME, MIGRATION_13),
+        (14, MIGRATION_14_NAME, MIGRATION_14),
+        (15, MIGRATION_15_NAME, MIGRATION_15),
     ];
     if rows.len() > known.len() {
         bail!("database schema is newer than this node host supports");
@@ -776,6 +942,7 @@ fn build_status(
     let controller_status = controller_status::load_verified(connection)?;
     let activation_status = activation::load_activation_status(connection)?;
     let router_mapping = mapping::load_status(connection)?;
+    let relay = relay::load_status(connection)?;
     let xray_status = xray::load_xray_runtime_status(connection, data_dir)?;
     let (
         xray_binary_path,
@@ -817,6 +984,7 @@ fn build_status(
         reality_public_key,
         reality_short_id,
         router_mapping,
+        relay,
     })
 }
 

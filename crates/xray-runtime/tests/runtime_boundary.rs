@@ -3,6 +3,7 @@
 use std::{
     fmt::Write as _,
     fs,
+    net::{Ipv4Addr, SocketAddrV4, TcpListener},
     os::unix::fs::{symlink, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -14,10 +15,11 @@ use tempfile::TempDir;
 use tokio::time::{sleep, Instant};
 use uuid::Uuid;
 use xray_runtime::{
-    probe_version, start_managed, test_config, BinaryValidationError, ConfigValidationError,
-    ExecutionLimits, RealityPrivateKey, RealityTarget, RuntimeError, ServerName, Sha256Digest,
-    ShortId, UserEmail, VerifiedXrayBinary, VerifiedXrayConfig, VlessRealityConfigBuilder,
-    VlessUser, XrayBinarySpec, XrayConfigSpec,
+    probe_version, query_user_traffic, start_managed, test_config, BinaryValidationError,
+    ConfigValidationError, ExecutionLimits, RealityPrivateKey, RealityTarget, RuntimeError,
+    ServerName, Sha256Digest, ShortId, StatsApiConfig, StatsQueryError, UserEmail,
+    VerifiedXrayBinary, VerifiedXrayConfig, VlessRealityConfigBuilder, VlessUser, XrayBinarySpec,
+    XrayConfigSpec,
 };
 
 struct FakeExecutable {
@@ -126,6 +128,21 @@ fn rendered_empty_access_config() -> xray_runtime::RenderedXrayConfig {
     .expect("empty access config")
 }
 
+fn rendered_stats_config(port: u16) -> xray_runtime::RenderedXrayConfig {
+    VlessRealityConfigBuilder::new(
+        "127.0.0.1".parse().expect("valid IP"),
+        port.checked_add(1).expect("test API port leaves room"),
+        RealityTarget::new("www.example.com", 443).expect("valid target"),
+        RealityPrivateKey::parse(&URL_SAFE_NO_PAD.encode([8_u8; 32])).expect("valid private key"),
+    )
+    .expect("valid builder")
+    .server_name(ServerName::parse("www.example.com").expect("valid server name"))
+    .short_id(ShortId::parse("1122334455667788").expect("valid short ID"))
+    .stats_api(StatsApiConfig::loopback(port).expect("valid Stats API"))
+    .build()
+    .expect("Stats config")
+}
+
 fn short_limits() -> ExecutionLimits {
     ExecutionLimits::new(Duration::from_secs(2), 1024).expect("valid limits")
 }
@@ -227,6 +244,41 @@ printf 'Xray 25.7.1\n'"#,
 }
 
 #[tokio::test]
+async fn queries_stats_with_exact_bounded_non_reset_arguments() {
+    let fake = FakeExecutable::new(
+        r#"if [ "$#" -ne 9 ] ||
+  [ "$1" != "api" ] || [ "$2" != "statsquery" ] ||
+  [ "$3" != "--server" ] || [ "$4" != "127.0.0.1:31337" ] ||
+  [ "$5" != "-timeout" ] || [ "$6" != "2" ] ||
+  [ "$7" != "-pattern" ] || [ "$8" != "user>>>" ] ||
+  [ "$9" != "-reset=false" ]; then
+  exit 61
+fi
+printf '{"stat":[{"name":"user>>>friend@example.com>>>traffic>>>uplink","value":"12"},{"name":"user>>>friend@example.com>>>traffic>>>downlink","value":"34"}]}'"#,
+    );
+    let counters = query_user_traffic(
+        &fake.verify(),
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 31_337),
+        short_limits(),
+    )
+    .await
+    .expect("bounded Stats query succeeds");
+
+    assert_eq!(counters.len(), 1);
+    assert_eq!(counters[0].email().as_str(), "friend@example.com");
+    assert_eq!((counters[0].uplink(), counters[0].downlink()), (12, 34));
+
+    let error = query_user_traffic(
+        &fake.verify(),
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 31_337),
+        short_limits(),
+    )
+    .await
+    .expect_err("non-loopback query must fail before spawn");
+    assert!(matches!(error, StatsQueryError::NonLoopbackEndpoint));
+}
+
+#[tokio::test]
 async fn runs_config_test_with_private_tempfile_arguments() {
     let fake = FakeExecutable::new(
         r#"if [ "$#" -ne 4 ] || [ "$1" != "run" ] || [ "$2" != "-test" ] || [ "$3" != "-config" ]; then
@@ -272,14 +324,17 @@ done"#,
     let error = probe_version(&fake.verify(), limits)
         .await
         .expect_err("output must be bounded");
-    assert!(matches!(
-        error,
-        RuntimeError::OutputLimitExceeded {
-            stream: "stdout",
-            limit: 128,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &error,
+            RuntimeError::OutputLimitExceeded {
+                stream: "stdout",
+                limit: 128,
+                ..
+            }
+        ),
+        "unexpected bounded-output error: {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -464,7 +519,7 @@ async fn managed_child_can_be_forcefully_killed_and_reaped() {
 
 #[tokio::test]
 #[ignore = "requires XRAY_RUNTIME_REAL_BINARY pointing to a trusted current Xray executable"]
-async fn current_xray_accepts_generated_user_and_empty_access_configs() {
+async fn current_xray_accepts_configs_and_serves_loopback_stats() {
     let path = std::env::var_os("XRAY_RUNTIME_REAL_BINARY")
         .map(PathBuf::from)
         .expect("XRAY_RUNTIME_REAL_BINARY");
@@ -478,6 +533,42 @@ async fn current_xray_accepts_generated_user_and_empty_access_configs() {
             .await
             .expect("current Xray must accept generated config");
     }
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve API port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let config = rendered_stats_config(port);
+    test_config(&binary, &config, ExecutionLimits::default())
+        .await
+        .expect("current Xray must accept Stats config");
+    let config_file = ConfigFile::new(config.expose_json().as_bytes());
+    let mut child = start_managed(&binary, &config_file.verify())
+        .await
+        .expect("start real Xray with Stats API");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match query_user_traffic(
+            &binary,
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            ExecutionLimits::default(),
+        )
+        .await
+        {
+            Ok(counters) => {
+                assert!(counters.is_empty());
+                break;
+            }
+            Err(error) if Instant::now() < deadline => {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "real Xray exited: {error}"
+                );
+                sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("real Xray Stats API did not become ready: {error}"),
+        }
+    }
+    child.kill_and_wait().await.expect("stop real Xray");
 }
 
 #[test]

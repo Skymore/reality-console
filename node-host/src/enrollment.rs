@@ -213,7 +213,11 @@ fn build_enrollment_request(
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_str(&URL_SAFE_NO_PAD.encode(nonce_bytes))
         .context("failed to encode enrollment nonce")?;
-    let mut capabilities = vec![NodeCapability::Xray, NodeCapability::DirectTcp];
+    let mut capabilities = vec![
+        NodeCapability::Xray,
+        NodeCapability::DirectTcp,
+        NodeCapability::RelayTcp,
+    ];
     if provider_consent.router_mapping_accepted {
         capabilities.extend([
             NodeCapability::Pcp,

@@ -1,4 +1,6 @@
-use crate::{HostStatus, RouterMappingStatus};
+use crate::{
+    HostStatus, RelayAssignmentState, RelayAssignmentStatus, RelayRuntimeState, RouterMappingStatus,
+};
 use anyhow::{Context as _, Result};
 #[cfg(target_os = "macos")]
 use control_protocol::id::RequestId;
@@ -12,7 +14,7 @@ use std::path::Path;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-pub(crate) const LOCAL_API_SCHEMA_VERSION: u16 = 2;
+pub(crate) const LOCAL_API_SCHEMA_VERSION: u16 = 3;
 #[cfg(target_os = "macos")]
 pub(crate) const LOCAL_API_REQUEST_MAX_BYTES: usize = 4 * 1024;
 #[cfg(target_os = "macos")]
@@ -200,6 +202,10 @@ pub struct LocalServiceStatus {
     pub xray_configured: bool,
     /// Current provider-owned router mapping state.
     pub router_mapping: RouterMappingStatus,
+    /// Current safe relay assignment metadata.
+    pub relay_assignment: RelayAssignmentStatus,
+    /// Live relay connector lifecycle owned by this service process.
+    pub relay_runtime: RelayRuntimeState,
     /// Last categorized service-loop failure, if it has not yet recovered.
     pub last_error: Option<LocalServiceError>,
 }
@@ -252,6 +258,7 @@ impl LocalServiceStatus {
         host: &HostStatus,
         phase: LocalServicePhase,
         runtime_state: NodeRuntimeState,
+        relay_runtime: RelayRuntimeState,
         last_error: Option<LocalServiceError>,
     ) -> Result<Self> {
         let status = Self {
@@ -271,6 +278,8 @@ impl LocalServiceStatus {
             activation_phase: host.xray_activation_phase.clone(),
             xray_configured: host.xray_configured,
             router_mapping: host.router_mapping.clone(),
+            relay_assignment: host.relay.clone(),
+            relay_runtime,
             last_error,
         };
         status.validate()?;
@@ -295,6 +304,12 @@ impl LocalServiceStatus {
                     controller_status.controller_instance_id,
                 )
                 .context("local service controller status is invalid")?;
+        }
+        if self.relay_runtime == RelayRuntimeState::Registered
+            && (self.runtime_state != NodeRuntimeState::Serving
+                || self.relay_assignment.state != RelayAssignmentState::Configured)
+        {
+            anyhow::bail!("registered relay requires a serving runtime and current assignment");
         }
         if self
             .activation_phase

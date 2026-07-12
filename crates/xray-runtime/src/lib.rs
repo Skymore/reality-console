@@ -15,14 +15,16 @@ mod binary;
 mod config;
 mod config_file;
 mod process;
+mod stats;
 
 pub use binary::{BinaryValidationError, Sha256Digest, VerifiedXrayBinary, XrayBinarySpec};
 pub use config::{
     ConfigBuildError, RealityPrivateKey, RealityTarget, RenderedXrayConfig, ServerName, ShortId,
-    UserEmail, VlessRealityConfigBuilder, VlessUser,
+    StatsApiConfig, UserEmail, VlessRealityConfigBuilder, VlessUser,
 };
 pub use config_file::{ConfigValidationError, VerifiedXrayConfig, XrayConfigSpec};
 pub use process::{
     probe_version, start_managed, test_config, ConfigTestReport, ExecutionLimits, ManagedXrayChild,
     RuntimeError, VersionProbe,
 };
+pub use stats::{query_user_traffic, StatsQueryError, UserTrafficCounter};

@@ -390,6 +390,14 @@ not recreated from client claims. Node credentials missing from the restore must
 the encrypted backup or rotated through an authenticated recovery flow; otherwise the node is
 re-enrolled with a new identity.
 
+The implemented Control CLI provides `backup create`, `backup verify`, and explicit recovery-mode
+`restore`. It uses SQLite's online backup API, owner-only staging, controller-signed manifests,
+artifact/identity/migration checks, and per-domain high-water comparison. Restore writes a new
+generation directory and never replaces an existing database path. Because the controller identity
+sidecar is not application-encrypted, backup creation requires a named externally encrypted
+destination contract. Switching the service to the restored generation and performing steps 4-9
+above remain explicit deployment/operator actions.
+
 ### 11.4 Telemetry after stale restore
 
 Node Host retains acknowledged telemetry for seven days. If restored Control reports an earlier

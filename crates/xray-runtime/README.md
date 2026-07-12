@@ -6,6 +6,9 @@ agent. It is a standalone Rust 1.80 crate.
 ## Included
 
 - A typed, deterministic VLESS + REALITY server configuration builder.
+- An optional least-privilege Stats API topology: a dedicated IPv4-loopback
+  `dokodemo-door` inbound, one fixed API routing rule, `StatsService` only, and
+  per-user byte counters enabled through policy level `0`.
 - Conservative validation for listen endpoints, REALITY targets, server names,
   private keys, short IDs, and VLESS users.
 - Explicit Xray executable selection by absolute path and caller-provided
@@ -17,6 +20,9 @@ agent. It is a standalone Rust 1.80 crate.
   `0600`; symbolic links are rejected.
 - Bounded asynchronous `xray version` and
   `xray run -test -config <private-tempfile>` operations with no shell.
+- Bounded, non-resetting `xray api statsquery` execution against IPv4 loopback,
+  with strict cumulative per-user counter parsing and no response contents in
+  errors.
 - Constrained `xray run -config <path>` startup with a cleared environment,
   null standard streams, drop-triggered kill, nonblocking status checks, and a
   bounded forceful kill/reap operation for an external supervisor.

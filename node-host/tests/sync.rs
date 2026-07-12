@@ -23,6 +23,7 @@ use control_protocol::request_auth::{
     verify_node_request_signature, NodeRequestAuthHeaders, NodeRequestSigningInput,
 };
 use control_protocol::secret::Secret;
+use control_protocol::telemetry::{TelemetryBatch, TelemetryBatchAcknowledgement, TelemetryCursor};
 use ed25519_dalek::{Signer as _, SigningKey};
 #[cfg(unix)]
 use node_host::configure_xray;
@@ -177,6 +178,11 @@ impl MockController {
             .route("/v1/nodes/{node_id}/heartbeat", post(capture))
             .route("/v1/nodes/{node_id}/desired", get(capture))
             .route(
+                "/v1/nodes/{node_id}/telemetry/cursor",
+                get(telemetry_cursor),
+            )
+            .route("/v1/nodes/{node_id}/telemetry", put(telemetry_upload))
+            .route(
                 "/v1/nodes/{node_id}/revisions/{revision}/result",
                 put(capture),
             )
@@ -219,6 +225,21 @@ impl MockController {
     fn reject_revision_results(&self, reject: bool) {
         self.reject_revision_results.store(reject, Ordering::SeqCst);
     }
+}
+
+async fn telemetry_cursor() -> axum::Json<TelemetryCursor> {
+    axum::Json(TelemetryCursor {
+        acknowledged_sequence: SequenceNumber::new(0).unwrap(),
+        expected_sequence: SequenceNumber::new(1).unwrap(),
+    })
+}
+
+async fn telemetry_upload(body: Bytes) -> axum::Json<TelemetryBatchAcknowledgement> {
+    let batch: TelemetryBatch = serde_json::from_slice(&body).unwrap();
+    axum::Json(TelemetryBatchAcknowledgement {
+        acknowledged_sequence: batch.last_sequence,
+        expected_sequence: batch.last_sequence.checked_next().unwrap(),
+    })
 }
 
 impl Drop for MockController {
@@ -528,7 +549,7 @@ async fn sync_signs_exact_requests_with_unique_nonces_and_persists_success() {
     assert!(synced.last_sync_at.is_some());
     assert!(synced.controller_status.is_none());
     assert_eq!(synced.desired_revision_cursor, 0);
-    assert_eq!(synced.schema_version, 12);
+    assert_eq!(synced.schema_version, 15);
 
     let captured = controller.captured();
     assert_eq!(captured.len(), 2);
@@ -1156,7 +1177,7 @@ async fn service_loop_repeats_sync_and_releases_the_data_lock_on_shutdown() {
                 max_backoff: StdDuration::from_millis(20),
             },
             async move {
-                tokio::time::timeout(StdDuration::from_millis(500), async {
+                tokio::time::timeout(StdDuration::from_secs(2), async {
                     loop {
                         if shutdown_requests.lock().unwrap().len() >= 4 {
                             break;

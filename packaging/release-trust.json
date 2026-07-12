@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "productionReady": false,
+  "releaseKeys": [
+    {
+      "keyId": "release_root_pending_2026",
+      "publicKey": "HxCHCJl-Mmkj0SHisI9kU08CgYRzb08nwM5E0aoSdEY"
+    }
+  ],
+  "rollbackKeys": [
+    {
+      "keyId": "rollback_root_pending_2026",
+      "publicKey": "EfUKR8aEmiPhHUA-_10zeTKBQ7Ruz0gxQLFWrp52Ykw"
+    }
+  ]
+}

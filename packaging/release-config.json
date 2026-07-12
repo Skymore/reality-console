@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "products": {
+    "connect": {
+      "bundleIdentifier": "com.sky.realityclient",
+      "targets": [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-pc-windows-msvc"
+      ]
+    },
+    "nodeHost": {
+      "bundleIdentifier": "com.sky.realitynode",
+      "serviceIdentifier": "com.sky.realitynode.agent",
+      "targets": [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin"
+      ]
+    }
+  },
+  "toolchains": {
+    "node": "22.17.0",
+    "rust": "1.88.0",
+    "tauriCli": "2.11.4"
+  },
+  "xray": {
+    "version": "26.3.27",
+    "releaseBaseUrl": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27",
+    "assets": {
+      "aarch64-apple-darwin": {
+        "archive": "Xray-macos-arm64-v8a.zip",
+        "archiveSha256": "2e93a67e8aa1936ecefb307e120830fcbd4c643ab9b1c46a2d0838d5f8409eaf",
+        "binary": "xray",
+        "binarySha256": "5d9dd24c0aba4b6cfcc6a33a5d67f854816ee17f392bf932ec8176da46f7e404"
+      },
+      "x86_64-apple-darwin": {
+        "archive": "Xray-macos-64.zip",
+        "archiveSha256": "f5b0471d3459eff1b82e48af0aeac186abcc3298210070afbbbd8437a4e8b203",
+        "binary": "xray",
+        "binarySha256": "afd0eaebb77994a18f29b00c5f50a4f7fbb77da06e24352d43035f3cad3c3786"
+      },
+      "x86_64-pc-windows-msvc": {
+        "archive": "Xray-windows-64.zip",
+        "archiveSha256": "d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad",
+        "binary": "xray.exe",
+        "binarySha256": "15c2d007954ac53ba69b80ec91242786b3c0b71d52649165b4ca1d5cc96ef8f1"
+      }
+    }
+  },
+  "windowsServiceWrapper": {
+    "version": "2.12.0",
+    "url": "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe",
+    "sha256": "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da"
+  },
+  "update": {
+    "manifestSchemaVersion": 1,
+    "minimumConfigSchemaVersion": 1
+  }
+}

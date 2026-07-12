@@ -34,7 +34,7 @@ impl ControllerIdentity {
     pub fn load_or_create(database_path: &Path) -> Result<Self, IdentityError> {
         let path = identity_path(database_path);
         if path.exists() {
-            return Self::load(&path);
+            return Self::load_existing(&path);
         }
 
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -56,13 +56,13 @@ impl ControllerIdentity {
                 Self::from_signing_key(signing_key, path)
             }
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Self::load(&path)
+                Self::load_existing(&path)
             }
             Err(error) => Err(IdentityError::Io(error.error)),
         }
     }
 
-    fn load(path: &Path) -> Result<Self, IdentityError> {
+    pub(crate) fn load_existing(path: &Path) -> Result<Self, IdentityError> {
         let metadata = fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(IdentityError::UnsafeIdentityPath(path.to_path_buf()));

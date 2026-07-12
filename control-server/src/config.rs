@@ -2,6 +2,7 @@ use crate::auth::{BootstrapTokenError, BootstrapTokenVerifier};
 use crate::probe::{
     ProbeMode, RemoteTcpProbeConfig, RemoteTcpProbeConfigError, TcpProbeLoopOptions,
 };
+use crate::protocol_canary::{CanaryConfigError, ProtocolCanaryConfig, ProtocolCanaryLoopOptions};
 use std::env;
 use std::net::{AddrParseError, SocketAddr};
 use std::path::PathBuf;
@@ -26,6 +27,8 @@ pub struct ServiceConfig {
     pub probe_mode: ProbeMode,
     pub probe_options: TcpProbeLoopOptions,
     pub remote_probe: Option<RemoteTcpProbeConfig>,
+    pub protocol_canary: Option<ProtocolCanaryConfig>,
+    pub protocol_canary_options: ProtocolCanaryLoopOptions,
 }
 
 impl ServiceConfig {
@@ -65,6 +68,9 @@ impl ServiceConfig {
         let remote_url = optional_env("CONTROL_TCP_PROBE_URL")?;
         let remote_token = optional_env("CONTROL_TCP_PROBE_TOKEN")?;
         let remote_probe = build_remote_probe_config(probe_mode, remote_url, remote_token)?;
+        let canary_path = optional_env("CONTROL_PROTOCOL_CANARY_XRAY_PATH")?;
+        let canary_sha256 = optional_env("CONTROL_PROTOCOL_CANARY_XRAY_SHA256")?;
+        let protocol_canary = build_protocol_canary_config(canary_path, canary_sha256)?;
 
         Ok(Self {
             bind_address,
@@ -76,6 +82,8 @@ impl ServiceConfig {
             probe_mode,
             probe_options: TcpProbeLoopOptions::default(),
             remote_probe,
+            protocol_canary,
+            protocol_canary_options: ProtocolCanaryLoopOptions::default(),
         })
     }
 
@@ -95,7 +103,23 @@ impl ServiceConfig {
             probe_mode: ProbeMode::Disabled,
             probe_options: TcpProbeLoopOptions::default(),
             remote_probe: None,
+            protocol_canary: None,
+            protocol_canary_options: ProtocolCanaryLoopOptions::default(),
         })
+    }
+}
+
+fn build_protocol_canary_config(
+    path: Option<String>,
+    sha256: Option<String>,
+) -> Result<Option<ProtocolCanaryConfig>, ConfigError> {
+    match (path, sha256) {
+        (None, None) => Ok(None),
+        (Some(path), Some(sha256)) => Ok(Some(ProtocolCanaryConfig::new(
+            PathBuf::from(path),
+            sha256,
+        )?)),
+        _ => Err(ConfigError::IncompleteProtocolCanary),
     }
 }
 
@@ -195,6 +219,10 @@ pub enum ConfigError {
     RemoteProbeSettingsWithoutMode,
     #[error(transparent)]
     InvalidRemoteProbe(#[from] RemoteTcpProbeConfigError),
+    #[error("CONTROL_PROTOCOL_CANARY_XRAY_PATH and CONTROL_PROTOCOL_CANARY_XRAY_SHA256 must be set together")]
+    IncompleteProtocolCanary,
+    #[error(transparent)]
+    InvalidProtocolCanary(#[from] CanaryConfigError),
 }
 
 #[cfg(test)]

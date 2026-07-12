@@ -1,0 +1,22 @@
+# Public mTLS relay endpoint. This is the only remote destination selected by the connector.
+relay_address = "203.0.113.10:7443"
+relay_server_name = "relay.example.com"
+route_id = "route_replace_with_opaque_id"
+route_token_path = "pki/route-token"
+tls_cert_path = "pki/node.pem"
+tls_key_path = "pki/node-key.pem"
+relay_ca_path = "pki/relay-ca.pem"
+
+# Mandatory fixed loopback target. The wire protocol has no target-address field.
+local_target = "127.0.0.1:443"
+max_frame_bytes = 65536
+command_queue_frames = 256
+stream_buffer_frames = 16
+initial_window_bytes = 262144
+max_streams = 16
+connect_timeout_secs = 10
+idle_timeout_secs = 1800
+heartbeat_interval_secs = 15
+heartbeat_timeout_secs = 45
+reconnect_initial_ms = 500
+reconnect_max_secs = 30
