@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.sky.realitynode",
   "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1421",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -11,10 +14,10 @@
       {
         "label": "main",
         "title": "Private Network Node",
-        "width": 680,
-        "height": 480,
-        "minWidth": 560,
-        "minHeight": 400
+        "width": 920,
+        "height": 680,
+        "minWidth": 720,
+        "minHeight": 560
       }
     ],
     "security": {

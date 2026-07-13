@@ -3,9 +3,24 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
     "tauri": "tauri"
   },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.0",
+    "@fontsource/dm-sans": "5.2.6",
+    "@fontsource/manrope": "5.2.6",
+    "lucide-react": "0.468.0",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
+  },
   "devDependencies": {
-    "@tauri-apps/cli": "2.11.4"
+    "@tauri-apps/cli": "2.11.4",
+    "@types/react": "19.1.10",
+    "@types/react-dom": "19.1.7",
+    "@vitejs/plugin-react": "4.7.0",
+    "typescript": "5.9.2",
+    "vite": "7.3.6"
   }
 }
