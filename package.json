@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "bundle:macos:local": "scripts/release/build-local-macos.sh control",
     "preview": "vite preview",
     "tauri": "tauri"
   },

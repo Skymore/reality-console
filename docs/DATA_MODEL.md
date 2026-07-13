@@ -223,15 +223,19 @@ window.
 | `applied_revision` | Required foreign key to this node's immutable revision target |
 | `observed_at`, `expires_at` | Node observation and finite mapping/relay lease; manual may omit expiry |
 | `last_report_generation` | Binds presence to one complete authenticated heartbeat snapshot |
+| `verification_generation` | Oldest heartbeat generation whose probe results belong to the current active lifecycle |
 | `first_reported_at`, `last_reported_at`, `withdrawn_at` | Candidate lifecycle timestamps |
 
 Candidate rows never contain node-authored verification state. The heartbeat transaction first
 fences stale or conflicting durable `heartbeatGeneration` values, then uses the accepted generation
 to refresh exact current candidates and mark omitted candidates withdrawn without deleting history.
-An exact retry is a no-op and cannot mutate controller-owned verification. Reusing an endpoint ID
-with changed fields, or resurrecting a withdrawn ID, is a state conflict. Only one non-withdrawn row
-may exist for the same `(network_id, node_id, mode, address, port, applied_revision)`. The schema-6 migration discards
-legacy `node_reported_endpoints` because those rows allowed a node to assert `verified`.
+An exact current retry is a no-op and cannot mutate controller-owned verification. An exact
+withdrawn candidate may be reactivated after a normal node restart; this advances
+`verification_generation`, resets controller verification to `pending`, and requires fresh probes
+without deleting the old audit records. Reusing an endpoint ID with any changed immutable field is a
+state conflict. Only one non-withdrawn row may exist for the same
+`(network_id, node_id, mode, address, port, applied_revision)`. The schema-6 migration discards legacy
+`node_reported_endpoints` because those rows allowed a node to assert `verified`.
 
 `node_endpoint_verifications` is controller-owned and keyed by the same candidate identity. It
 stores `status` (`pending`, `verified`, `failed`, or `withdrawn`), probe count, last probe/success,

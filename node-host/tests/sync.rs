@@ -1085,7 +1085,7 @@ async fn configured_runtime_validates_and_persists_an_immutable_candidate() {
     assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
     assert_eq!(config["inbounds"][0]["port"], 10_443);
     assert_eq!(
-        config["inbounds"][0]["settings"]["users"][0]["id"],
+        config["inbounds"][0]["settings"]["clients"][0]["id"],
         "2f55c837-7be6-4752-b58a-a7f51401bd89"
     );
 

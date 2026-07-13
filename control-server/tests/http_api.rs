@@ -2342,6 +2342,76 @@ async fn heartbeat_withdraws_missing_candidates_and_rejects_identity_reuse() {
 }
 
 #[tokio::test]
+async fn heartbeat_reactivates_an_identical_withdrawn_candidate_for_a_restarted_node() {
+    let app = TestApp::new();
+    let (node, current) = setup_applied_heartbeat(&app).await;
+    accepted_heartbeat_status(post_heartbeat(&app, &node, &current, 242).await).await;
+
+    let job = app
+        .database
+        .claim_tcp_probe(Uuid::new_v4(), TcpProbeLoopOptions::default())
+        .await
+        .unwrap()
+        .expect("current direct candidate should be due");
+    assert_eq!(
+        app.database
+            .complete_tcp_probe(
+                job,
+                TcpProbeResult::failed(TcpProbeErrorCode::TcpUnreachable),
+            )
+            .await
+            .unwrap(),
+        TcpProbeCompletion::Recorded
+    );
+
+    let mut withdrawn = current.clone();
+    withdrawn.heartbeat_generation = SequenceNumber::new(2).unwrap();
+    withdrawn.endpoints.clear();
+    assert_eq!(
+        post_heartbeat(&app, &node, &withdrawn, 243).await.status(),
+        StatusCode::OK
+    );
+
+    let mut restarted = current.clone();
+    restarted.heartbeat_generation = SequenceNumber::new(3).unwrap();
+    let status =
+        accepted_heartbeat_status(post_heartbeat(&app, &node, &restarted, 244).await).await;
+    assert_eq!(status.document.endpoints.len(), 1);
+    assert_eq!(
+        status.document.endpoints[0].readiness,
+        EndpointReadiness::Pending
+    );
+
+    let connection = rusqlite::Connection::open(app.database_path()).unwrap();
+    let candidate: (i64, Option<i64>) = connection
+        .query_row(
+            "SELECT last_report_generation, withdrawn_at
+             FROM node_endpoint_candidates WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(candidate, (3, None));
+    let verification: (String, i64, Option<i64>, Option<String>) = connection
+        .query_row(
+            "SELECT status, probe_attempts, last_probe_at, error_code
+             FROM node_endpoint_verifications WHERE node_id = ?1",
+            [node.node_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(verification, ("pending".into(), 0, None, None));
+    drop(connection);
+
+    let mut changed = restarted;
+    changed.heartbeat_generation = SequenceNumber::new(4).unwrap();
+    changed.endpoints[0].address = "changed.example.test".to_string();
+    let conflict = post_heartbeat(&app, &node, &changed, 245).await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(json(conflict).await["error"]["code"], "state_conflict");
+}
+
+#[tokio::test]
 async fn heartbeat_cannot_approve_a_node_or_regress_durable_progress() {
     let app = TestApp::new();
     let node = enroll_signed_node(&app).await;

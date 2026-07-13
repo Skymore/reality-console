@@ -1330,7 +1330,7 @@ mod tests {
     struct Fixture {
         _network_test_lock: tokio::sync::MutexGuard<'static, ()>,
         _directory: tempfile::TempDir,
-        _fake: FakeXray,
+        fake: FakeXray,
         listener: Option<TcpListener>,
         data_dir: PathBuf,
         listen_port: u16,
@@ -1354,7 +1354,7 @@ mod tests {
             Self {
                 _network_test_lock: network_test_lock,
                 _directory: directory,
-                _fake: fake,
+                fake,
                 listener: Some(listener),
                 data_dir,
                 listen_port,
@@ -1881,7 +1881,7 @@ mod tests {
     async fn runtime_replacement_cannot_invalidate_a_validated_candidate() {
         let fixture = Fixture::new(FakeMode::Valid).await;
         fixture.validate_revision(1).await;
-        let replacement = FakeXray::new(FakeMode::Valid);
+        let replacement = FakeXray::new(FakeMode::FailEveryManagedStart);
 
         let error = configure_xray(
             &fixture.data_dir,
@@ -1895,6 +1895,30 @@ mod tests {
         assert!(error
             .to_string()
             .contains("cannot be replaced while validated revisions are retained"));
+    }
+
+    #[tokio::test]
+    async fn identical_runtime_bytes_can_move_without_invalidating_a_validated_candidate() {
+        let fixture = Fixture::new(FakeMode::Valid).await;
+        fixture.validate_revision(1).await;
+        let relocated_directory = tempfile::tempdir().unwrap();
+        let relocated = relocated_directory.path().join("xray");
+        fs::copy(&fixture.fake.path, &relocated).unwrap();
+        fs::set_permissions(&relocated, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let status = configure_xray(&fixture.data_dir, &relocated, &fixture.fake.digest, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status.xray_binary_path.as_deref(),
+            Some(relocated.as_path())
+        );
+        assert_eq!(
+            status.xray_expected_sha256.as_deref(),
+            Some(fixture.fake.digest.as_str())
+        );
+        assert_eq!(status.applied_revision, None);
     }
 
     #[test]

@@ -80,7 +80,7 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 pub(crate) const APPLICATION_ID: i64 = 0x5243_4F4E;
 const INVITATION_SECRET_BYTES: usize = 32;
 const NODE_CREDENTIAL_LIFETIME_DAYS: i64 = 90;
@@ -1299,6 +1299,12 @@ CREATE TABLE relay_outbox (
 CREATE INDEX relay_outbox_due ON relay_outbox(completed_at, next_attempt_at);
 ";
 
+const MIGRATION_16_SQL: &str = r"
+ALTER TABLE node_endpoint_candidates
+ADD COLUMN verification_generation INTEGER NOT NULL DEFAULT 1
+    CHECK(verification_generation > 0);
+";
+
 struct Migration {
     version: i64,
     name: &'static str,
@@ -1380,6 +1386,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 15,
         name: "relay_provisioning_outbox",
         sql: MIGRATION_15_SQL,
+    },
+    Migration {
+        version: 16,
+        name: "endpoint_verification_generations",
+        sql: MIGRATION_16_SQL,
     },
 ];
 
@@ -3353,6 +3364,7 @@ fn build_signed_node_heartbeat_status(
     };
     let mut statement = transaction.prepare(
         "SELECT candidate.endpoint_id, candidate.last_report_generation,
+                candidate.verification_generation,
                 verification.status, verification.last_probe_at,
                 verification.verification_expires_at,
                 attempt.status, attempt.candidate_generation, attempt.claim_expires_at,
@@ -3382,14 +3394,15 @@ fn build_signed_node_heartbeat_status(
             Ok(StoredNodeEndpointStatus {
                 endpoint_id: row.get(0)?,
                 candidate_generation: row.get(1)?,
-                verification_status: row.get(2)?,
-                verification_last_probe_at: row.get(3)?,
-                verification_expires_at: row.get(4)?,
-                attempt_status: row.get(5)?,
-                attempt_candidate_generation: row.get(6)?,
-                attempt_claim_expires_at: row.get(7)?,
-                attempt_completed_at: row.get(8)?,
-                attempt_result_code: row.get(9)?,
+                verification_generation: row.get(2)?,
+                verification_status: row.get(3)?,
+                verification_last_probe_at: row.get(4)?,
+                verification_expires_at: row.get(5)?,
+                attempt_status: row.get(6)?,
+                attempt_candidate_generation: row.get(7)?,
+                attempt_claim_expires_at: row.get(8)?,
+                attempt_completed_at: row.get(9)?,
+                attempt_result_code: row.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -3427,6 +3440,7 @@ fn build_signed_node_heartbeat_status(
 struct StoredNodeEndpointStatus {
     endpoint_id: String,
     candidate_generation: i64,
+    verification_generation: i64,
     verification_status: String,
     verification_last_probe_at: Option<i64>,
     verification_expires_at: Option<i64>,
@@ -3465,6 +3479,10 @@ fn decode_node_endpoint_status(
         });
     }
 
+    let attempt_is_current = stored
+        .attempt_candidate_generation
+        .is_some_and(|generation| generation >= stored.verification_generation);
+
     let (readiness, last_checked_at, error_code) = match stored.attempt_status.as_deref() {
         Some("claimed")
             if stored.attempt_candidate_generation == Some(stored.candidate_generation)
@@ -3477,7 +3495,7 @@ fn decode_node_endpoint_status(
         Some("claimed" | "cancelled" | "expired") | None => {
             (EndpointReadiness::Pending, None, None)
         }
-        Some("succeeded") => (
+        Some("succeeded") if attempt_is_current => (
             EndpointReadiness::TcpReachable,
             Some(timestamp(
                 stored
@@ -3486,7 +3504,7 @@ fn decode_node_endpoint_status(
             )?),
             None,
         ),
-        Some("failed") => (
+        Some("failed") if attempt_is_current => (
             EndpointReadiness::TcpUnreachable,
             Some(timestamp(
                 stored
@@ -3499,6 +3517,7 @@ fn decode_node_endpoint_status(
                     .ok_or(DatabaseError::StoredProtocolValue)?,
             ),
         ),
+        Some("succeeded" | "failed") => (EndpointReadiness::Pending, None, None),
         Some(_) => return Err(DatabaseError::StoredProtocolValue),
     };
     Ok(NodeEndpointStatus {
@@ -3554,6 +3573,7 @@ WHERE network.status = 'active'
         AND previous.node_id = c.node_id
         AND previous.endpoint_id = c.endpoint_id
         AND previous.phase = 'tcp'
+        AND previous.candidate_generation >= c.verification_generation
       ORDER BY previous.attempt_id DESC
       LIMIT 1
   ), 0) <= ?5
@@ -3564,6 +3584,7 @@ ORDER BY COALESCE((
               AND previous.node_id = c.node_id
               AND previous.endpoint_id = c.endpoint_id
               AND previous.phase = 'tcp'
+              AND previous.candidate_generation >= c.verification_generation
          ), 0),
          c.first_reported_at,
          c.endpoint_id
@@ -3693,6 +3714,7 @@ fn claim_protocol_canary(
                    AND latest.status = 'succeeded'
                    AND latest.applied_revision = c.applied_revision
                    AND latest.address = c.address AND latest.port = c.port
+                   AND latest.candidate_generation >= c.verification_generation
                  ORDER BY latest.attempt_id DESC LIMIT 1
              )
              JOIN node_endpoint_verifications AS verification
@@ -3721,6 +3743,7 @@ fn claim_protocol_canary(
                      AND previous.node_id = c.node_id
                      AND previous.endpoint_id = c.endpoint_id
                      AND previous.phase = 'protocol'
+                     AND previous.candidate_generation >= c.verification_generation
                    ORDER BY previous.attempt_id DESC LIMIT 1
                ), 0) <= ?1
              ORDER BY COALESCE((
@@ -3729,6 +3752,7 @@ fn claim_protocol_canary(
                    AND previous.node_id = c.node_id
                    AND previous.endpoint_id = c.endpoint_id
                    AND previous.phase = 'protocol'
+                   AND previous.candidate_generation >= c.verification_generation
              ), 0), c.first_reported_at, c.endpoint_id
              LIMIT 1",
             params![
@@ -4580,24 +4604,48 @@ fn refresh_endpoint_candidate(
         && stored.3 == i64::from(candidate.port)
         && stored.4 == candidate.applied_revision.get()
         && stored.5 == prepared.observed_at
-        && stored.6 == prepared.expires_at
-        && stored.7.is_none();
+        && stored.6 == prepared.expires_at;
     if !unchanged {
         return Err(DatabaseError::EndpointCandidateConflict);
     }
+    let was_withdrawn = stored.7.is_some();
     transaction.execute(
         "UPDATE node_endpoint_candidates
-         SET last_report_generation = ?1, last_reported_at = ?2
+         SET last_report_generation = ?1, last_reported_at = ?2, withdrawn_at = NULL,
+             verification_generation = CASE WHEN ?6 = 1
+                 THEN ?1 ELSE verification_generation END
          WHERE network_id = ?3 AND node_id = ?4 AND endpoint_id = ?5
-           AND withdrawn_at IS NULL",
+           AND (withdrawn_at IS NULL OR ?6 = 1)",
         params![
             report_generation,
             now,
             network_id,
             node_id,
             candidate.endpoint_id.to_string(),
+            was_withdrawn,
         ],
     )?;
+    if was_withdrawn {
+        transaction.execute(
+            "UPDATE endpoint_probe_attempts
+             SET status = 'cancelled', completed_at = ?1,
+                 resolved_address = NULL, latency_ms = NULL,
+                 result_code = 'candidate_changed'
+             WHERE network_id = ?2 AND node_id = ?3 AND endpoint_id = ?4
+               AND status = 'claimed'",
+            params![now, network_id, node_id, candidate.endpoint_id.to_string(),],
+        )?;
+        transaction.execute(
+            "UPDATE node_endpoint_verifications
+             SET status = 'pending', probe_attempts = 0,
+                 last_probe_at = NULL, last_success_at = NULL,
+                 latency_ms = NULL, error_code = NULL,
+                 verification_expires_at = NULL, updated_at = ?1
+             WHERE network_id = ?2 AND node_id = ?3 AND endpoint_id = ?4
+               AND status = 'withdrawn'",
+            params![now, network_id, node_id, candidate.endpoint_id.to_string(),],
+        )?;
+    }
     Ok(true)
 }
 
@@ -4641,8 +4689,9 @@ fn insert_endpoint_candidate(
         "INSERT INTO node_endpoint_candidates(
             network_id, node_id, endpoint_id, mode, source, address, port,
             applied_revision, observed_at, expires_at, last_report_generation,
-            first_reported_at, last_reported_at, withdrawn_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, NULL)",
+            first_reported_at, last_reported_at, withdrawn_at,
+            verification_generation
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, NULL, ?11)",
         params![
             network_id,
             node_id,

@@ -1,0 +1,14 @@
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "0.0.0.0"
+allowPorts = [{ single = 443 }, { single = 18080 }]
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/etc/frp/token"
+
+transport.tls.force = true
+
+log.to = "console"
+log.level = "info"
+log.maxDays = 7

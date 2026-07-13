@@ -1,5 +1,5 @@
 {
-  "name": "reality-client",
+  "name": "private-network-connect",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -11,11 +11,15 @@
     "build": "tsc && vite build",
     "bundle:macos:arm64": "tauri build --target aarch64-apple-darwin",
     "bundle:macos:x64": "tauri build --target x86_64-apple-darwin",
+    "bundle:macos:local": "../scripts/release/build-local-macos.sh connect",
     "bundle:windows:x64": "tauri build --target x86_64-pc-windows-msvc",
     "tauri": "tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@fontsource/dm-sans": "5.2.6",
+    "@fontsource/manrope": "5.2.6",
+    "lucide-react": "0.468.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
@@ -26,6 +30,6 @@
     "@vitejs/plugin-react": "^4.6.0",
     "typescript": "~5.8.3",
     "fflate": "^0.8.2",
-    "vite": "^7.0.4"
+    "vite": "7.3.6"
   }
 }

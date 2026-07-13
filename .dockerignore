@@ -1,0 +1,9 @@
+.git
+**/node_modules
+**/target
+dist
+release
+artifacts
+*.dmg
+*.pkg
+*.zip

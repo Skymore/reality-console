@@ -1,0 +1,10 @@
+{
+  "build": {
+    "beforeBuildCommand": "../scripts/release/prepare-local-macos-sidecars.sh connect && npm run build"
+  },
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "Private Network Local Development"
+    }
+  }
+}

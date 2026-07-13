@@ -114,14 +114,68 @@ def read_existing_config(path: Path) -> dict[str, object] | None:
     return value
 
 
+def read_private_secret(path: Path) -> str:
+    path = path.expanduser().absolute()
+    metadata = path.lstat()
+    if path.is_symlink() or not path.is_file() or metadata.st_uid != os.getuid():
+        raise ProductError("probe token file is unsafe")
+    if metadata.st_mode & 0o077:
+        raise ProductError("probe token file must be owner-only")
+    value = path.read_text(encoding="utf-8").strip()
+    if not 32 <= len(value) <= 512 or not value.isascii() or any(character.isspace() for character in value):
+        raise ProductError("probe token must contain 32 to 512 visible ASCII bytes")
+    return value
+
+
+def probe_config(
+    mode: str | None,
+    url: str | None,
+    token_file: Path | None,
+    existing: dict[str, object] | None,
+) -> tuple[str, str | None, str | None]:
+    selected = mode or (str(existing.get("probeMode")) if existing else "disabled")
+    if selected not in {"disabled", "local-tcp", "remote-http"}:
+        raise ProductError("probe mode is invalid")
+    if selected != "remote-http":
+        if url is not None or token_file is not None:
+            raise ProductError("probe URL and token file require remote-http mode")
+        return selected, None, None
+    selected_url = url or (str(existing.get("tcpProbeUrl")) if existing and existing.get("tcpProbeUrl") else None)
+    selected_token = (
+        read_private_secret(token_file)
+        if token_file is not None
+        else str(existing.get("tcpProbeToken"))
+        if existing and existing.get("tcpProbeToken")
+        else None
+    )
+    if selected_url is None or selected_token is None:
+        raise ProductError("remote-http mode requires a probe URL and owner-only token file")
+    parsed = urlsplit(selected_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.path != "/v1/tcp-probe" or parsed.query or parsed.fragment:
+        raise ProductError("probe URL must be an HTTPS /v1/tcp-probe endpoint")
+    return selected, selected_url, selected_token
+
+
 def build_config(
     data_dir: Path,
-    bind_address: str,
-    public_origin: str,
-    network_name: str,
+    bind_address: str | None,
+    public_origin: str | None,
+    network_name: str | None,
     xray: Path,
     existing: dict[str, object] | None,
+    probe_mode: str | None = None,
+    tcp_probe_url: str | None = None,
+    tcp_probe_token_file: Path | None = None,
 ) -> dict[str, object]:
+    bind_address = bind_address or (
+        str(existing.get("bindAddress")) if existing else DEFAULT_BIND
+    )
+    public_origin = public_origin or (
+        str(existing.get("publicOrigin")) if existing else DEFAULT_ORIGIN
+    )
+    network_name = network_name or (
+        str(existing.get("networkName")) if existing else "Friends Network"
+    )
     validate_bind(bind_address)
     public_origin = validate_origin(public_origin)
     if not network_name or network_name.strip() != network_name or len(network_name) > 128:
@@ -129,6 +183,9 @@ def build_config(
     token = existing.get("bootstrapToken") if existing else secrets.token_urlsafe(48)
     if not isinstance(token, str) or len(token) < 32:
         raise ProductError("existing bootstrap token is invalid")
+    probe_mode, tcp_probe_url, tcp_probe_token = probe_config(
+        probe_mode, tcp_probe_url, tcp_probe_token_file, existing
+    )
     return {
         "schemaVersion": SCHEMA_VERSION,
         "bindAddress": bind_address,
@@ -137,9 +194,9 @@ def build_config(
         "bootstrapToken": token,
         "publicOrigin": public_origin,
         "requestTimeoutSeconds": 10,
-        "probeMode": "disabled",
-        "tcpProbeUrl": None,
-        "tcpProbeToken": None,
+        "probeMode": probe_mode,
+        "tcpProbeUrl": tcp_probe_url,
+        "tcpProbeToken": tcp_probe_token,
         "protocolCanaryXrayPath": str(xray),
         "protocolCanaryXraySha256": sha256_file(xray),
     }
@@ -203,11 +260,24 @@ def bootout() -> None:
 
 def start_service(plist: Path) -> None:
     bootout()
-    result = run_launchctl("bootstrap", launch_domain(), str(plist), check=False)
-    if result.returncode != 0:
-        raise ProductError(result.stderr.decode(errors="replace").strip() or "launchctl bootstrap failed")
-    run_launchctl("enable", f"{launch_domain()}/{LABEL}")
-    run_launchctl("kickstart", "-k", f"{launch_domain()}/{LABEL}")
+    service = f"{launch_domain()}/{LABEL}"
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if run_launchctl("print", service, check=False).returncode != 0:
+            break
+        time.sleep(0.05)
+    result = None
+    for attempt in range(3):
+        result = run_launchctl("bootstrap", launch_domain(), str(plist), check=False)
+        if result.returncode == 0 or run_launchctl("print", service, check=False).returncode == 0:
+            break
+        if attempt < 2:
+            time.sleep(0.25 * (attempt + 1))
+    if result is None or (result.returncode != 0 and run_launchctl("print", service, check=False).returncode != 0):
+        message = result.stderr.decode(errors="replace").strip() if result is not None else ""
+        raise ProductError(message or "launchctl bootstrap failed")
+    run_launchctl("enable", service)
+    run_launchctl("kickstart", "-k", service)
 
 
 def health_url(config: dict[str, object]) -> str:
@@ -246,6 +316,9 @@ def install(args: argparse.Namespace) -> None:
         args.network_name,
         xray,
         existing,
+        args.probe_mode,
+        args.tcp_probe_url,
+        args.tcp_probe_token_file,
     )
     atomic_json(config_path, config)
 
@@ -441,10 +514,13 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     install_parser = commands.add_parser("install")
     install_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
-    install_parser.add_argument("--bind-address", default=DEFAULT_BIND)
-    install_parser.add_argument("--public-origin", default=DEFAULT_ORIGIN)
-    install_parser.add_argument("--network-name", default="Friends Network")
+    install_parser.add_argument("--bind-address")
+    install_parser.add_argument("--public-origin")
+    install_parser.add_argument("--network-name")
     install_parser.add_argument("--xray-path")
+    install_parser.add_argument("--probe-mode", choices=("disabled", "local-tcp", "remote-http"))
+    install_parser.add_argument("--tcp-probe-url")
+    install_parser.add_argument("--tcp-probe-token-file", type=Path)
     for name in ("status", "start", "admin-token"):
         command = commands.add_parser(name)
         command.add_argument("--data-dir", type=Path, default=default_data_dir())

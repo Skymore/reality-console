@@ -1,0 +1,26 @@
+services:
+  node:
+    build:
+      context: ../../..
+      dockerfile: deploy/docker/node-host/Dockerfile
+    image: private-network/node-host:0.1.0
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    environment:
+      PUBLIC_ADDRESS: ${PUBLIC_ADDRESS:?set PUBLIC_ADDRESS to the VPS public IPv4 address}
+      PUBLIC_PORT: ${PUBLIC_PORT:-443}
+      SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-30}
+    volumes:
+      - node-state:/var/lib/private-network-node
+
+volumes:
+  node-state:

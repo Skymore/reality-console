@@ -21,7 +21,6 @@ export interface TcpSocket {
 
 export type TcpConnector = (
   address: { hostname: string; port: number },
-  options: { secureTransport: "off"; allowHalfOpen: false },
 ) => TcpSocket;
 
 interface SocketAttempt {
@@ -76,10 +75,7 @@ async function executeProbe(
     try {
       attempts.push({
         target,
-        socket: connector(
-          { hostname: target, port: request.port },
-          { secureTransport: "off", allowHalfOpen: false },
-        ),
+        socket: connector({ hostname: target, port: request.port }),
       });
     } catch {
       // A synchronous provider rejection is one failed target, never a reason

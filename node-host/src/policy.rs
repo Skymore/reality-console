@@ -588,10 +588,11 @@ fn current_admission_target(connection: &Connection, data_dir: &Path) -> Result<
     let revision = current_applied_revision(connection)?
         .context("manual endpoint requires a current applied revision")?;
     let candidate = crate::xray::load_validated_candidate(connection, data_dir, revision)?;
-    let port = candidate
-        .public_port
-        .context("current applied revision has no public admission port")?;
-    Ok((revision, port))
+    Ok((revision, admission_forward_port(&candidate)))
+}
+
+const fn admission_forward_port(candidate: &crate::xray::ValidatedXrayCandidate) -> u16 {
+    candidate.listen_port
 }
 
 fn load_manual_status(
@@ -719,14 +720,32 @@ const fn next_weekday(day: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        allows_advertising, evaluate_and_checkpoint, load_manual_candidate, pause_provider,
-        record_usage_delta_in_transaction, resume_provider, ProviderAvailability, ProviderPolicy,
-        WeeklyScheduleWindow,
+        admission_forward_port, allows_advertising, evaluate_and_checkpoint, load_manual_candidate,
+        pause_provider, record_usage_delta_in_transaction, resume_provider, ProviderAvailability,
+        ProviderPolicy, WeeklyScheduleWindow,
     };
-    use crate::{initialize, migrate, open_database};
+    use crate::{initialize, migrate, open_database, xray::ValidatedXrayCandidate};
+    use control_protocol::crypto::Sha256Digest;
     use control_protocol::id::{EndpointId, Revision};
     use rusqlite::params;
+    use std::path::PathBuf;
     use time::macros::datetime;
+    use xray_runtime::Sha256Digest as RuntimeSha256Digest;
+
+    #[test]
+    fn manual_forwarding_targets_the_local_listener_not_the_public_port() {
+        let candidate = ValidatedXrayCandidate {
+            revision: Revision::new(1).unwrap(),
+            config_path: PathBuf::from("config.json"),
+            config_digest: Sha256Digest::from_bytes([0; 32]),
+            binary_path: PathBuf::from("xray"),
+            binary_digest: RuntimeSha256Digest::from_hex(&"0".repeat(64)).unwrap(),
+            listen_port: 10_443,
+            public_port: Some(442),
+        };
+
+        assert_eq!(admission_forward_port(&candidate), 10_443);
+    }
 
     #[test]
     fn same_day_window_is_left_closed_and_right_open() {

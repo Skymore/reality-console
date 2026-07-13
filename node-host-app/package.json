@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "bundle:macos:local": "../scripts/release/build-local-macos.sh node-host",
     "tauri": "tauri"
   },
   "dependencies": {

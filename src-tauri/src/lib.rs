@@ -1,4 +1,5 @@
 mod config_store;
+mod control_api;
 mod db;
 
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -137,6 +139,12 @@ static PUBLIC_IPV4_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock:
 static PUBLIC_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const PUBLIC_IPV4_TTL: Duration = Duration::from_secs(5 * 60);
+const RELAY_PUBLIC_IPV4_ENV: &str = "RELAY_PUBLIC_IPV4";
+const RELAY_PUBLIC_IPV4_FILES: &[&str] = &[
+    "/opt/homebrew/etc/frp/public-ipv4",
+    "/usr/local/etc/frp/public-ipv4",
+    "/etc/frp/public-ipv4",
+];
 
 async fn run_blocking<T, F>(task: F) -> Result<T, String>
 where
@@ -734,6 +742,10 @@ fn delete_vless_user_sync(user_id: String) -> Result<UserMutationResult, String>
 }
 
 fn resolve_public_ipv4() -> Option<String> {
+    if let Some(public_ipv4) = resolve_relay_public_ipv4() {
+        return Some(public_ipv4);
+    }
+
     let cache = PUBLIC_IPV4_CACHE.get_or_init(|| Mutex::new(None));
     let mut cached = cache.lock().ok()?;
 
@@ -760,6 +772,27 @@ fn resolve_public_ipv4() -> Option<String> {
     }
 
     fetched.or(stale)
+}
+
+fn resolve_relay_public_ipv4() -> Option<String> {
+    env::var(RELAY_PUBLIC_IPV4_ENV)
+        .ok()
+        .and_then(|value| normalize_public_ipv4(&value))
+        .or_else(|| {
+            RELAY_PUBLIC_IPV4_FILES.iter().find_map(|path| {
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|value| normalize_public_ipv4(&value))
+            })
+        })
+}
+
+fn normalize_public_ipv4(value: &str) -> Option<String> {
+    value
+        .trim()
+        .parse::<Ipv4Addr>()
+        .ok()
+        .map(|address| address.to_string())
 }
 
 fn load_config_with_ip(public_ipv4: Option<String>) -> Result<LoadedConfig, String> {
@@ -1401,7 +1434,14 @@ pub fn run() {
             pull_access_logs,
             get_connection_logs,
             get_user_analytics,
-            service_action
+            service_action,
+            control_api::get_control_snapshot,
+            control_api::create_control_account,
+            control_api::update_control_account_nodes,
+            control_api::set_control_account_status,
+            control_api::create_connect_setup,
+            control_api::create_node_setup,
+            control_api::control_node_action
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1453,6 +1493,17 @@ mod tests {
             server_name: Some("www.example.com".to_string()),
         })
         .is_ok());
+    }
+
+    #[test]
+    fn normalizes_relay_public_ipv4_values() {
+        assert_eq!(
+            normalize_public_ipv4(" 203.0.113.10\n"),
+            Some("203.0.113.10".to_string())
+        );
+        assert_eq!(normalize_public_ipv4("203.0.113.10:443"), None);
+        assert_eq!(normalize_public_ipv4("not-an-ip"), None);
+        assert_eq!(normalize_public_ipv4("2001:db8::1"), None);
     }
 
     #[test]

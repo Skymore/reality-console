@@ -370,7 +370,7 @@ impl VlessRealityConfigBuilder {
     /// Validates all cross-field constraints and renders deterministic JSON.
     ///
     /// Disabled users are validated for duplicate identities but are omitted
-    /// from the rendered Xray `settings.users` list. No enabled users produces
+    /// from the rendered Xray `settings.clients` list. No enabled users produces
     /// an empty list that revokes all VLESS identities.
     ///
     /// # Errors
@@ -417,7 +417,7 @@ impl VlessRealityConfigBuilder {
             port: self.listen_port,
             protocol: "vless",
             settings: VlessInboundSettings {
-                users: enabled_users
+                clients: enabled_users
                     .into_iter()
                     .map(|user| Client {
                         id: user.id,
@@ -768,7 +768,8 @@ struct ApiInboundSettings {
 
 #[derive(Serialize)]
 struct VlessInboundSettings<'a> {
-    users: Vec<Client<'a>>,
+    // Xray 26.3.27 predates the inbound `clients` -> `users` rename.
+    clients: Vec<Client<'a>>,
     decryption: &'a str,
 }
 
@@ -904,11 +905,11 @@ mod tests {
             Some(&Value::from("www.example.com:443"))
         );
         assert_eq!(
-            json.pointer("/inbounds/0/settings/users/0/email"),
+            json.pointer("/inbounds/0/settings/clients/0/email"),
             Some(&Value::from("friend-a@example.com"))
         );
         assert_eq!(
-            json.pointer("/inbounds/0/settings/users")
+            json.pointer("/inbounds/0/settings/clients")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(2)
@@ -942,7 +943,7 @@ mod tests {
             Some(&Value::Bool(true))
         );
         assert_eq!(
-            json.pointer("/inbounds/0/settings/users/0/level"),
+            json.pointer("/inbounds/0/settings/clients/0/level"),
             Some(&Value::from(0))
         );
         assert_eq!(
@@ -958,7 +959,7 @@ mod tests {
             json.pointer("/inbounds/1/settings/address"),
             Some(&Value::from("127.0.0.1"))
         );
-        assert!(json.pointer("/inbounds/1/settings/users").is_none());
+        assert!(json.pointer("/inbounds/1/settings/clients").is_none());
         assert!(json.pointer("/inbounds/1/streamSettings").is_none());
         assert_eq!(
             json.pointer("/routing/rules/0/inboundTag"),
@@ -999,7 +1000,7 @@ mod tests {
         let empty_json: Value = serde_json::from_str(empty.expose_json()).unwrap();
         assert_eq!(
             empty_json
-                .pointer("/inbounds/0/settings/users")
+                .pointer("/inbounds/0/settings/clients")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0)
@@ -1071,7 +1072,7 @@ mod tests {
         let disabled_json: Value = serde_json::from_str(all_disabled.expose_json()).unwrap();
         assert_eq!(
             disabled_json
-                .pointer("/inbounds/0/settings/users")
+                .pointer("/inbounds/0/settings/clients")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0)

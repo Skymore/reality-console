@@ -31,11 +31,15 @@ pub fn build_xray_config(profile: &ConnectionProfile, socks_port: u16, http_port
                 "tag": "proxy",
                 "protocol": "vless",
                 "settings": {
-                    "address": profile.server_address,
-                    "port": profile.server_port,
-                    "id": profile.user_id.to_string(),
-                    "encryption": "none",
-                    "flow": profile.flow
+                    "vnext": [{
+                        "address": profile.server_address,
+                        "port": profile.server_port,
+                        "users": [{
+                            "id": profile.user_id.to_string(),
+                            "encryption": "none",
+                            "flow": profile.flow
+                        }]
+                    }]
                 },
                 "streamSettings": {
                     "network": "raw",
@@ -43,7 +47,7 @@ pub fn build_xray_config(profile: &ConnectionProfile, socks_port: u16, http_port
                     "realitySettings": {
                         "serverName": profile.server_name,
                         "fingerprint": profile.fingerprint,
-                        "password": profile.reality_password,
+                        "publicKey": profile.reality_password,
                         "shortId": profile.short_id,
                         "spiderX": profile.spider_x
                     }
@@ -81,11 +85,16 @@ mod tests {
             Some(&json!("raw"))
         );
         assert_eq!(
-            config.pointer("/outbounds/0/streamSettings/realitySettings/password"),
+            config.pointer("/outbounds/0/streamSettings/realitySettings/publicKey"),
             Some(&json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"))
         );
+        assert_eq!(
+            config.pointer("/outbounds/0/settings/vnext/0/users/0/id"),
+            Some(&json!("11111111-1111-4111-8111-111111111111"))
+        );
+        assert!(config.pointer("/outbounds/0/settings/address").is_none());
         assert!(config
-            .pointer("/outbounds/0/streamSettings/realitySettings/publicKey")
+            .pointer("/outbounds/0/streamSettings/realitySettings/password")
             .is_none());
     }
 

@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
+use time::OffsetDateTime;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
@@ -302,14 +303,20 @@ impl ConnectService {
             .as_ref()
             .and_then(VerifiedBundle::etag)
             .map(str::to_owned);
-        let modified = match self.session.fetch_bundle(now, etag.as_deref()).await? {
+        let fetched = self.session.fetch_bundle(now, etag.as_deref()).await?;
+        // Control can issue a bundle after the request starts. Validate against the completion
+        // clock so a freshly signed bundle is not rejected as being from the future.
+        let verification_now =
+            verification_completed_at(now, Timestamp::from_datetime(OffsetDateTime::now_utc()));
+        let modified = match fetched {
             BundleFetch::NotModified => false,
             BundleFetch::Modified { bundle, etag } => {
                 let verifier = self.verifier(binding);
-                let verified =
-                    tokio::task::spawn_blocking(move || verifier.verify(*bundle, etag, now))
-                        .await
-                        .map_err(|_| connect_error("connect_bundle_verify_failed"))??;
+                let verified = tokio::task::spawn_blocking(move || {
+                    verifier.verify(*bundle, etag, verification_now)
+                })
+                .await
+                .map_err(|_| connect_error("connect_bundle_verify_failed"))??;
                 let cache = BundleCache::new(self.app_data_dir.clone(), binding)?;
                 let artifact = verified.signed().clone();
                 let artifact_etag = verified.etag().map(str::to_owned);
@@ -317,7 +324,8 @@ impl ConnectService {
                 tokio::task::spawn_blocking(move || {
                     // Re-verification inside this blocking boundary keeps cache writes tied to the
                     // exact authenticated envelope rather than a separately reconstructed view.
-                    let verified = cache_verifier.verify(artifact, artifact_etag, now)?;
+                    let verified =
+                        cache_verifier.verify(artifact, artifact_etag, verification_now)?;
                     cache.install(&verified)
                 })
                 .await
@@ -640,6 +648,14 @@ fn offline_deadline_elapsed(deadline: Timestamp, now: Timestamp) -> bool {
     deadline.as_datetime() <= now.as_datetime()
 }
 
+fn verification_completed_at(started_at: Timestamp, completed_at: Timestamp) -> Timestamp {
+    if completed_at.as_datetime() > started_at.as_datetime() {
+        completed_at
+    } else {
+        started_at
+    }
+}
+
 fn connect_error(code: &str) -> ClientError {
     ClientError::internal(code, "The account connection operation failed.")
 }
@@ -799,6 +815,15 @@ mod tests {
         let before: Timestamp = "2029-12-31T23:59:59Z".parse().unwrap();
         assert!(!offline_deadline_elapsed(deadline, before));
         assert!(offline_deadline_elapsed(deadline, deadline));
+    }
+
+    #[test]
+    fn bundle_verification_uses_the_later_request_completion_clock() {
+        let started: Timestamp = "2030-01-01T00:00:00Z".parse().unwrap();
+        let completed: Timestamp = "2030-01-01T00:00:01Z".parse().unwrap();
+
+        assert_eq!(verification_completed_at(started, completed), completed);
+        assert_eq!(verification_completed_at(completed, started), completed);
     }
 
     #[tokio::test]

@@ -1,0 +1,27 @@
+[Unit]
+Description=Private Network Control HTTPS gateway
+After=network-online.target frps.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+Environment=XDG_DATA_HOME=/var/lib/caddy
+Environment=XDG_CONFIG_HOME=/var/lib/caddy
+ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+Restart=on-failure
+RestartSec=5s
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/caddy /var/log/caddy
+
+[Install]
+WantedBy=multi-user.target

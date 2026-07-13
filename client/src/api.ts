@@ -1,84 +1,68 @@
 import { invoke } from "@tauri-apps/api/core"
 
 export type ClientPhase = "disconnected" | "starting" | "connected" | "stopping" | "failed"
-
 export type ProxyMode = "manual" | "system"
-
-export type LocalProxyEndpoints = {
-  socks: string
-  http: string
-}
 
 export type ClientState = {
   phase: ClientPhase
-  activeProfileId?: string | null
-  mode?: ProxyMode | null
-  endpoints: LocalProxyEndpoints
-  errorCode?: string | null
-  errorMessage?: string | null
+  activeProfileId: string | null
+  mode: ProxyMode | null
+  endpoints: { socks: string; http: string }
+  errorCode: string | null
+  errorMessage: string | null
 }
 
-export type ClientError = {
-  code: string
-  message: string
-  field?: string | null
+export type AccountSession = {
+  phase: "signedOut" | "refreshRequired" | "active"
+  binding: { networkId: string; userId: string; deviceId: string } | null
+  account: { userId: string; displayName: string; status: "active" | "disabled" | "deleted" } | null
+  accessExpiresAt: string | null
+  refreshExpiresAt: string | null
+  refreshRotation: number | null
 }
 
-export type InvitationPreview = {
-  name: string
-  serverAddress: string
-  serverPort: number
-  transport: "raw"
-  security: "reality"
-  flow: string
-  serverName: string
-  fingerprint: string
+export type SafeNode = {
+  nodeId: string
+  displayName: string
+  region: string | null
+  endpointMode: "direct" | "relay"
+  priority: number
 }
 
-export type StoredProfile = {
-  id: string
-  name: string
-  serverAddress: string
-  serverPort: number
-  serverName: string
-  flow: string
-  fingerprint: string
-  createdAt: number
-  credentialAvailable: boolean
+export type SelectionMode =
+  | { kind: "automatic" }
+  | { kind: "manual"; nodes: string }
+  | { kind: "pinnedFallback"; nodes: string[] }
+
+export type ConnectSnapshot = {
+  session: AccountSession
+  bundle: {
+    generation: number
+    refreshAfter: string
+    offlineExpiresAt: string
+    nodes: SafeNode[]
+  } | null
+  selectionMode: SelectionMode
+  selectedNodeId: string | null
+  selectionReason: string | null
+  runtime: ClientState
 }
 
-export function getClientState() {
-  return invoke<ClientState>("client_get_state")
+export type SetupSession = {
+  sessionId: string
+  preview: { displayName: string; controllerOrigin: string; expiresAt: string }
 }
 
-export function startClient(profileId: string, mode: ProxyMode = "manual") {
-  return invoke<ClientState>("client_start", { profileId, mode })
-}
-
-export function stopClient() {
-  return invoke<ClientState>("client_stop")
-}
-
-export function previewInvitation(invitation: string) {
-  return invoke<InvitationPreview>("client_preview_invitation", { invitation })
-}
-
-export function listProfiles() {
-  return invoke<StoredProfile[]>("client_list_profiles")
-}
-
-export function importProfile(invitation: string, name?: string) {
-  return invoke<StoredProfile>("client_import_profile", { invitation, name })
-}
-
-export function renameProfile(profileId: string, name: string) {
-  return invoke<StoredProfile>("client_rename_profile", { profileId, name })
-}
-
-export function deleteProfile(profileId: string) {
-  return invoke<void>("client_delete_profile", { profileId })
-}
-
-export function previewProfile(profileId: string) {
-  return invoke<InvitationPreview>("client_preview_profile", { profileId })
-}
+export const getSnapshot = () => invoke<ConnectSnapshot | null>("connect_get_snapshot")
+export const beginSetup = (input: string) => invoke<SetupSession>("connect_begin_setup", { input })
+export const cancelSetup = (sessionId: string) => invoke<boolean>("connect_cancel_setup", { sessionId })
+export const confirmSetup = (sessionId: string, deviceName: string) =>
+  invoke<ConnectSnapshot>("connect_confirm_setup", { sessionId, deviceName })
+export const refreshBundle = () => invoke<ConnectSnapshot>("connect_refresh_bundle")
+export const probeNodes = () => invoke<ConnectSnapshot>("connect_probe_nodes")
+export const setSelection = (selection: SelectionMode) =>
+  invoke<ConnectSnapshot>("connect_set_selection", { selection })
+export const connect = (mode: ProxyMode = "system") =>
+  invoke<ConnectSnapshot>("connect_start", { mode })
+export const disconnect = () => invoke<ConnectSnapshot>("connect_stop")
+export const logout = () => invoke<ConnectSnapshot>("connect_logout")

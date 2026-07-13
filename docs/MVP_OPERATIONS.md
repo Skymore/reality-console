@@ -75,6 +75,23 @@ python3 scripts/product/control-service.py install \
 The reverse tunnel must forward only to `http://127.0.0.1:8787`. The service remains loopback-only,
 and reconfiguration preserves the existing database, controller identity, and administrator token.
 
+For real endpoint publication, deploy `probe-worker/` and keep its unrelated bearer in an
+owner-only file. Reconfigure the service without putting that secret in shell arguments:
+
+```bash
+chmod 600 ~/.private-network-probe-token
+python3 scripts/product/control-service.py install \
+  --network-name "Friends Network" \
+  --xray-path /opt/homebrew/bin/xray \
+  --public-origin https://control.example.com \
+  --probe-mode remote-http \
+  --tcp-probe-url https://probe.example.workers.dev/v1/tcp-probe \
+  --tcp-probe-token-file ~/.private-network-probe-token
+```
+
+`local-tcp` exists for development with a controller outside the node LAN. It is not valid proof
+when Control and Node Host share this home network because it tests router hairpin behavior.
+
 ## 5. Create a Node Setup Code
 
 After the public origin is configured, create one single-use code with the node's intended public
@@ -145,10 +162,12 @@ The `create-account`, `create-node`, and `create-connect-code` commands accept a
 `--idempotency-key` for exact operational retries. Connect consumes only the returned setup code;
 the friend does not select or configure nodes manually.
 
-## 7. Remaining Product Stages
+## 7. Acceptance Status
 
-The next product stages build on this running controller:
+The local product path has been exercised end to end with the pinned Xray 26.3.27 runtime:
 
-1. Install the signed Node Host package on a separate Mac and confirm the same one-code path.
-2. Activate Connect with one account setup code and automatically receive the node list.
-3. Prove a real client connection through the complete installed path.
+1. Node Host applies a signed desired-state revision and publishes the managed endpoint.
+2. Connect activates from one account setup code and automatically receives its assigned nodes.
+3. Both HTTP and SOCKS client traffic traverse the REALITY path and exit through the relay VPS.
+
+Release acceptance still requires signed packages on a clean macOS build host and a Windows runner.

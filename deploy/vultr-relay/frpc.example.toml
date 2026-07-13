@@ -1,0 +1,28 @@
+serverAddr = "VPS_PUBLIC_IPV4"
+serverPort = 7000
+loginFailExit = false
+
+auth.method = "token"
+auth.tokenSource.type = "file"
+auth.tokenSource.file.path = "/opt/homebrew/etc/frp/token"
+
+transport.tls.enable = true
+transport.wireProtocol = "v2"
+
+log.to = "console"
+log.level = "info"
+log.maxDays = 7
+
+[[proxies]]
+name = "home-managed-node-443"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 10443
+remotePort = 443
+
+[[proxies]]
+name = "home-control-service"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8787
+remotePort = 18080

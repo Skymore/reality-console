@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Reality Client",
+  "productName": "Private Network Connect",
   "version": "0.1.0",
   "identifier": "com.sky.realityclient",
   "build": {
@@ -13,11 +13,11 @@
     "windows": [
       {
         "label": "main",
-        "title": "Reality Client",
-        "width": 760,
-        "height": 560,
-        "minWidth": 620,
-        "minHeight": 480
+        "title": "Private Network Connect",
+        "width": 880,
+        "height": 650,
+        "minWidth": 680,
+        "minHeight": 540
       }
     ],
     "security": {

@@ -48,11 +48,59 @@ class ControlServiceProductTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(path.read_text())["schemaVersion"], 1)
 
+    def test_config_upgrade_preserves_existing_operator_settings_by_default(self):
+        existing = control.build_config(
+            self.root,
+            "127.0.0.1:9876",
+            "https://control.example.test:8443",
+            "Existing Friends",
+            self.xray,
+            None,
+            "local-tcp",
+        )
+        upgraded = control.build_config(
+            self.root,
+            None,
+            None,
+            None,
+            self.xray,
+            existing,
+        )
+        self.assertEqual(upgraded["bindAddress"], existing["bindAddress"])
+        self.assertEqual(upgraded["publicOrigin"], existing["publicOrigin"])
+        self.assertEqual(upgraded["networkName"], existing["networkName"])
+        self.assertEqual(upgraded["probeMode"], "local-tcp")
+        self.assertEqual(upgraded["bootstrapToken"], existing["bootstrapToken"])
+
     def test_public_http_and_non_loopback_binding_are_rejected(self):
         with self.assertRaisesRegex(control.ProductError, "loopback"):
             control.validate_bind("0.0.0.0:8787")
         with self.assertRaisesRegex(control.ProductError, "HTTPS"):
             control.validate_origin("http://control.example.test")
+
+    def test_remote_probe_requires_https_endpoint_and_private_token_file(self):
+        token = self.root / "probe-token"
+        token.write_text("p" * 48)
+        token.chmod(0o600)
+        self.assertEqual(
+            control.probe_config(
+                "remote-http",
+                "https://probe.example.test/v1/tcp-probe",
+                token,
+                None,
+            ),
+            ("remote-http", "https://probe.example.test/v1/tcp-probe", "p" * 48),
+        )
+        token.chmod(0o644)
+        with self.assertRaisesRegex(control.ProductError, "owner-only"):
+            control.probe_config(
+                "remote-http",
+                "https://probe.example.test/v1/tcp-probe",
+                token,
+                None,
+            )
+        with self.assertRaisesRegex(control.ProductError, "requires"):
+            control.probe_config("remote-http", None, None, None)
 
     def test_launch_agent_contains_no_admin_token(self):
         binary = self.root / "control-server"

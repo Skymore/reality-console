@@ -44,6 +44,18 @@
         "archiveSha256": "d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad",
         "binary": "xray.exe",
         "binarySha256": "15c2d007954ac53ba69b80ec91242786b3c0b71d52649165b4ca1d5cc96ef8f1"
+      },
+      "x86_64-unknown-linux-gnu": {
+        "archive": "Xray-linux-64.zip",
+        "archiveSha256": "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae",
+        "binary": "xray",
+        "binarySha256": "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed"
+      },
+      "aarch64-unknown-linux-gnu": {
+        "archive": "Xray-linux-arm64-v8a.zip",
+        "archiveSha256": "4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c",
+        "binary": "xray",
+        "binarySha256": "c2d20a7045250497083afea0d79db0672f6c89a25aaaf37c92de034d6b764b04"
       }
     }
   },

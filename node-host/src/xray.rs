@@ -98,10 +98,13 @@ pub async fn configure_xray(
     let pin_changed = existing.as_ref().is_some_and(|stored| {
         stored.binary_path != binary_path || stored.expected_sha256 != expected_sha256
     });
+    let digest_changed = existing
+        .as_ref()
+        .is_some_and(|stored| stored.expected_sha256 != expected_sha256);
     if pin_changed && !replace {
         bail!("Xray runtime is already configured; use --replace to change the pinned binary");
     }
-    if pin_changed {
+    if digest_changed {
         let validated_configs: i64 =
             connection.query_row("SELECT COUNT(*) FROM rendered_xray_configs", [], |row| {
                 row.get(0)

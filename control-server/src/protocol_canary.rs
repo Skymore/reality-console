@@ -275,7 +275,7 @@ async fn execute_xray_canary(
         .port();
     drop(listener);
     let mut config_file =
-        NamedTempFile::new().map_err(|_| ProtocolCanaryErrorCode::ClientStartFailed)?;
+        canary_config_file().map_err(|_| ProtocolCanaryErrorCode::ClientStartFailed)?;
     set_owner_only(config_file.path()).map_err(|_| ProtocolCanaryErrorCode::ClientStartFailed)?;
     let client_config = xray_client_config(job, local_port);
     serde_json::to_writer(config_file.as_file_mut(), &client_config)
@@ -302,6 +302,13 @@ async fn execute_xray_canary(
     result.map(|()| started.elapsed())
 }
 
+fn canary_config_file() -> std::io::Result<NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix("private-network-canary-")
+        .suffix(".json")
+        .tempfile()
+}
+
 fn xray_client_config(job: &ProtocolCanaryJob, local_port: u16) -> serde_json::Value {
     json!({
         "log": { "loglevel": "none" },
@@ -323,7 +330,7 @@ fn xray_client_config(job: &ProtocolCanaryJob, local_port: u16) -> serde_json::V
                 }]
             }]},
             "streamSettings": {
-                "network": "tcp",
+                "network": "raw",
                 "security": "reality",
                 "realitySettings": {
                     "serverName": job.server_name,
@@ -487,9 +494,55 @@ pub enum CanaryServiceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{socks_connect, ProtocolCanaryErrorCode};
+    use super::{
+        canary_config_file, socks_connect, xray_client_config, ProtocolCanaryErrorCode,
+        ProtocolCanaryJob,
+    };
+    use control_protocol::id::{EndpointId, NetworkId, NodeId, Revision};
+    use control_protocol::secret::Secret;
+    use std::net::{IpAddr, Ipv4Addr};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    #[test]
+    fn canary_config_file_has_an_explicit_json_format() {
+        let file = canary_config_file().unwrap();
+        assert_eq!(
+            file.path().extension().and_then(|value| value.to_str()),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn canary_uses_current_xray_raw_transport_name() {
+        let config = xray_client_config(
+            &ProtocolCanaryJob {
+                probe_id: Uuid::new_v4(),
+                runner_id: Uuid::new_v4(),
+                network_id: NetworkId::new(),
+                node_id: NodeId::new(),
+                endpoint_id: EndpointId::new(),
+                address: "203.0.113.10".to_string(),
+                resolved_address: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+                port: 443,
+                applied_revision: Revision::new(1).unwrap(),
+                candidate_generation: 1,
+                claim_expires_at: 1,
+                claim_token: Secret::new([0; 32]),
+                vless_uuid: Secret::new(Uuid::new_v4().to_string()),
+                server_name: "example.com".to_string(),
+                reality_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                reality_short_id: "0123456789abcdef".to_string(),
+            },
+            10_808,
+        );
+
+        assert_eq!(
+            config.pointer("/outbounds/0/streamSettings/network"),
+            Some(&serde_json::Value::String("raw".to_string()))
+        );
+    }
 
     #[tokio::test]
     async fn socks_success_requires_a_complete_connect_reply() {
