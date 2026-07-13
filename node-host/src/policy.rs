@@ -343,6 +343,58 @@ pub fn clear_manual_endpoint(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Carries an unexpired provider-approved endpoint to a new applied revision
+/// only when the forwarding target remains the same local port. The original
+/// expiry is preserved and a new endpoint identity forces protocol rechecking.
+pub(crate) fn carry_manual_endpoint_forward(
+    data_dir: &Path,
+    applied_revision: Revision,
+    forwarded_local_port: u16,
+) -> Result<bool> {
+    if forwarded_local_port == 0 {
+        bail!("manual forwarding local port must be non-zero");
+    }
+    let mut connection = open_database(data_dir, false)?;
+    migrate(&mut connection)?;
+    let now = unix_timestamp()?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing: Option<(i64, i64, i64)> = transaction
+        .query_row(
+            "SELECT forwarded_local_port, applied_revision, expires_at
+             FROM provider_manual_endpoint WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((stored_port, stored_revision, expires_at)) = existing else {
+        return Ok(false);
+    };
+    if stored_revision == applied_revision.get()
+        || stored_port != i64::from(forwarded_local_port)
+        || expires_at <= now
+    {
+        return Ok(false);
+    }
+    let updated = transaction.execute(
+        "UPDATE provider_manual_endpoint
+         SET endpoint_id = ?1, applied_revision = ?2, observed_at = ?3
+         WHERE singleton = 1 AND applied_revision = ?4
+           AND forwarded_local_port = ?5 AND expires_at > ?3",
+        params![
+            EndpointId::new().to_string(),
+            applied_revision.get(),
+            now,
+            stored_revision,
+            forwarded_local_port,
+        ],
+    )?;
+    if updated != 1 {
+        bail!("manual endpoint changed during revision carry-forward");
+    }
+    transaction.commit()?;
+    Ok(true)
+}
+
 pub(crate) fn evaluate(data_dir: &Path) -> Result<ProviderPolicyStatus> {
     let mut connection = open_database(data_dir, false)?;
     migrate(&mut connection)?;
@@ -720,9 +772,10 @@ const fn next_weekday(day: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        admission_forward_port, allows_advertising, evaluate_and_checkpoint, load_manual_candidate,
-        pause_provider, record_usage_delta_in_transaction, resume_provider, ProviderAvailability,
-        ProviderPolicy, WeeklyScheduleWindow,
+        admission_forward_port, allows_advertising, carry_manual_endpoint_forward,
+        evaluate_and_checkpoint, load_manual_candidate, pause_provider,
+        record_usage_delta_in_transaction, resume_provider, ProviderAvailability, ProviderPolicy,
+        WeeklyScheduleWindow,
     };
     use crate::{initialize, migrate, open_database, xray::ValidatedXrayCandidate};
     use control_protocol::crypto::Sha256Digest;
@@ -879,22 +932,25 @@ mod tests {
         initialize(directory.path(), "https://controller.example").unwrap();
         let connection = open_database(directory.path(), false).unwrap();
         let revision = Revision::new(7).unwrap();
-        connection
-            .execute(
-                "INSERT INTO desired_state_artifacts(
+        let next_revision = Revision::new(8).unwrap();
+        for desired_revision in [revision, next_revision] {
+            connection
+                .execute(
+                    "INSERT INTO desired_state_artifacts(
                     revision, network_id, node_id, controller_instance_id, signing_key_id,
                     envelope_json, envelope_digest, transcript_digest, received_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?6, ?6, 1)",
-                params![
-                    revision.get(),
-                    uuid::Uuid::new_v4().to_string(),
-                    uuid::Uuid::new_v4().to_string(),
-                    uuid::Uuid::new_v4().to_string(),
-                    uuid::Uuid::new_v4().to_string(),
-                    format!("sha256:{}", "0".repeat(64)),
-                ],
-            )
-            .unwrap();
+                    params![
+                        desired_revision.get(),
+                        uuid::Uuid::new_v4().to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        format!("sha256:{}", "0".repeat(64)),
+                    ],
+                )
+                .unwrap();
+        }
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         connection
             .execute(
@@ -913,11 +969,20 @@ mod tests {
             candidate.expires_at.unwrap().as_datetime().unix_timestamp(),
             now + 60
         );
-        assert!(
-            load_manual_candidate(&connection, Revision::new(8).unwrap())
-                .unwrap()
-                .is_none()
+        assert!(load_manual_candidate(&connection, next_revision)
+            .unwrap()
+            .is_none());
+        let first_endpoint_id = candidate.endpoint_id;
+        assert!(carry_manual_endpoint_forward(directory.path(), next_revision, 8443).unwrap());
+        let carried = load_manual_candidate(&connection, next_revision)
+            .unwrap()
+            .unwrap();
+        assert_ne!(carried.endpoint_id, first_endpoint_id);
+        assert_eq!(
+            carried.expires_at.unwrap().as_datetime().unix_timestamp(),
+            now + 60
         );
+        assert!(!carry_manual_endpoint_forward(directory.path(), next_revision, 8443).unwrap());
         pause_provider(directory.path()).unwrap();
         assert!(!allows_advertising(&connection).unwrap());
         assert!(load_manual_candidate(&connection, revision)

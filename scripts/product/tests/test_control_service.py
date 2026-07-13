@@ -181,6 +181,45 @@ class ControlServiceProductTests(unittest.TestCase):
         self.assertEqual(sent.headers["Idempotency-key"], "retry-key")
         self.assertEqual(json.loads(sent.data), {"displayName": "Friend"})
 
+    def test_admin_request_accepts_no_content_response(self):
+        config = {"bindAddress": "127.0.0.1:8787", "bootstrapToken": "secret-token"}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def read():
+                return b""
+
+        with patch.object(control, "urlopen", return_value=Response()):
+            self.assertIsNone(
+                control.admin_request(
+                    config,
+                    "POST",
+                    "/v1/admin/nodes/00000000-0000-4000-8000-000000000001/revoke",
+                )
+            )
+
+    def test_node_status_uses_closed_lifecycle_endpoint(self):
+        args = type("Args", (), {
+            "data_dir": self.root,
+            "node_id": "00000000-0000-4000-8000-000000000001",
+            "status": "revoke",
+        })()
+        with patch.object(control, "load_config", return_value={"config": True}), \
+             patch.object(control, "admin_request", return_value=None) as request, \
+             patch("builtins.print"):
+            control.set_node_status(args)
+        request.assert_called_once_with(
+            {"config": True},
+            "POST",
+            "/v1/admin/nodes/00000000-0000-4000-8000-000000000001/revoke",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

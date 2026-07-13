@@ -20,7 +20,8 @@ BASE="$WORK/Private Network Node"
 service_pid=$!
 
 /usr/bin/sed \
-  "s|^BASE=.*$|BASE=\"$BASE\"|" \
+  -e "s|^BASE=.*$|BASE=\"$BASE\"|" \
+  -e 's|/usr/sbin/pkgutil --pkg-info com.sky.realitynode.pkg|/usr/bin/true|' \
   "$ROOT/packaging/macos/pkg-scripts/preinstall" > "$WORK/preinstall"
 /bin/sh "$WORK/preinstall"
 
@@ -29,6 +30,15 @@ payload_status=73
 [ "$payload_status" -ne 0 ]
 /bin/kill -0 "$service_pid"
 [ "$(/bin/cat "$BASE/.previous-release")" = releases/previous ]
+
+# A failed first install can leave payload files without a package receipt.
+# Such a partial candidate must never be selected as a rollback release.
+/usr/bin/sed \
+  -e "s|^BASE=.*$|BASE=\"$BASE\"|" \
+  -e 's|/usr/sbin/pkgutil --pkg-info com.sky.realitynode.pkg|/usr/bin/false|' \
+  "$ROOT/packaging/macos/pkg-scripts/preinstall" > "$WORK/preinstall-no-receipt"
+/bin/sh "$WORK/preinstall-no-receipt"
+[ ! -e "$BASE/.previous-release" ]
 
 if /usr/bin/grep -q 'launchctl\|bootout' "$ROOT/packaging/macos/pkg-scripts/preinstall"; then
   echo "preinstall still controls the running service" >&2

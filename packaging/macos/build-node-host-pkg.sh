@@ -40,7 +40,9 @@ if [ "${REQUIRE_SIGNING:-0}" = 1 ]; then
   /usr/bin/codesign --verify --strict --verbose=2 "$XRAY"
 fi
 mkdir -p "$PAYLOAD/Applications" "$BASE/bin" "$BASE/releases/$VERSION" "$PAYLOAD/Library/LaunchDaemons" "$PKG_SCRIPTS" "$OUTPUT"
-cp -R "$APP" "$PAYLOAD/Applications/Private Network Node.app"
+# Copy the signed bundle without host-local xattrs. Those attributes are not
+# part of the code signature and pkgbuild would encode them as AppleDouble files.
+/usr/bin/ditto --norsrc --noextattr --noacl --noqtn "$APP" "$PAYLOAD/Applications/Private Network Node.app"
 install -m 755 "$AGENT" "$BASE/releases/$VERSION/node-host"
 install -m 755 "$XRAY" "$BASE/releases/$VERSION/xray"
 install -m 644 "$WORK/sidecars.json" "$BASE/releases/$VERSION/sidecars.json"
@@ -58,8 +60,9 @@ install -m 644 "$ROOT/packaging/macos/com.sky.realitynode.agent.plist" "$PAYLOAD
 # pkgbuild archives the tree. Release packages carry only normal files and the
 # embedded Mach-O signatures, never host-local metadata sidecars.
 /usr/bin/xattr -cr "$PAYLOAD"
-if /usr/bin/xattr -lr "$PAYLOAD" 2>/dev/null | /usr/bin/grep -q 'com\.apple\.provenance:'; then
-  echo "build host retains protected com.apple.provenance metadata; refusing a polluted package" >&2
+provenance_paths=$(/usr/bin/xattr -lr "$PAYLOAD" 2>/dev/null | /usr/bin/sed -n 's/: com\.apple\.provenance:.*//p')
+if [ -n "$provenance_paths" ]; then
+  printf 'build host retains protected com.apple.provenance metadata; refusing a polluted package:\n%s\n' "$provenance_paths" >&2
   exit 65
 fi
 if /usr/bin/find "$PAYLOAD" -name '._*' -print -quit | /usr/bin/grep -q .; then

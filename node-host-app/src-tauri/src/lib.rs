@@ -14,7 +14,10 @@ use uuid::Uuid;
 const SERVICE_LABEL: &str = "com.sky.realitynode.agent";
 const AGENT_PATH: &str = "/Library/Application Support/Private Network Node/current/node-host";
 const SERVICE_PATH: &str = "/Library/LaunchDaemons/com.sky.realitynode.agent.plist";
-const STATE_PATH: &str = "/Library/Application Support/Private Network Node/service-state/state";
+// The service owns the child state directory with mode 0700. The UI can safely
+// verify only the root-owned container; live state comes from the authenticated socket.
+const STATE_CONTAINER_PATH: &str =
+    "/Library/Application Support/Private Network Node/service-state";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,7 +133,7 @@ async fn node_system_package_status() -> Result<SystemPackageStatus, String> {
         system_package_status_with(
             &PathBuf::from(AGENT_PATH),
             &PathBuf::from(SERVICE_PATH),
-            &PathBuf::from(STATE_PATH),
+            &PathBuf::from(STATE_CONTAINER_PATH),
             loaded,
         )
     })
@@ -352,5 +355,13 @@ mod tests {
         assert_eq!(status.service_definition, Presence::Present);
         assert_eq!(status.service_registration, Presence::Present);
         assert_eq!(status.state_directory, Presence::Present);
+    }
+
+    #[test]
+    fn package_status_probes_only_the_inspectable_state_container() {
+        assert_eq!(
+            STATE_CONTAINER_PATH,
+            "/Library/Application Support/Private Network Node/service-state"
+        );
     }
 }

@@ -411,7 +411,8 @@ def admin_request(
     request = Request(f"{origin}{path}", data=data, headers=headers, method=method)
     try:
         with urlopen(request, timeout=10) as response:
-            return json.loads(response.read())
+            payload = response.read()
+            return json.loads(payload) if payload else None
     except HTTPError as error:
         raise ProductError(f"Control Service rejected the request with HTTP {error.code}") from error
     except (URLError, TimeoutError) as error:
@@ -451,6 +452,16 @@ def create_node(args: argparse.Namespace) -> None:
 def nodes(args: argparse.Namespace) -> None:
     config = load_config(args.data_dir)
     print(json.dumps(admin_request(config, "GET", "/v1/admin/nodes"), indent=2))
+
+
+def set_node_status(args: argparse.Namespace) -> None:
+    config = load_config(args.data_dir)
+    admin_request(
+        config,
+        "POST",
+        f"/v1/admin/nodes/{args.node_id}/{args.status}",
+    )
+    print(json.dumps({"nodeId": args.node_id, "status": args.status}, indent=2))
 
 
 def create_account(args: argparse.Namespace) -> None:
@@ -536,6 +547,10 @@ def parser() -> argparse.ArgumentParser:
     create_node_parser.add_argument("--idempotency-key")
     nodes_parser = commands.add_parser("nodes")
     nodes_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    node_status_parser = commands.add_parser("set-node-status")
+    node_status_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    node_status_parser.add_argument("--node-id", required=True)
+    node_status_parser.add_argument("--status", choices=("approve", "disable", "revoke"), required=True)
     create_account_parser = commands.add_parser("create-account")
     create_account_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
     create_account_parser.add_argument("--display-name", required=True)
@@ -575,6 +590,8 @@ def main() -> int:
             create_node(args)
         elif args.command == "nodes":
             nodes(args)
+        elif args.command == "set-node-status":
+            set_node_status(args)
         elif args.command == "create-account":
             create_account(args)
         elif args.command == "accounts":

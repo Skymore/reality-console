@@ -1143,7 +1143,15 @@ fn remove_stale_socket(paths: &SystemServicePaths) -> Result<()> {
 }
 
 async fn read_frame(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>> {
-    let length = timeout(FRAME_IO_TIMEOUT, stream.read_u32())
+    read_frame_with_timeout(stream, limit, FRAME_IO_TIMEOUT).await
+}
+
+async fn read_frame_with_timeout(
+    stream: &mut UnixStream,
+    limit: usize,
+    io_timeout: Duration,
+) -> Result<Vec<u8>> {
+    let length = timeout(io_timeout, stream.read_u32())
         .await
         .context("system setup frame header timed out")??;
     let length = usize::try_from(length)?;
@@ -1151,7 +1159,7 @@ async fn read_frame(stream: &mut UnixStream, limit: usize) -> Result<Vec<u8>> {
         bail!("system setup frame length is invalid");
     }
     let mut bytes = vec![0_u8; length];
-    timeout(FRAME_IO_TIMEOUT, stream.read_exact(&mut bytes))
+    timeout(io_timeout, stream.read_exact(&mut bytes))
         .await
         .context("system setup frame body timed out")??;
     Ok(bytes)
@@ -1228,7 +1236,7 @@ impl SystemServiceClient {
         write_result?;
         let response_bytes = timeout(
             OPERATION_TIMEOUT,
-            read_frame(&mut stream, MAX_SYSTEM_RESPONSE_BYTES),
+            read_frame_with_timeout(&mut stream, MAX_SYSTEM_RESPONSE_BYTES, OPERATION_TIMEOUT),
         )
         .await
         .context("system setup operation timed out")??;
@@ -1408,6 +1416,19 @@ mod tests {
         }
     }
 
+    struct DelayedHandler(Duration);
+
+    #[async_trait]
+    impl SystemSetupHandler for DelayedHandler {
+        async fn handle(&self, request: SystemSetupRequest) -> SystemSetupResponse {
+            tokio::time::sleep(self.0).await;
+            SystemSetupResponse::success(
+                request.request_id,
+                SystemSetupResult::ManualEndpointCleared {},
+            )
+        }
+    }
+
     fn make_socket_directory(paths: &SystemServicePaths) {
         fs::create_dir(&paths.socket_dir).unwrap();
         fs::set_permissions(
@@ -1468,6 +1489,40 @@ mod tests {
             assert_eq!(response.request_id, request.request_id);
         }
         assert_eq!(handler.0.load(Ordering::SeqCst), 1);
+        shutdown.cancel();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_waits_past_frame_timeout_for_a_long_running_operation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = SystemServicePaths::for_test(temporary.path());
+        make_socket_directory(&paths);
+        let shutdown = CancellationToken::new();
+        let server = tokio::spawn(serve_system_setup_socket(
+            paths.clone(),
+            Arc::new(AllowUid(paths.expected_service_uid)),
+            Arc::new(DelayedHandler(
+                FRAME_IO_TIMEOUT + Duration::from_millis(100),
+            )),
+            shutdown.clone(),
+        ));
+        for _ in 0..20 {
+            if paths.socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = SystemServiceClient::with_paths(paths)
+            .request(SystemSetupOperation::ClearManualEndpoint {})
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.outcome,
+            SystemSetupOutcome::Success { result }
+                if matches!(*result, SystemSetupResult::ManualEndpointCleared {})
+        ));
         shutdown.cancel();
         server.await.unwrap().unwrap();
     }
@@ -1917,6 +1972,9 @@ mod tests {
         assert!(postinstall.contains(
             "/usr/bin/sudo -u _privnetnode \"$BASE/current/node-host\" migrate-system-layout"
         ));
+        assert!(postinstall.contains("[ \"$service_shell\" = /usr/bin/false ]"));
+        assert!(postinstall.contains("[ \"$service_home\" = /var/empty ]"));
+        assert!(postinstall.contains("[ \"$service_hidden\" = 1 ]"));
     }
 
     #[test]

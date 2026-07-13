@@ -450,6 +450,7 @@ async fn run_cycle(data_dir: &Path, runtime: &mut ManagedRuntime) -> Result<()> 
     // is temporarily unavailable after a service restart.
     runtime.xray.reconcile(data_dir).await?;
     let target = runtime.xray.router_mapping_target()?;
+    carry_manual_endpoint_for_target(data_dir, target)?;
     let mapping_error = runtime.direct.reconcile(data_dir, target).await.err();
     let relay_target = consented_relay_target(data_dir, target);
     let relay_error = runtime.relay.reconcile(data_dir, relay_target).await.err();
@@ -499,6 +500,7 @@ async fn run_cycle(data_dir: &Path, runtime: &mut ManagedRuntime) -> Result<()> 
     }
     runtime.xray.reconcile(data_dir).await?;
     let target = runtime.xray.router_mapping_target()?;
+    carry_manual_endpoint_for_target(data_dir, target)?;
     if let Err(error) = runtime.direct.reconcile(data_dir, target).await {
         tracing::warn!(error = %error, "direct mapping reconciliation failed after sync");
     }
@@ -511,6 +513,20 @@ async fn run_cycle(data_dir: &Path, runtime: &mut ManagedRuntime) -> Result<()> 
     }
     if let Some(error) = relay_error {
         tracing::warn!(error = %error, "relay failed independently of direct mapping and heartbeat");
+    }
+    Ok(())
+}
+
+fn carry_manual_endpoint_for_target(
+    data_dir: &Path,
+    target: Option<crate::mapping::MappingTarget>,
+) -> Result<()> {
+    if let Some(target) = target {
+        crate::policy::carry_manual_endpoint_forward(
+            data_dir,
+            target.revision,
+            target.internal_port,
+        )?;
     }
     Ok(())
 }

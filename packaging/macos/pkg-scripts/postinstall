@@ -80,9 +80,12 @@ user_group_id=$(/usr/bin/dscl . -read /Users/_privnetnode PrimaryGroupID | /usr/
 service_uid=$(/usr/bin/dscl . -read /Users/_privnetnode UniqueID | /usr/bin/awk '{print $2}')
 case "$service_uid" in *[!0-9]*|'') echo "_privnetnode user ID is invalid" >&2; exit 70 ;; esac
 [ "$service_uid" -gt 0 ] && [ "$service_uid" -lt 500 ] || { echo "_privnetnode user is not a system account" >&2; exit 70; }
-/usr/bin/dscl . -create /Users/_privnetnode UserShell /usr/bin/false
-/usr/bin/dscl . -create /Users/_privnetnode NFSHomeDirectory /var/empty
-/usr/bin/dscl . -create /Users/_privnetnode IsHidden 1
+service_shell=$(/usr/bin/dscl . -read /Users/_privnetnode UserShell | /usr/bin/awk '{print $2}')
+service_home=$(/usr/bin/dscl . -read /Users/_privnetnode NFSHomeDirectory | /usr/bin/awk '{print $2}')
+service_hidden=$(/usr/bin/dscl . -read /Users/_privnetnode IsHidden | /usr/bin/awk '{print $2}')
+[ "$service_shell" = /usr/bin/false ] || { echo "_privnetnode has an unsafe login shell" >&2; exit 70; }
+[ "$service_home" = /var/empty ] || { echo "_privnetnode has an unsafe home directory" >&2; exit 70; }
+[ "$service_hidden" = 1 ] || { echo "_privnetnode is not hidden" >&2; exit 70; }
 
 for directory in "$SERVICE_STATE" "$LEGACY_STATE" "$LEGACY_IDENTITY" \
                  "$LEGACY_DEFAULT_IDENTITY" "$RUNTIME" "$LOGS"; do
@@ -134,7 +137,7 @@ fi
 /usr/bin/codesign --verify --deep --strict --verbose=2 "/Applications/Private Network Node.app"
 /usr/bin/codesign --verify --strict --verbose=2 "$BASE/current/node-host"
 /usr/bin/codesign --verify --strict --verbose=2 "$BASE/current/xray"
-/usr/bin/test -f "$BASE/current/sidecars.json"
+/bin/test -f "$BASE/current/sidecars.json"
 /usr/bin/sudo -u _privnetnode "$BASE/current/node-host" migrate-system-layout
 /usr/sbin/chown root:_privnetnode "$RUNTIME"
 /bin/chmod 775 "$RUNTIME"

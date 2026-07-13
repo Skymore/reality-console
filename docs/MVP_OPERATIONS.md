@@ -126,6 +126,11 @@ List controller-visible node status with:
 
 ```bash
 python3 scripts/product/control-service.py nodes
+
+# Disable temporarily, approve a pending node, or permanently revoke one.
+python3 scripts/product/control-service.py set-node-status \
+  --node-id NODE_ID \
+  --status revoke
 ```
 
 ## 6. Create a Friend Account

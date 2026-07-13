@@ -128,6 +128,11 @@ Its closed subcommands mirror status, setup, policy, pause/resume, manual endpoi
 Setup invitation bytes are accepted only on stdin; there is no invitation argument, arbitrary RPC,
 path mutation, shell, or raw Xray configuration option.
 
+A finite manual endpoint remains provider-owned. When a later signed revision keeps the same local
+forwarding port, Node Host carries the unexpired approval forward with a new endpoint ID and requires
+the controller probe to verify it again. A port change or expiry still withdraws the endpoint and
+requires explicit reconfiguration; automatic carry-forward never extends the provider's TTL.
+
 The status response includes only safe acceptance evidence: current service-instance ID, runtime
 and setup phases, direct/relay protocol-verification states, and whether the relay is registered.
 Endpoint IDs, addresses, credentials, generated configuration, and invitation material remain

@@ -3,7 +3,7 @@ set -eu
 
 BASE="/Library/Application Support/Private Network Node"
 /bin/rm -f "$BASE/.previous-release"
-if [ -L "$BASE/current" ]; then
+if /usr/sbin/pkgutil --pkg-info com.sky.realitynode.pkg >/dev/null 2>&1 && [ -L "$BASE/current" ]; then
   previous=$(readlink "$BASE/current")
   case "$previous" in
     releases/*) printf '%s\n' "$previous" > "$BASE/.previous-release" ;;
