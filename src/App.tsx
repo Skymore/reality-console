@@ -323,10 +323,10 @@ function App() {
   }
 
   return (
-    <div className="relative min-h-screen overflow-hidden bg-background text-foreground">
+    <div className="relative h-screen min-h-0 overflow-hidden bg-background text-foreground">
       <div className="pointer-events-none fixed inset-0 opacity-45 [background-image:linear-gradient(to_right,rgb(39_38_34/0.035)_1px,transparent_1px),linear-gradient(to_bottom,rgb(39_38_34/0.035)_1px,transparent_1px)] [background-size:28px_28px]" />
-      <div className="relative flex min-h-screen flex-col lg:flex-row">
-        <aside className="flex shrink-0 flex-col border-b border-border/70 bg-sidebar/86 backdrop-blur-xl lg:w-56 lg:border-r lg:border-b-0">
+      <div className="relative flex h-full min-h-0">
+        <aside className="flex h-full w-56 shrink-0 flex-col border-r border-border/70 bg-sidebar/86 backdrop-blur-xl">
           <div
             className="flex h-20 items-center gap-3 px-5 select-none"
             onMouseDown={(event) => {
@@ -348,7 +348,7 @@ function App() {
             </div>
           </div>
 
-          <nav className="flex gap-1 overflow-x-auto px-3 pb-3 lg:flex-col lg:pb-0">
+          <nav className="flex min-h-0 flex-col gap-1 overflow-y-auto px-3 pb-3">
             {navItems.map((item) => {
               const Icon = item.icon
               return (
@@ -357,7 +357,7 @@ function App() {
                   type="button"
                   onClick={() => setPage(item.id)}
                   className={cn(
-                    "flex min-w-max items-center gap-2 rounded-xl px-3 py-2 text-sm transition-colors lg:w-full",
+                    "flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm transition-colors",
                     page === item.id
                       ? "bg-foreground text-background shadow-sm"
                       : "text-muted-foreground hover:bg-muted hover:text-foreground",
@@ -370,7 +370,7 @@ function App() {
             })}
           </nav>
 
-          <div className="mt-auto hidden p-4 lg:block">
+          <div className="mt-auto p-4">
             <div className="rounded-2xl border border-border/70 bg-background/70 p-3">
               <div className="flex items-center gap-2 text-xs font-medium">
                 <span className={cn("size-2 rounded-full", control.healthy ? "bg-emerald-500" : "bg-amber-500")} />
@@ -383,9 +383,9 @@ function App() {
           </div>
         </aside>
 
-        <main className="min-w-0 flex-1">
+        <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <header
-            className="flex min-h-24 items-center justify-between border-b border-border/60 px-5 py-5 select-none lg:px-8"
+            className="flex h-24 shrink-0 items-center justify-between gap-6 border-b border-border/60 px-8 py-5 select-none"
             onMouseDown={(event) => {
               if (event.button !== 0 || event.detail !== 1 || (event.target as HTMLElement).closest("button,input")) return
               event.preventDefault()
@@ -396,14 +396,14 @@ function App() {
               void getCurrentWindow().toggleMaximize()
             }}
           >
-            <div>
+            <div className="min-w-0">
               <p className="text-[11px] font-semibold tracking-[0.18em] text-primary uppercase">
                 {control.network?.displayName ?? "Private Network"}
               </p>
               <h1 className="mt-1 font-heading text-3xl leading-none lg:text-4xl">{pageCopy[0]}</h1>
               <p className="mt-2 max-w-2xl text-sm text-muted-foreground">{pageCopy[1]}</p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               <Button variant="outline" size="icon" onClick={toggleLanguage} aria-label="Toggle language">
                 <Languages />
               </Button>
@@ -420,8 +420,8 @@ function App() {
             </div>
           </header>
 
-          <ScrollArea className="h-[calc(100vh-6rem)]">
-            <div className="mx-auto max-w-6xl space-y-4 p-5 pb-12 lg:p-8">
+          <ScrollArea className="min-h-0 flex-1 overscroll-contain">
+            <div className="mx-auto max-w-6xl space-y-4 p-8 pb-12">
               {error ? <Banner tone="danger" text={error} /> : null}
               {control.error && !error ? <Banner tone="warning" text={control.error} /> : null}
               {notice ? <Banner tone="neutral" text={notice} /> : null}
@@ -627,9 +627,9 @@ function NodeCard({ node, language, onAction }: { node: ControlNode; language: "
           <TinyMetric label={language === "zh" ? "配置" : "Revision"} value={node.revisions.appliedRevision != null ? `r${node.revisions.appliedRevision}` : "—"} />
           <TinyMetric label={language === "zh" ? "同步" : "Sync"} value={synced ? (language === "zh" ? "完成" : "Ready") : (language === "zh" ? "等待" : "Pending")} />
         </div>
-        <div className="mt-4 flex items-center justify-between border-t border-border/60 pt-4">
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border/60 pt-4">
           <p className="text-xs text-muted-foreground">{language === "zh" ? "最后在线" : "Last seen"} · {relativeTime(node.lastSeenAt, language)}</p>
-          <div className="flex gap-1">
+          <div className="ml-auto flex flex-wrap justify-end gap-1">
             {node.status === "pending" ? <Button size="sm" onClick={() => onAction(node, "approve")}><Check />{language === "zh" ? "批准" : "Approve"}</Button> : null}
             {node.status === "active" ? <Button variant="outline" size="sm" onClick={() => onAction(node, "disable")}><Pause />{language === "zh" ? "禁用" : "Disable"}</Button> : null}
             {node.status === "disabled" ? <Button variant="outline" size="sm" onClick={() => onAction(node, "approve")}><Play />{language === "zh" ? "启用" : "Enable"}</Button> : null}

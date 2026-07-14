@@ -744,7 +744,27 @@ impl FixedBase64 for X25519PublicKey {
 }
 
 fn vault_error(code: &str) -> ClientError {
-    ClientError::internal(code, "The native device credential store operation failed.")
+    let message = match code {
+        "vault_unavailable" | "vault_read_failed" | "vault_write_failed"
+        | "vault_delete_failed" => native_vault_access_message(),
+        _ => "The saved device credentials are unavailable or invalid.",
+    };
+    ClientError::internal(code, message)
+}
+
+#[cfg(target_os = "macos")]
+const fn native_vault_access_message() -> &'static str {
+    "Connect cannot access macOS Keychain. Unlock your login keychain, then reopen the app."
+}
+
+#[cfg(target_os = "windows")]
+const fn native_vault_access_message() -> &'static str {
+    "Connect cannot access Windows Credential Manager. Unlock Windows, then reopen the app."
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const fn native_vault_access_message() -> &'static str {
+    "Connect cannot access the operating system credential store. Unlock it, then reopen the app."
 }
 
 #[cfg(test)]

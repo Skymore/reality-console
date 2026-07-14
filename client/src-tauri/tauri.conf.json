@@ -16,8 +16,8 @@
         "title": "Private Network Connect",
         "width": 880,
         "height": 650,
-        "minWidth": 680,
-        "minHeight": 540
+        "minWidth": 820,
+        "minHeight": 620
       }
     ],
     "security": {

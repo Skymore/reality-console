@@ -13,8 +13,10 @@
     "windows": [
       {
         "title": "Xray✈️",
-        "width": 800,
-        "height": 600,
+        "width": 1180,
+        "height": 760,
+        "minWidth": 1040,
+        "minHeight": 680,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "acceptFirstMouse": true

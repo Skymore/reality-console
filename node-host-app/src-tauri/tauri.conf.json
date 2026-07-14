@@ -16,8 +16,8 @@
         "title": "Private Network Node",
         "width": 920,
         "height": 680,
-        "minWidth": 720,
-        "minHeight": 560
+        "minWidth": 780,
+        "minHeight": 600
       }
     ],
     "security": {

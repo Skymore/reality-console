@@ -188,7 +188,8 @@ function App() {
         </button>
       </header>
 
-      <section className="hero">
+      <div className="shell-scroll">
+        <section className="hero">
         <div>
           <p className="eyebrow">Share this Mac safely</p>
           <h1>{paired ? statusLabel(status) : "Add this Mac as a node"}</h1>
@@ -203,20 +204,20 @@ function App() {
           <Server size={30} />
           <strong>{paired ? statusLabel(status) : installed ? "Ready" : "Install required"}</strong>
         </div>
-      </section>
+        </section>
 
-      {(error || (installed && serviceError)) && (
-        <div className="notice error"><CircleAlert size={18} /><span>{error ?? serviceError}</span></div>
-      )}
+        {(error || (installed && serviceError)) && (
+          <div className="notice error"><CircleAlert size={18} /><span>{error ?? serviceError}</span></div>
+        )}
 
-      {!installed && pack && (
-        <div className="notice warn">
-          <CircleAlert size={18} />
-          <span>The background service is incomplete. Reinstall the signed Private Network Node package, then refresh.</span>
-        </div>
-      )}
+        {!installed && pack && (
+          <div className="notice warn">
+            <CircleAlert size={18} />
+            <span>The background service is incomplete. Reinstall the signed Private Network Node package, then refresh.</span>
+          </div>
+        )}
 
-      {!paired ? (
+        {!paired ? (
         <section className="setup-card">
           <div className="step-number">01</div>
           {!setup ? (
@@ -265,7 +266,7 @@ function App() {
             </div>
           )}
         </section>
-      ) : (
+        ) : (
         <div className="dashboard-grid">
           <section className="card summary-card">
             <div className="section-heading">
@@ -323,7 +324,8 @@ function App() {
             </button>
           </section>
         </div>
-      )}
+        )}
+      </div>
     </main>
   )
 }
