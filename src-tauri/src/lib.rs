@@ -11,6 +11,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -22,6 +23,8 @@ struct XraySnapshot {
     installed: bool,
     binary_path: Option<String>,
     version: Option<String>,
+    service_manageable: bool,
+    service_manager: Option<String>,
     running: bool,
     pid: Option<u32>,
     config_path: Option<String>,
@@ -135,10 +138,22 @@ struct LoadedConfig {
     link_context: RealityLinkContext,
 }
 
+#[derive(Debug, Default)]
+struct XrayServiceState {
+    manageable: bool,
+    running: bool,
+    pid: Option<u32>,
+}
+
 static PUBLIC_IPV4_CACHE: OnceLock<Mutex<Option<(Instant, String)>>> = OnceLock::new();
 static PUBLIC_KEY_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 static CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const PUBLIC_IPV4_TTL: Duration = Duration::from_secs(5 * 60);
+const HOMEBREW_XRAY_LABEL: &str = "homebrew.mxcl.xray";
+const HOMEBREW_XRAY_PLISTS: &[&str] = &[
+    "/opt/homebrew/opt/xray/homebrew.mxcl.xray.plist",
+    "/usr/local/opt/xray/homebrew.mxcl.xray.plist",
+];
 const RELAY_PUBLIC_IPV4_ENV: &str = "RELAY_PUBLIC_IPV4";
 const RELAY_PUBLIC_IPV4_FILES: &[&str] = &[
     "/opt/homebrew/etc/frp/public-ipv4",
@@ -178,7 +193,10 @@ fn get_xray_snapshot_sync() -> XraySnapshot {
         None
     };
 
-    let (running, pid) = pgrep_status("xray").unwrap_or((false, None));
+    let service_state = homebrew_xray_service_state();
+    if installed && !service_state.manageable {
+        notes.push("Xray is installed, but no manageable Homebrew service was found.".to_string());
+    }
 
     let config_path = detect_config_path();
     let public_ipv4: Option<String> = resolve_public_ipv4().or_else(|| {
@@ -213,8 +231,12 @@ fn get_xray_snapshot_sync() -> XraySnapshot {
         installed,
         binary_path,
         version,
-        running,
-        pid,
+        service_manageable: service_state.manageable,
+        service_manager: service_state
+            .manageable
+            .then(|| "Homebrew services".to_string()),
+        running: service_state.running,
+        pid: service_state.pid,
         config_path,
         public_ipv4,
         lan_ip,
@@ -424,18 +446,51 @@ fn service_action_sync(action: String) -> Result<String, String> {
         return Err(format!("Invalid action: {action}"));
     }
 
+    let before = homebrew_xray_service_state();
+    if !before.manageable {
+        return Err(
+            "The compatibility Xray installation is not managed by Homebrew services.".to_string(),
+        );
+    }
+
     let brew_binary = resolve_required_command_path("brew")?;
     let output = Command::new(&brew_binary)
         .args(["services", action.as_str(), "xray"])
         .output()
         .map_err(|error| format!("Failed to run brew services {action}: {error}"))?;
 
-    if output.status.success() {
-        Ok("ok".to_string())
-    } else {
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(format!("{action} failed: {stderr}"))
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!("{action} failed: {detail}"));
     }
+
+    let expected_running = action != "stop";
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(100));
+        let current = homebrew_xray_service_state();
+        let restarted = action != "restart"
+            || before.pid.is_none()
+            || current.pid.is_some_and(|pid| Some(pid) != before.pid);
+        if current.running == expected_running && restarted {
+            return Ok("ok".to_string());
+        }
+    }
+
+    let current = homebrew_xray_service_state();
+    Err(format!(
+        "Homebrew reported success, but Xray is still {}{}.",
+        if current.running {
+            "running"
+        } else {
+            "stopped"
+        },
+        current
+            .pid
+            .map(|pid| format!(" (PID {pid})"))
+            .unwrap_or_default()
+    ))
 }
 
 #[tauri::command]
@@ -1278,10 +1333,68 @@ fn detect_lan_ip() -> Option<String> {
     command_output("ipconfig", &["getifaddr", interface.as_str()])
 }
 
-fn pgrep_status(process: &str) -> Option<(bool, Option<u32>)> {
-    let output = command_output("pgrep", &["-x", process])?;
-    let pid = output.lines().next()?.trim().parse::<u32>().ok()?;
-    Some((true, Some(pid)))
+fn homebrew_xray_service_state() -> XrayServiceState {
+    let manageable = resolve_command_path("brew").is_some()
+        && HOMEBREW_XRAY_PLISTS
+            .iter()
+            .any(|path| Path::new(path).is_file());
+    if !manageable {
+        return XrayServiceState::default();
+    }
+
+    let uid = Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        });
+    let Some(uid) = uid else {
+        return XrayServiceState {
+            manageable,
+            ..XrayServiceState::default()
+        };
+    };
+
+    let output = Command::new("/bin/launchctl")
+        .args(["print", format!("gui/{uid}/{HOMEBREW_XRAY_LABEL}").as_str()])
+        .output();
+    let Ok(output) = output else {
+        return XrayServiceState {
+            manageable,
+            ..XrayServiceState::default()
+        };
+    };
+    if !output.status.success() {
+        return XrayServiceState {
+            manageable,
+            ..XrayServiceState::default()
+        };
+    }
+
+    let description = String::from_utf8_lossy(&output.stdout);
+    let (running, pid) = parse_launchctl_service(&description);
+    XrayServiceState {
+        manageable,
+        running,
+        pid,
+    }
+}
+
+fn parse_launchctl_service(description: &str) -> (bool, Option<u32>) {
+    let running = description
+        .lines()
+        .any(|line| line.trim() == "state = running");
+    let pid = description.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("pid = ")
+            .and_then(|value| value.parse::<u32>().ok())
+    });
+    (running && pid.is_some(), pid)
 }
 
 fn resolve_required_command_path(program: &str) -> Result<PathBuf, String> {
@@ -1504,6 +1617,22 @@ mod tests {
         assert_eq!(normalize_public_ipv4("203.0.113.10:443"), None);
         assert_eq!(normalize_public_ipv4("not-an-ip"), None);
         assert_eq!(normalize_public_ipv4("2001:db8::1"), None);
+    }
+
+    #[test]
+    fn parses_launchctl_xray_state_without_matching_other_processes() {
+        let running = r#"
+            state = running
+            pid = 56412
+            last exit code = (never exited)
+        "#;
+        assert_eq!(parse_launchctl_service(running), (true, Some(56_412)));
+
+        let stopped = r#"
+            state = waiting
+            last exit code = 0
+        "#;
+        assert_eq!(parse_launchctl_service(stopped), (false, None));
     }
 
     #[test]

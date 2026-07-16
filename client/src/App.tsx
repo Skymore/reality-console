@@ -7,6 +7,7 @@ import {
   Cloud,
   Gauge,
   Globe2,
+  Languages,
   Laptop,
   LoaderCircle,
   LockKeyhole,
@@ -38,32 +39,41 @@ import {
   type SafeNode,
   type SetupSession,
 } from "./api"
+import { connectCopy, initialLocale, type Locale } from "./locale"
 
 function messageOf(reason: unknown) {
   if (reason && typeof reason === "object" && "message" in reason) return String(reason.message)
   return reason instanceof Error ? reason.message : String(reason)
 }
 
-function defaultDeviceName() {
-  const platform = navigator.userAgent.includes("Windows") ? "Windows PC" : "Mac"
-  return `My ${platform}`
+function defaultDeviceName(language: Locale) {
+  const device = connectCopy[language].device
+  return navigator.userAgent.includes("Windows") ? device.windows : device.mac
 }
 
-function formatDate(value: string | null | undefined) {
-  if (!value) return "Not available"
-  return new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+function formatDate(value: string | null | undefined, language: Locale) {
+  if (!value) return connectCopy[language].notAvailable
+  return new Date(value).toLocaleString(language === "zh" ? "zh-CN" : "en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
 }
 
 function App() {
+  const [language, setLanguage] = useState<Locale>(initialLocale)
   const [snapshot, setSnapshot] = useState<ConnectSnapshot | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [setupCode, setSetupCode] = useState("")
   const [setup, setSetup] = useState<SetupSession | null>(null)
-  const [deviceName, setDeviceName] = useState(defaultDeviceName)
+  const [deviceName, setDeviceName] = useState<string>(() => defaultDeviceName(language))
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [logoutConfirm, setLogoutConfirm] = useState(false)
+  const t = connectCopy[language]
+
+  function toggleLanguage() {
+    const next = language === "zh" ? "en" : "zh"
+    localStorage.setItem("locale", next)
+    setLanguage(next)
+  }
 
   async function load(silent = false) {
     if (!silent) setBusy("load")
@@ -143,46 +153,49 @@ function App() {
   const selectedNode = snapshot?.bundle?.nodes.find((node) => node.nodeId === snapshot.selectedNodeId) ?? null
 
   if (!loaded) {
-    return <main className="loading"><span className="brand-mark"><Network /></span><LoaderCircle className="spin" /><p>Preparing your private network</p></main>
+    return <main className="loading"><span className="brand-mark"><Network /></span><LoaderCircle className="spin" /><p>{t.preparing}</p></main>
   }
 
   if (!snapshot) {
     return (
       <main className="onboarding-shell">
         <header className="topbar" data-tauri-drag-region>
-          <Brand />
-          <span className="privacy"><LockKeyhole size={14} /> Device-only credentials</span>
+          <Brand language={language} />
+          <div className="top-actions">
+            <span className="privacy"><LockKeyhole size={14} /> {t.deviceCredentials}</span>
+            <LanguageButton language={language} label={t.switchLanguage} onClick={toggleLanguage} />
+          </div>
         </header>
         <div className="app-scroll">
           <section className="onboarding">
             <div className="intro">
               <div className="intro-art"><span className="ring ring-one" /><span className="ring ring-two" /><ShieldCheck size={48} /></div>
-              <p className="eyebrow">Invitation only</p>
-              <h1>Join your private network.</h1>
-              <p>One setup code adds your account, downloads your assigned nodes, and keeps them in sync automatically.</p>
-              <div className="trust-row"><span><Check /> No manual server setup</span><span><Check /> Automatic failover</span><span><Check /> End-to-end verified updates</span></div>
+              <p className="eyebrow">{t.onboarding.invitationOnly}</p>
+              <h1>{t.onboarding.title}</h1>
+              <p>{t.onboarding.description}</p>
+              <div className="trust-row"><span><Check /> {t.onboarding.noManualSetup}</span><span><Check /> {t.onboarding.automaticFailover}</span><span><Check /> {t.onboarding.verifiedUpdates}</span></div>
             </div>
             <div className="setup-panel">
               {error && <Notice message={error} />}
               {!setup ? (
                 <>
-                  <p className="eyebrow">Get started</p>
-                  <h2>Enter your setup code</h2>
-                  <p className="muted">Ask the network owner for a new Connect code. Each code works once.</p>
+                  <p className="eyebrow">{t.onboarding.getStarted}</p>
+                  <h2>{t.onboarding.enterCode}</h2>
+                  <p className="muted">{t.onboarding.codeHint}</p>
                   <textarea value={setupCode} onChange={(event) => setSetupCode(event.target.value)} placeholder="pn-member-v1..." spellCheck={false} autoFocus />
                   <button className="primary wide" onClick={() => void inspectSetup()} disabled={!setupCode.trim() || busy !== null}>
-                    {busy === "inspect" ? <LoaderCircle className="spin" /> : <ArrowRight />} Continue
+                    {busy === "inspect" ? <LoaderCircle className="spin" /> : <ArrowRight />} {t.onboarding.continue}
                   </button>
                 </>
               ) : (
                 <>
-                  <span className="accepted"><Check /> Invitation verified</span>
-                  <p className="eyebrow">Welcome to</p>
+                  <span className="accepted"><Check /> {t.onboarding.verified}</span>
+                  <p className="eyebrow">{t.onboarding.welcome}</p>
                   <h2>{setup.preview.displayName}</h2>
-                  <div className="setup-detail"><Cloud /><div><span>Secure control service</span><strong>{new URL(setup.preview.controllerOrigin).host}</strong></div></div>
-                  <label className="field"><span>Name this device</span><input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} maxLength={80} /></label>
-                  <p className="expiry">This code expires {formatDate(setup.preview.expiresAt)}.</p>
-                  <div className="button-row"><button className="secondary" onClick={() => void abandonSetup()}>Back</button><button className="primary" disabled={!deviceName.trim() || busy !== null} onClick={() => void activate()}>{busy === "activate" ? <LoaderCircle className="spin" /> : <ShieldCheck />} Join network</button></div>
+                  <div className="setup-detail"><Cloud /><div><span>{t.onboarding.controlService}</span><strong>{new URL(setup.preview.controllerOrigin).host}</strong></div></div>
+                  <label className="field"><span>{t.onboarding.deviceName}</span><input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} maxLength={80} /></label>
+                  <p className="expiry">{t.onboarding.expires(formatDate(setup.preview.expiresAt, language))}</p>
+                  <div className="button-row"><button className="secondary" onClick={() => void abandonSetup()}>{t.onboarding.back}</button><button className="primary" disabled={!deviceName.trim() || busy !== null} onClick={() => void activate()}>{busy === "activate" ? <LoaderCircle className="spin" /> : <ShieldCheck />} {t.onboarding.join}</button></div>
                 </>
               )}
             </div>
@@ -195,10 +208,11 @@ function App() {
   return (
     <main className={`app-shell ${connected ? "is-connected" : ""}`}>
       <header className="topbar" data-tauri-drag-region>
-        <Brand />
+        <Brand language={language} />
         <div className="top-actions">
           <span className="account-pill"><span className="avatar">{snapshot.session.account?.displayName.slice(0, 1).toUpperCase()}</span>{snapshot.session.account?.displayName}</span>
-          <button className="icon-button" onClick={() => setSettingsOpen(!settingsOpen)} aria-label="Settings"><Settings2 /></button>
+          <LanguageButton language={language} label={t.switchLanguage} onClick={toggleLanguage} />
+          <button className="icon-button" onClick={() => setSettingsOpen(!settingsOpen)} aria-label={t.settings.open} title={t.settings.open}><Settings2 /></button>
         </div>
       </header>
 
@@ -215,50 +229,50 @@ function App() {
               {busy === "connect" || busy === "disconnect" || changing ? <LoaderCircle className="spin" /> : connected ? <Unplug /> : <Power />}
             </button>
           </div>
-          <p className="eyebrow">{changing ? "Please wait" : connected ? "Protected" : "Ready"}</p>
-          <h1>{changing ? (snapshot.runtime.phase === "starting" ? "Connecting..." : "Disconnecting...") : connected ? "You're connected" : "Connect when you're ready"}</h1>
+          <p className="eyebrow">{changing ? t.connection.pleaseWait : connected ? t.connection.protected : t.connection.ready}</p>
+          <h1>{changing ? (snapshot.runtime.phase === "starting" ? t.connection.connecting : t.connection.disconnecting) : connected ? t.connection.connected : t.connection.prompt}</h1>
           <p className="connection-copy">
             {connected
-              ? `${selectedNode?.displayName ?? "Best available node"}${selectedNode?.region ? ` · ${selectedNode.region}` : ""}`
+              ? `${selectedNode?.displayName ?? t.connection.bestNode}${selectedNode?.region ? ` · ${selectedNode.region}` : ""}`
               : snapshot.bundle?.nodes.length
-                ? `${snapshot.bundle.nodes.length} ${snapshot.bundle.nodes.length === 1 ? "node" : "nodes"} available · automatic selection`
-                : "Your account has no available nodes yet."}
+                ? t.connection.availableNodes(snapshot.bundle.nodes.length)
+                : t.connection.noNodes}
           </p>
           {error && <Notice message={error} />}
         </section>
 
         <section className="status-strip">
-          <StatusItem icon={<Route />} label="Route" value={selectedNode ? (selectedNode.endpointMode === "relay" ? "Managed relay" : "Direct") : "Automatic"} />
-          <StatusItem icon={<Globe2 />} label="System access" value={connected && snapshot.runtime.mode === "system" ? "Enabled" : "Off"} />
-          <StatusItem icon={<Gauge />} label="Bundle" value={`Generation ${snapshot.bundle?.generation ?? 0}`} />
+          <StatusItem icon={<Route />} label={t.connection.route} value={selectedNode ? (selectedNode.endpointMode === "relay" ? t.connection.managedRelay : t.connection.direct) : t.connection.automatic} />
+          <StatusItem icon={<Globe2 />} label={t.connection.systemAccess} value={connected && snapshot.runtime.mode === "system" ? t.connection.enabled : t.connection.off} />
+          <StatusItem icon={<Gauge />} label={t.connection.bundle} value={t.connection.generation(snapshot.bundle?.generation ?? 0)} />
         </section>
 
         <section className="content-grid">
         <div className="nodes-card">
           <div className="section-heading">
-            <div><p className="eyebrow">Available routes</p><h2>Network nodes</h2></div>
-            <button className="text-button" disabled={busy !== null} onClick={() => void run("refresh", async () => { await refreshBundle(); return probeNodes() })}><RefreshCw className={busy === "refresh" ? "spin" : ""} /> Sync now</button>
+            <div><p className="eyebrow">{t.nodes.eyebrow}</p><h2>{t.nodes.title}</h2></div>
+            <button className="text-button" disabled={busy !== null} onClick={() => void run("refresh", async () => { await refreshBundle(); return probeNodes() })}><RefreshCw className={busy === "refresh" ? "spin" : ""} /> {t.nodes.sync}</button>
           </div>
           <button className={`node-row auto ${snapshot.selectionMode.kind === "automatic" ? "selected" : ""}`} onClick={() => void run("selection", () => setSelection({ kind: "automatic" }))} disabled={busy !== null}>
             <span className="node-icon auto-icon"><Sparkles /></span>
-            <span className="node-copy"><strong>Automatic</strong><small>Use the best healthy route and switch when needed</small></span>
+            <span className="node-copy"><strong>{t.nodes.automatic}</strong><small>{t.nodes.automaticDescription}</small></span>
             {snapshot.selectionMode.kind === "automatic" ? <span className="selected-mark"><Check /></span> : <ChevronRight />}
           </button>
           {snapshot.bundle?.nodes.map((node) => (
-            <NodeRow key={node.nodeId} node={node} selected={snapshot.selectionMode.kind === "manual" && snapshot.selectionMode.nodes === node.nodeId} active={snapshot.selectedNodeId === node.nodeId} onSelect={() => void run("selection", () => setSelection({ kind: "manual", nodes: node.nodeId }))} disabled={busy !== null} />
+            <NodeRow key={node.nodeId} node={node} selected={snapshot.selectionMode.kind === "manual" && snapshot.selectionMode.nodes === node.nodeId} active={snapshot.selectedNodeId === node.nodeId} onSelect={() => void run("selection", () => setSelection({ kind: "manual", nodes: node.nodeId }))} disabled={busy !== null} language={language} />
           ))}
-          {!snapshot.bundle?.nodes.length && <div className="empty"><CircleAlert /><strong>No nodes assigned</strong><span>Ask the network owner to assign at least one active node, then sync again.</span></div>}
+          {!snapshot.bundle?.nodes.length && <div className="empty"><CircleAlert /><strong>{t.nodes.none}</strong><span>{t.nodes.noneDescription}</span></div>}
         </div>
 
         <aside className="details-card">
-          <p className="eyebrow">Account</p>
+          <p className="eyebrow">{t.account.eyebrow}</p>
           <h2>{snapshot.session.account?.displayName}</h2>
           <dl>
-            <div><dt>Device</dt><dd><Laptop /> {snapshot.session.binding?.deviceId.slice(0, 8)}</dd></div>
-            <div><dt>Offline access until</dt><dd>{formatDate(snapshot.bundle?.offlineExpiresAt)}</dd></div>
-            <div><dt>Next sync</dt><dd>{formatDate(snapshot.bundle?.refreshAfter)}</dd></div>
+            <div><dt>{t.account.device}</dt><dd><Laptop /> {snapshot.session.binding?.deviceId.slice(0, 8)}</dd></div>
+            <div><dt>{t.account.offlineUntil}</dt><dd>{formatDate(snapshot.bundle?.offlineExpiresAt, language)}</dd></div>
+            <div><dt>{t.account.nextSync}</dt><dd>{formatDate(snapshot.bundle?.refreshAfter, language)}</dd></div>
           </dl>
-          <div className="security-note"><ShieldCheck /><p><strong>Verified node updates</strong><span>Node credentials are encrypted for this device and never shown in the app.</span></p></div>
+          <div className="security-note"><ShieldCheck /><p><strong>{t.account.verifiedUpdates}</strong><span>{t.account.verifiedDescription}</span></p></div>
         </aside>
         </section>
       </div>
@@ -266,11 +280,11 @@ function App() {
       {settingsOpen && (
         <div className="modal-backdrop" onMouseDown={() => setSettingsOpen(false)}>
           <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="section-heading"><div><p className="eyebrow">This device</p><h2>Settings</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)}>×</button></div>
-            <div className="setting-row"><div><strong>System-wide access</strong><span>When connected, supported apps use this network automatically.</span></div><span className="badge">Default</span></div>
-            <div className="setting-row"><div><strong>Local proxy</strong><span>For advanced apps that need a manual endpoint.</span></div><code>{snapshot.runtime.endpoints.socks}</code></div>
+            <div className="section-heading"><div><p className="eyebrow">{t.settings.thisDevice}</p><h2>{t.settings.title}</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)}>×</button></div>
+            <div className="setting-row"><div><strong>{t.settings.systemWide}</strong><span>{t.settings.systemWideDescription}</span></div><span className="badge">{t.settings.default}</span></div>
+            <div className="setting-row"><div><strong>{t.settings.localProxy}</strong><span>{t.settings.localProxyDescription}</span></div><code>{snapshot.runtime.endpoints.socks}</code></div>
             <div className="logout-box">
-              {!logoutConfirm ? <button className="logout-button" onClick={() => setLogoutConfirm(true)}><LogOut /> Remove account from this device</button> : <><p>This disconnects and removes local keys and cached nodes. Your network account is not deleted.</p><div className="button-row"><button className="secondary" onClick={() => setLogoutConfirm(false)}>Cancel</button><button className="danger" onClick={() => void removeAccount()} disabled={busy !== null}>{busy === "logout" ? <LoaderCircle className="spin" /> : null}Remove account</button></div></>}
+              {!logoutConfirm ? <button className="logout-button" onClick={() => setLogoutConfirm(true)}><LogOut /> {t.settings.remove}</button> : <><p>{t.settings.removeDescription}</p><div className="button-row"><button className="secondary" onClick={() => setLogoutConfirm(false)}>{t.settings.cancel}</button><button className="danger" onClick={() => void removeAccount()} disabled={busy !== null}>{busy === "logout" ? <LoaderCircle className="spin" /> : null}{t.settings.confirmRemove}</button></div></>}
             </div>
           </section>
         </div>
@@ -279,8 +293,13 @@ function App() {
   )
 }
 
-function Brand() {
-  return <div className="brand" data-tauri-drag-region><span className="brand-mark"><Network /></span><div data-tauri-drag-region><strong>Private Network</strong><span>Connect</span></div></div>
+function Brand({ language }: { language: Locale }) {
+  const t = connectCopy[language]
+  return <div className="brand" data-tauri-drag-region><span className="brand-mark"><Network /></span><div data-tauri-drag-region><strong>{t.brand}</strong><span>{t.product}</span></div></div>
+}
+
+function LanguageButton({ language, label, onClick }: { language: Locale; label: string; onClick: () => void }) {
+  return <button className="icon-button language-button" onClick={onClick} aria-label={label} title={label}><Languages /><span>{language === "zh" ? "EN" : "中文"}</span></button>
 }
 
 function Notice({ message }: { message: string }) {
@@ -291,10 +310,11 @@ function StatusItem({ icon, label, value }: { icon: ReactNode; label: string; va
   return <div className="status-item"><span>{icon}</span><div><small>{label}</small><strong>{value}</strong></div></div>
 }
 
-function NodeRow({ node, selected, active, onSelect, disabled }: { node: SafeNode; selected: boolean; active: boolean; onSelect: () => void; disabled: boolean }) {
+function NodeRow({ node, selected, active, onSelect, disabled, language }: { node: SafeNode; selected: boolean; active: boolean; onSelect: () => void; disabled: boolean; language: Locale }) {
+  const t = connectCopy[language].nodes
   return <button className={`node-row ${selected ? "selected" : ""}`} onClick={onSelect} disabled={disabled}>
     <span className="node-icon">{node.endpointMode === "relay" ? <Cloud /> : <Wifi />}</span>
-    <span className="node-copy"><strong>{node.displayName}{active && <em>Active</em>}</strong><small><MapPin /> {node.region ?? "Private node"} · {node.endpointMode === "relay" ? "managed relay" : "direct route"}</small></span>
+    <span className="node-copy"><strong>{node.displayName}{active && <em>{t.active}</em>}</strong><small><MapPin /> {node.region ?? t.privateNode} · {node.endpointMode === "relay" ? t.relay : t.direct}</small></span>
     {selected ? <span className="selected-mark"><Check /></span> : <ChevronRight />}
   </button>
 }

@@ -2,6 +2,8 @@ export type XraySnapshot = {
   installed: boolean
   binaryPath?: string | null
   version?: string | null
+  serviceManageable: boolean
+  serviceManager?: string | null
   running: boolean
   pid?: number | null
   configPath?: string | null

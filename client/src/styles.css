@@ -25,6 +25,7 @@ h2 { font-size: 25px; }
 .avatar { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; color: var(--green); background: var(--mint); }
 .icon-button { width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 50%; color: var(--ink); background: rgba(255,255,255,.5); display: grid; place-items: center; }
 .icon-button svg { width: 17px; }
+.language-button { width: auto; padding: 0 11px; border-radius: 999px; display: flex; gap: 6px; font-size: 11px; font-weight: 700; }
 .loading { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; color: var(--muted); }
 .loading .brand-mark { width: 58px; height: 58px; }
 
