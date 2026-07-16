@@ -4,13 +4,15 @@ import { initReactI18next } from "react-i18next"
 import zh from "@/locales/zh.json"
 import en from "@/locales/en.json"
 
+const savedLocale = localStorage.getItem("locale")
+
 i18n.use(initReactI18next).init({
   resources: {
     zh: { translation: zh },
     en: { translation: en },
   },
-  lng: localStorage.getItem("locale") ?? "zh",
-  fallbackLng: "en",
+  lng: savedLocale === "en" ? "en" : "zh",
+  fallbackLng: "zh",
   interpolation: { escapeValue: false },
 })
 

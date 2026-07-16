@@ -552,8 +552,14 @@ function App() {
               <p className="mt-2 max-w-2xl text-sm text-muted-foreground">{pageCopy[1]}</p>
             </div>
             <div className="flex shrink-0 items-center gap-2">
-              <Button variant="outline" size="icon" onClick={toggleLanguage} aria-label="Toggle language">
+              <Button
+                variant="outline"
+                onClick={toggleLanguage}
+                aria-label={language === "zh" ? "Switch to English" : "切换到中文"}
+                title={language === "zh" ? "Switch to English" : "切换到中文"}
+              >
                 <Languages />
+                <span>{language === "zh" ? "EN" : "中文"}</span>
               </Button>
               <Button variant="outline" onClick={() => void refresh()} disabled={loading}>
                 <RefreshCcw className={cn(loading && "animate-spin")} />
