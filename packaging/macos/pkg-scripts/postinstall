@@ -8,7 +8,8 @@ IDENTITY="$SERVICE_STATE/identity"
 LEGACY_STATE="$BASE/state"
 LEGACY_IDENTITY="$BASE/identity"
 LEGACY_DEFAULT_IDENTITY="$BASE/.state.installation-identity"
-RUNTIME="/var/run/private-network-node"
+RUNTIME="$BASE/run"
+LEGACY_RUNTIME="/var/run/private-network-node"
 LOGS="/Library/Logs/Private Network Node"
 PLIST="/Library/LaunchDaemons/com.sky.realitynode.agent.plist"
 PREVIOUS="$BASE/.previous-release"
@@ -88,7 +89,7 @@ service_hidden=$(/usr/bin/dscl . -read /Users/_privnetnode IsHidden | /usr/bin/a
 [ "$service_hidden" = 1 ] || { echo "_privnetnode is not hidden" >&2; exit 70; }
 
 for directory in "$SERVICE_STATE" "$LEGACY_STATE" "$LEGACY_IDENTITY" \
-                 "$LEGACY_DEFAULT_IDENTITY" "$RUNTIME" "$LOGS"; do
+                 "$LEGACY_DEFAULT_IDENTITY" "$RUNTIME" "$LEGACY_RUNTIME" "$LOGS"; do
   [ ! -L "$directory" ] || { echo "unsafe symlink at $directory" >&2; exit 70; }
 done
 
@@ -146,6 +147,27 @@ if [ -e "$RUNTIME/control.sock" ] || [ -L "$RUNTIME/control.sock" ]; then
   socket_uid=$(/usr/bin/stat -f '%u' "$RUNTIME/control.sock")
   [ "$socket_uid" = "$service_uid" ] || { echo "control socket has an unsafe owner" >&2; exit 70; }
   /bin/rm -f "$RUNTIME/control.sock"
+fi
+if [ -e "$LEGACY_RUNTIME" ]; then
+  [ -d "$LEGACY_RUNTIME" ] && [ ! -L "$LEGACY_RUNTIME" ] \
+    || { echo "unsafe legacy runtime directory" >&2; exit 70; }
+  [ "$(/usr/bin/stat -f '%u' "$LEGACY_RUNTIME")" = 0 ] \
+    || { echo "legacy runtime owner is unsafe" >&2; exit 70; }
+  [ "$(/usr/bin/stat -f '%g' "$LEGACY_RUNTIME")" = "$group_id" ] \
+    || { echo "legacy runtime group is unsafe" >&2; exit 70; }
+  [ "$(/usr/bin/stat -f '%Lp' "$LEGACY_RUNTIME")" = 775 ] \
+    || { echo "legacy runtime mode is unsafe" >&2; exit 70; }
+  if [ -e "$LEGACY_RUNTIME/control.sock" ] || [ -L "$LEGACY_RUNTIME/control.sock" ]; then
+    [ -S "$LEGACY_RUNTIME/control.sock" ] \
+      || { echo "unsafe legacy control socket" >&2; exit 70; }
+    legacy_socket_uid=$(/usr/bin/stat -f '%u' "$LEGACY_RUNTIME/control.sock")
+    [ "$legacy_socket_uid" = "$service_uid" ] \
+      || { echo "legacy control socket has an unsafe owner" >&2; exit 70; }
+    /bin/rm -f "$LEGACY_RUNTIME/control.sock"
+  fi
+  [ -z "$(/usr/bin/find "$LEGACY_RUNTIME" -xdev -mindepth 1 -maxdepth 1 -print -quit)" ] \
+    || { echo "legacy runtime directory contains unexpected entries" >&2; exit 70; }
+  /bin/rmdir "$LEGACY_RUNTIME"
 fi
 /bin/chmod 755 "$BASE" "$BASE/bin" "$BASE/releases"
 /bin/chmod 644 "$PLIST"

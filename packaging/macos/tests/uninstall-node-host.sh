@@ -11,7 +11,8 @@ trap cleanup EXIT INT TERM
 BASE="$WORK/Library/Application Support/Private Network Node"
 APP="$WORK/Applications/Private Network Node.app"
 PLIST="$WORK/Library/LaunchDaemons/com.sky.realitynode.agent.plist"
-RUNTIME="$WORK/var/run/private-network-node"
+RUNTIME="$BASE/run"
+LEGACY_RUNTIME="$WORK/var/run/private-network-node"
 LOGS="$WORK/Library/Logs/Private Network Node"
 SCRIPT="$WORK/uninstall"
 UID_VALUE=$(/usr/bin/id -u)
@@ -22,6 +23,7 @@ NODE_ID=11111111-1111-4111-8111-111111111111
   -e "s|^APP=.*$|APP=\"$APP\"|" \
   -e "s|^PLIST=.*$|PLIST=\"$PLIST\"|" \
   -e "s|^RUNTIME=.*$|RUNTIME=\"$RUNTIME\"|" \
+  -e "s|^LEGACY_RUNTIME=.*$|LEGACY_RUNTIME=\"$LEGACY_RUNTIME\"|" \
   -e "s|^LOGS=.*$|LOGS=\"$LOGS\"|" \
   -e "s|^EXPECTED_UID=0$|EXPECTED_UID=$UID_VALUE|" \
   -e "s|^SERVICE_UID=.*$|SERVICE_UID=$UID_VALUE|" \
@@ -34,7 +36,8 @@ NODE_ID=11111111-1111-4111-8111-111111111111
 make_layout() {
   /bin/mkdir -p \
     "$BASE/bin" "$BASE/releases/1.0.0" "$BASE/service-state/state" \
-    "$BASE/service-state/identity" "$APP" "$(dirname "$PLIST")" "$RUNTIME" "$LOGS"
+    "$BASE/service-state/identity" "$APP" "$(dirname "$PLIST")" \
+    "$RUNTIME" "$LEGACY_RUNTIME" "$LOGS"
   /bin/ln -s releases/1.0.0 "$BASE/current"
   printf 'plist\n' > "$PLIST"
   printf 'identity\n' > "$BASE/service-state/identity/seed"
@@ -51,6 +54,7 @@ printf 'database\n' > "$BASE/service-state/state/node-host.sqlite3"
 [ ! -e "$APP" ]
 [ ! -e "$PLIST" ]
 [ ! -e "$RUNTIME" ]
+[ ! -e "$LEGACY_RUNTIME" ]
 [ ! -e "$BASE/current" ]
 [ ! -e "$BASE/releases" ]
 [ ! -e "$BASE/bin" ]

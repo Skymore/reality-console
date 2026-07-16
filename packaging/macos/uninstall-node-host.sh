@@ -6,7 +6,8 @@ SERVICE_STATE="$BASE/service-state"
 STATE="$SERVICE_STATE/state"
 APP="/Applications/Private Network Node.app"
 PLIST="/Library/LaunchDaemons/com.sky.realitynode.agent.plist"
-RUNTIME="/var/run/private-network-node"
+RUNTIME="$BASE/run"
+LEGACY_RUNTIME="/var/run/private-network-node"
 LOGS="/Library/Logs/Private Network Node"
 RECEIPT="com.sky.realitynode.pkg"
 EXPECTED_UID=0
@@ -71,6 +72,7 @@ validate_directory "$STATE" "$SERVICE_UID"
 validate_directory "$SERVICE_STATE/identity" "$SERVICE_UID"
 validate_directory "$APP" "$EXPECTED_UID"
 validate_directory "$RUNTIME" "$EXPECTED_UID"
+validate_directory "$LEGACY_RUNTIME" "$EXPECTED_UID"
 validate_directory "$LOGS" "$SERVICE_UID"
 validate_regular_file "$PLIST" "$EXPECTED_UID"
 
@@ -106,7 +108,7 @@ if [ "$mode" = --purge-data ] && [ -f "$STATE/node-host.sqlite3" ]; then
 fi
 
 /bin/rm -f "$PLIST"
-/bin/rm -rf "$APP" "$RUNTIME"
+/bin/rm -rf "$APP" "$RUNTIME" "$LEGACY_RUNTIME"
 /bin/rm -f "$BASE/current"
 /bin/rm -rf "$BASE/bin" "$BASE/releases"
 

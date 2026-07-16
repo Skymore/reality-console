@@ -24,8 +24,10 @@ transport requirements.
 ## macOS Transport
 
 The package starts the daemon in `system-service` mode even before enrollment. `postinstall` creates
-`/var/run/private-network-node` as `root:_privnetnode` with mode `0775`; ordinary users can traverse
-it but cannot create or replace entries. The `_privnetnode` daemon binds the fixed
+`/Library/Application Support/Private Network Node/run` as `root:_privnetnode` with mode `0775`;
+ordinary users can traverse it but cannot create or replace entries. Unlike `/var/run`, this
+installer-owned namespace survives reboot so the unprivileged LaunchDaemon can always restart. The
+`_privnetnode` daemon binds the fixed
 `control.sock` path at mode `0666` and sets a bounded connection queue. Every accepted connection is
 authorized with macOS `getpeereid`:
 
@@ -115,7 +117,7 @@ Development/tests may inject an explicit identity directory. Production always p
 | `/Library/Application Support/Private Network Node/service-state/state` | `_privnetnode`, `0700` | Copyable operational state removed by unpair |
 | `/Library/Application Support/Private Network Node/service-state/identity` | `_privnetnode`, `0700` | Non-copyable installation identity removed by unpair |
 | `/Library/Application Support/Private Network Node/bin/private-network-node-uninstall` | `root:wheel`, `0755` | Fixed-path explicit preserve/purge uninstaller |
-| `/var/run/private-network-node` | `root:_privnetnode`, `0775` | Protected socket namespace |
+| `/Library/Application Support/Private Network Node/run` | `root:_privnetnode`, `0775` | Protected, reboot-persistent socket namespace |
 | `/Library/LaunchDaemons/com.sky.realitynode.agent.plist` | `root:wheel`, `0644` | Dedicated-user LaunchDaemon |
 
 The LaunchDaemon invokes only the root-owned wrapper, which invokes `node-host system-service`

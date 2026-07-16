@@ -7,18 +7,32 @@ if [ "${1-}" = "--test-root" ]; then
   action=$3
   EXPECTED_UID=$(/usr/bin/id -u)
   EXPECTED_GID=$(/usr/bin/id -g)
+  SNAPSHOT_DITTO=${ROLLBACK_TEST_DITTO:-/usr/bin/ditto}
 else
   [ "$#" -eq 1 ] || { echo "usage: $0 snapshot|restore|commit" >&2; exit 64; }
   BASE="/Library/Application Support/Private Network Node"
   action=$1
   EXPECTED_UID=0
   EXPECTED_GID=0
+  SNAPSHOT_DITTO=/usr/bin/ditto
 fi
 
 SNAPSHOT="$BASE/.service-state-rollback"
 MANIFEST="$SNAPSHOT/layouts"
+COMPLETE="$SNAPSHOT/complete"
 FAILED="$BASE/.service-state-failed"
 NAMES="state identity .state.installation-identity service-state"
+SNAPSHOT_STAGING=
+
+cleanup_staging() {
+  status=$?
+  trap - EXIT INT TERM
+  if [ -n "$SNAPSHOT_STAGING" ]; then
+    /bin/rm -rf "$SNAPSHOT_STAGING"
+  fi
+  exit "$status"
+}
+trap cleanup_staging EXIT INT TERM
 
 fail() {
   echo "service-state rollback: $*" >&2
@@ -55,6 +69,7 @@ require_snapshot() {
   [ "$(uid_of "$SNAPSHOT")" = "$EXPECTED_UID" ] || fail "snapshot owner is invalid"
   [ "$(gid_of "$SNAPSHOT")" = "$EXPECTED_GID" ] || fail "snapshot group is invalid"
   [ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] || fail "snapshot manifest is unsafe"
+  [ -f "$COMPLETE" ] && [ ! -L "$COMPLETE" ] || fail "snapshot completion marker is unsafe"
 }
 
 validate_name() {
@@ -68,19 +83,33 @@ snapshot() {
   require_base
   [ ! -e "$SNAPSHOT" ] && [ ! -L "$SNAPSHOT" ] || fail "stale snapshot already exists"
   [ ! -e "$FAILED" ] && [ ! -L "$FAILED" ] || fail "stale failed-state directory exists"
-  /bin/mkdir -m 700 "$SNAPSHOT"
-  /usr/sbin/chown "$EXPECTED_UID:$EXPECTED_GID" "$SNAPSHOT"
-  /usr/bin/touch "$MANIFEST"
-  /bin/chmod 600 "$MANIFEST"
-  /usr/sbin/chown "$EXPECTED_UID:$EXPECTED_GID" "$MANIFEST"
+  SNAPSHOT_STAGING="$BASE/.service-state-rollback.staging.$$"
+  [ ! -e "$SNAPSHOT_STAGING" ] && [ ! -L "$SNAPSHOT_STAGING" ] \
+    || fail "stale snapshot staging directory exists"
+  staging_manifest="$SNAPSHOT_STAGING/layouts"
+  staging_complete="$SNAPSHOT_STAGING/complete"
+  /bin/mkdir -m 700 "$SNAPSHOT_STAGING"
+  /usr/sbin/chown "$EXPECTED_UID:$EXPECTED_GID" "$SNAPSHOT_STAGING"
+  /usr/bin/touch "$staging_manifest"
+  /bin/chmod 600 "$staging_manifest"
+  /usr/sbin/chown "$EXPECTED_UID:$EXPECTED_GID" "$staging_manifest"
   for name in $NAMES; do
     source="$BASE/$name"
     if [ -e "$source" ] || [ -L "$source" ]; then
       require_plain_directory "$source"
-      /usr/bin/ditto --rsrc --extattr --acl "$source" "$SNAPSHOT/$name"
-      printf '%s\n' "$name" >> "$MANIFEST"
+      # Local IPC sockets contain no durable state and cannot be copied by
+      # ditto. launchd is stopped before snapshot, so any socket is stale.
+      /usr/bin/find "$source" -xdev -type s -delete
+      "$SNAPSHOT_DITTO" --rsrc --extattr --acl "$source" "$SNAPSHOT_STAGING/$name"
+      printf '%s\n' "$name" >> "$staging_manifest"
     fi
   done
+  /usr/bin/touch "$staging_complete"
+  /bin/chmod 600 "$staging_complete"
+  /usr/sbin/chown "$EXPECTED_UID:$EXPECTED_GID" "$staging_complete"
+  /bin/sync
+  /bin/mv "$SNAPSHOT_STAGING" "$SNAPSHOT"
+  SNAPSHOT_STAGING=
   /bin/sync
 }
 

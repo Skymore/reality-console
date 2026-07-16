@@ -33,7 +33,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 use zeroize::Zeroize as _;
 
-pub const SYSTEM_SOCKET_PATH: &str = "/var/run/private-network-node/control.sock";
+pub const SYSTEM_SOCKET_PATH: &str =
+    "/Library/Application Support/Private Network Node/run/control.sock";
 pub const SYSTEM_SERVICE_STATE_ROOT_PATH: &str =
     "/Library/Application Support/Private Network Node/service-state";
 pub const SYSTEM_STATE_PATH: &str =
@@ -1969,6 +1970,9 @@ mod tests {
         assert!(postinstall
             .contains("/usr/sbin/chown _privnetnode:_privnetnode \"$SERVICE_STATE\" \"$LOGS\""));
         assert!(postinstall.contains("/bin/chmod 700 \"$SERVICE_STATE\" \"$LOGS\""));
+        assert!(postinstall.contains("RUNTIME=\"$BASE/run\""));
+        assert!(postinstall.contains("/usr/sbin/chown root:_privnetnode \"$RUNTIME\""));
+        assert!(postinstall.contains("/bin/chmod 775 \"$RUNTIME\""));
         assert!(postinstall.contains(
             "/usr/bin/sudo -u _privnetnode \"$BASE/current/node-host\" migrate-system-layout"
         ));

@@ -43,6 +43,10 @@ mkdir -p "$PAYLOAD/Applications" "$BASE/bin" "$BASE/releases/$VERSION" "$PAYLOAD
 # Copy the signed bundle without host-local xattrs. Those attributes are not
 # part of the code signature and pkgbuild would encode them as AppleDouble files.
 /usr/bin/ditto --norsrc --noextattr --noacl --noqtn "$APP" "$PAYLOAD/Applications/Private Network Node.app"
+# Tauri preserves the source sidecar's owner-only mode. Once Installer assigns
+# the bundle to root:wheel, the console user must still be able to validate and
+# execute the signed embedded sidecar.
+/bin/chmod 755 "$PAYLOAD/Applications/Private Network Node.app/Contents/MacOS/xray"
 install -m 755 "$AGENT" "$BASE/releases/$VERSION/node-host"
 install -m 755 "$XRAY" "$BASE/releases/$VERSION/xray"
 install -m 644 "$WORK/sidecars.json" "$BASE/releases/$VERSION/sidecars.json"
@@ -56,33 +60,122 @@ install -m 644 "$ROOT/packaging/macos/com.sky.realitynode.agent.plist" "$PAYLOAD
 /bin/cat "$ROOT/packaging/macos/pkg-scripts/service-state-rollback" > "$PKG_SCRIPTS/service-state-rollback"
 /bin/chmod 755 "$PKG_SCRIPTS/preinstall" "$PKG_SCRIPTS/postinstall" "$PKG_SCRIPTS/service-state-rollback"
 
-# Provenance and Finder xattrs become AppleDouble `._*` payload entries when
-# pkgbuild archives the tree. Release packages carry only normal files and the
-# embedded Mach-O signatures, never host-local metadata sidecars.
+# Remove ordinary host metadata where macOS permits it. Protected provenance
+# can remain on some managed build hosts, so the generated package is the
+# source of truth: it must never contain AppleDouble payload entries.
 /usr/bin/xattr -cr "$PAYLOAD"
-provenance_paths=$(/usr/bin/xattr -lr "$PAYLOAD" 2>/dev/null | /usr/bin/sed -n 's/: com\.apple\.provenance:.*//p')
-if [ -n "$provenance_paths" ]; then
-  printf 'build host retains protected com.apple.provenance metadata; refusing a polluted package:\n%s\n' "$provenance_paths" >&2
-  exit 65
-fi
 if /usr/bin/find "$PAYLOAD" -name '._*' -print -quit | /usr/bin/grep -q .; then
   echo "payload contains an AppleDouble metadata file" >&2
   exit 65
 fi
 
 PKG="$OUTPUT/private-network-node-$VERSION-$TARGET-unsigned-validation.pkg"
+RAW_PKG="$WORK/pkgbuild.pkg"
 /usr/bin/pkgbuild \
   --root "$PAYLOAD" \
   --scripts "$PKG_SCRIPTS" \
   --identifier com.sky.realitynode.pkg \
   --version "$VERSION" \
   --install-location / \
-  "$PKG"
+  "$RAW_PKG"
+
+appledouble=$(/usr/sbin/pkgutil --payload-files "$RAW_PKG" | /usr/bin/grep -E '(^|/)\._' || true)
+if [ -n "$appledouble" ]; then
+  if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+    printf 'pkgbuild encoded protected xattrs as AppleDouble files, and Docker is unavailable for clean assembly:\n%s\n' "$appledouble" >&2
+    exit 65
+  fi
+
+  COMPONENTS="$WORK/components"
+  CLEAN_PARENT="$WORK/clean-components"
+  mkdir -p "$COMPONENTS" "$CLEAN_PARENT"
+  (
+    cd "$COMPONENTS"
+    /usr/bin/xar -xf "$RAW_PKG" PackageInfo
+  )
+
+  # Build the payload archives directly so host xattrs are never serialized.
+  (
+    cd "$PAYLOAD"
+    /usr/bin/find . -print | LC_ALL=C /usr/bin/sort | COPYFILE_DISABLE=1 /usr/bin/cpio -o -H odc -R 0:0 2>/dev/null | /usr/bin/gzip -9n > "$COMPONENTS/Payload"
+  )
+  (
+    cd "$PKG_SCRIPTS"
+    /usr/bin/find . -print | LC_ALL=C /usr/bin/sort | COPYFILE_DISABLE=1 /usr/bin/cpio -o -H odc -R 0:0 2>/dev/null | /usr/bin/gzip -9n > "$COMPONENTS/Scripts"
+  )
+
+  # mkbom records source ownership, while installer payloads use root:wheel.
+  /usr/bin/mkbom "$PAYLOAD" "$WORK/source.Bom"
+  /usr/bin/lsbom "$WORK/source.Bom" | /usr/bin/awk -F '\t' 'BEGIN { OFS = "\t" } { if (NF >= 3) $3 = "0/0"; print }' > "$WORK/root-bom.list"
+  /usr/bin/mkbom -i "$WORK/root-bom.list" "$COMPONENTS/Bom"
+
+  payload_files=$(
+    cd "$PAYLOAD"
+    /usr/bin/find . -print | /usr/bin/wc -l | /usr/bin/tr -d ' '
+  )
+  install_kbytes=$(/usr/bin/du -skA "$PAYLOAD" | /usr/bin/awk '{ print ($1 > 0 ? $1 - 1 : 0) }')
+  /usr/bin/python3 - "$COMPONENTS/PackageInfo" "$payload_files" "$install_kbytes" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text()
+text, count = re.subn(
+    r'<payload numberOfFiles="\d+" installKBytes="\d+"/>',
+    f'<payload numberOfFiles="{sys.argv[2]}" installKBytes="{sys.argv[3]}"/>',
+    text,
+    count=1,
+)
+if count != 1:
+    raise SystemExit("PackageInfo payload metadata was not found")
+path.write_text(text)
+PY
+
+  # Docker's VM rematerializes the four flat-package components without the
+  # protected host provenance attribute. No build tool runs inside the image.
+  docker run --rm \
+    -v "$COMPONENTS:/input:ro" \
+    -v "$CLEAN_PARENT:/output" \
+    "${DOCKER_CLEAN_IMAGE:-alpine:3.20}" \
+    sh -ceu 'mkdir /output/flat; for name in Bom PackageInfo Payload Scripts; do cat "/input/$name" > "/output/flat/$name"; done'
+  CLEAN_COMPONENTS="$CLEAN_PARENT/flat"
+  remaining_xattrs=$(/usr/bin/xattr -lr "$CLEAN_COMPONENTS" 2>/dev/null || true)
+  if [ -n "$remaining_xattrs" ]; then
+    printf 'clean package components still contain extended attributes:\n%s\n' "$remaining_xattrs" >&2
+    exit 65
+  fi
+  (
+    cd "$CLEAN_COMPONENTS"
+    /usr/bin/xar --compression none -cf "$PKG" Bom Payload Scripts PackageInfo
+  )
+else
+  /bin/mv "$RAW_PKG" "$PKG"
+fi
 
 appledouble=$(/usr/sbin/pkgutil --payload-files "$PKG" | /usr/bin/grep -E '(^|/)\._' || true)
 if [ -n "$appledouble" ]; then
   /bin/rm -f "$PKG"
-  printf 'package contains AppleDouble metadata files:\n%s\n' "$appledouble" >&2
+  printf 'package contains AppleDouble payload files:\n%s\n' "$appledouble" >&2
+  exit 65
+fi
+
+VERIFY="$WORK/verify"
+mkdir -p "$VERIFY"
+(
+  cd "$VERIFY"
+  /usr/bin/xar -xf "$PKG" Scripts
+)
+script_appledouble=$(/usr/bin/gzip -dc "$VERIFY/Scripts" | /usr/bin/cpio -it 2>/dev/null | /usr/bin/grep -E '(^|/)\._' || true)
+if [ -n "$script_appledouble" ]; then
+  /bin/rm -f "$PKG"
+  printf 'package contains AppleDouble script files:\n%s\n' "$script_appledouble" >&2
+  exit 65
+fi
+/usr/bin/xar --dump-toc="$WORK/package-toc.xml" -f "$PKG"
+if /usr/bin/grep -Eq '<ea([ >])' "$WORK/package-toc.xml"; then
+  /bin/rm -f "$PKG"
+  echo "package container contains extended attributes" >&2
   exit 65
 fi
 
