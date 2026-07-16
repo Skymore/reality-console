@@ -1,6 +1,8 @@
 //! Versioned, device-scoped storage for secrets that must never reach renderer state.
 
 use crate::error::ClientError;
+#[cfg(not(target_os = "windows"))]
+use crate::local_store::OwnerOnlySecretFile;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use control_protocol::crypto::{Ed25519PublicKey, Ed25519Signature, Nonce, X25519PublicKey};
 use control_protocol::id::{
@@ -10,12 +12,15 @@ use control_protocol::secret::Secret;
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "windows"))]
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 use zeroize::Zeroizing;
 
 const VAULT_VERSION: u8 = 1;
+#[cfg(target_os = "windows")]
 const KEYRING_SERVICE: &str = "com.sky.realityclient.credentials.v1";
 const DEVICE_KEY_SLOT: u8 = 0;
 const REFRESH_SLOTS: [u8; 2] = [0, 1];
@@ -35,7 +40,7 @@ pub(crate) struct PendingLoginOperation {
     pub(crate) idempotency_key: String,
 }
 
-/// Complete keyring namespace for one enrolled member device.
+/// Complete credential namespace for one enrolled member device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VaultScope {
     /// Bound private network.
@@ -46,7 +51,7 @@ pub struct VaultScope {
     pub device_id: DeviceId,
 }
 
-/// Discoverable account binding and controller trust retained in the native credential store.
+/// Discoverable account binding and controller trust retained in the selected credential store.
 ///
 /// This record contains no bearer, private key, or encrypted bundle payload.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +135,7 @@ pub struct RefreshRecord {
     pub credential: Secret<String>,
     /// Controller hard expiry.
     pub expires_at: Timestamp,
-    /// Local crash-recovery ordering across the two keyring slots.
+    /// Local crash-recovery ordering across the two credential slots.
     pub rotation: u64,
     /// Request key persisted before sending this rotation to Control.
     #[serde(default)]
@@ -152,16 +157,16 @@ impl std::fmt::Debug for RefreshRecord {
     }
 }
 
-/// Loaded refresh record together with its physical keyring slot.
+/// Loaded refresh record together with its physical credential slot.
 #[derive(Debug, Clone)]
 pub struct StoredRefresh {
-    /// Keyring slot containing `record`.
+    /// Credential slot containing `record`.
     pub slot: u8,
     /// Validated stored value.
     pub record: RefreshRecord,
 }
 
-/// Minimal native-credential backend used by the vault.
+/// Minimal credential backend used by the vault.
 pub trait VaultBackend: Send + Sync {
     /// Writes one opaque value.
     fn set(&self, account: &str, value: &str) -> Result<(), ClientError>;
@@ -171,15 +176,47 @@ pub trait VaultBackend: Send + Sync {
     fn delete(&self, account: &str) -> Result<(), ClientError>;
 }
 
-/// macOS Keychain/Windows Credential Manager implementation through `keyring`.
+/// Windows Credential Manager implementation through `keyring`.
+#[cfg(target_os = "windows")]
 pub struct NativeVaultBackend;
 
+#[cfg(target_os = "windows")]
 impl NativeVaultBackend {
     fn entry(account: &str) -> Result<keyring::Entry, ClientError> {
         keyring::Entry::new(KEYRING_SERVICE, account).map_err(|_| vault_error("vault_unavailable"))
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+struct LocalVaultBackend {
+    store: OwnerOnlySecretFile,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl LocalVaultBackend {
+    fn new(app_data_dir: &Path) -> Result<Self, ClientError> {
+        Ok(Self {
+            store: OwnerOnlySecretFile::new(app_data_dir, "credentials-v1.json")?,
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl VaultBackend for LocalVaultBackend {
+    fn set(&self, account: &str, value: &str) -> Result<(), ClientError> {
+        self.store.set(account, value)
+    }
+
+    fn get(&self, account: &str) -> Result<Option<String>, ClientError> {
+        self.store.get(account)
+    }
+
+    fn delete(&self, account: &str) -> Result<(), ClientError> {
+        self.store.delete(account)
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl VaultBackend for NativeVaultBackend {
     fn set(&self, account: &str, value: &str) -> Result<(), ClientError> {
         Self::entry(account)?
@@ -211,7 +248,23 @@ pub struct CredentialVault {
 }
 
 impl CredentialVault {
-    /// Creates a vault backed by the native OS credential store.
+    /// Uses application-managed owner-only storage on macOS/Linux and Windows Credential Manager
+    /// on Windows. The local backend never reads legacy macOS Keychain entries.
+    pub fn preferred(app_data_dir: &Path) -> Result<Self, ClientError> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let backend = Arc::new(LocalVaultBackend::new(app_data_dir)?);
+            Ok(Self::new(backend))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = app_data_dir;
+            Ok(Self::native())
+        }
+    }
+
+    /// Creates a vault backed by Windows Credential Manager.
+    #[cfg(target_os = "windows")]
     #[must_use]
     pub fn native() -> Self {
         Self::new(Arc::new(NativeVaultBackend))
@@ -745,26 +798,23 @@ impl FixedBase64 for X25519PublicKey {
 
 fn vault_error(code: &str) -> ClientError {
     let message = match code {
-        "vault_unavailable" | "vault_read_failed" | "vault_write_failed"
+        "vault_unavailable"
+        | "vault_read_failed"
+        | "vault_write_failed"
         | "vault_delete_failed" => native_vault_access_message(),
         _ => "The saved device credentials are unavailable or invalid.",
     };
     ClientError::internal(code, message)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "windows"))]
 const fn native_vault_access_message() -> &'static str {
-    "Connect cannot access macOS Keychain. Unlock your login keychain, then reopen the app."
+    "Connect cannot access its private local credential file. Check the app-data ownership and permissions, then reopen the app."
 }
 
 #[cfg(target_os = "windows")]
 const fn native_vault_access_message() -> &'static str {
     "Connect cannot access Windows Credential Manager. Unlock Windows, then reopen the app."
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const fn native_vault_access_message() -> &'static str {
-    "Connect cannot access the operating system credential store. Unlock it, then reopen the app."
 }
 
 #[cfg(test)]

@@ -406,7 +406,7 @@ impl ConnectService {
         self.snapshot_locked().await
     }
 
-    /// Revokes the account session, stops Xray, purges cache, and removes keyring material.
+    /// Revokes the account session, stops Xray, purges cache, and removes local credentials.
     pub async fn logout(&self, now: Timestamp) -> Result<ConnectSnapshot, ClientError> {
         let _operation = self.operations.lock().await;
         let binding = self

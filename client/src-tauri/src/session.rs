@@ -328,7 +328,7 @@ impl AccountSessionManager {
         .await
     }
 
-    /// Restores a keyring-backed session without loading a bearer access token from disk.
+    /// Restores a persisted session without loading a bearer access token from disk.
     pub async fn restore(
         &self,
         binding: SessionBinding,

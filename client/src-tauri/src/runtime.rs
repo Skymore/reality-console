@@ -75,9 +75,9 @@ pub struct ConnectRuntimeRegistry {
 
 impl ConnectRuntimeRegistry {
     /// Creates an empty process-local registry around the shared Xray supervisor.
-    #[must_use]
-    pub fn new(app_data_dir: PathBuf, supervisor: XraySupervisor) -> Self {
-        Self::new_with_vault(app_data_dir, supervisor, CredentialVault::native())
+    pub fn new(app_data_dir: PathBuf, supervisor: XraySupervisor) -> Result<Self, ClientError> {
+        let vault = CredentialVault::preferred(&app_data_dir)?;
+        Ok(Self::new_with_vault(app_data_dir, supervisor, vault))
     }
 
     fn new_with_vault(

@@ -381,6 +381,11 @@ desired -> received -> validated -> applied -> bundle available
 setup code 消费后不能在第二台设备重复使用。朋友新增设备时，网络所有者应为同一账号生成新
 Connect code。
 
+Connect 会自动保存登录状态，不需要朋友手工创建或管理 Keychain 项。macOS/Linux 默认写入
+当前用户独占的应用凭据文件（目录 `0700`、文件 `0600`）；Windows 使用 Credential Manager。
+macOS 旧版本留下的 Keychain 项不会被新版读取或自动删除。升级后如果账号或兼容连接未出现，
+为该设备重新生成一次 Connect code，或重新导入原始 `vless://` 链接。
+
 ### 6.2 连接和断开
 
 - 点击中央电源按钮连接。
@@ -710,7 +715,9 @@ CONTROL_DB="$HOME/Library/Application Support/Private Network/Control Service/st
 3. 退出 Connect。
 4. 删除应用。
 
-删除 App 前不移除账号会留下 credential-store 条目和恢复状态；重新安装可能继续识别旧设备。
+删除 App 前不移除账号会留下本地凭据和恢复状态；重新安装可能继续识别旧设备。macOS/Linux
+的 Connect 数据位于 `~/Library/Application Support/com.sky.realityclient/`，不要在账号仍需
+使用时手工删除。
 
 ### 10.2 Node Host 仅解除配对
 
@@ -771,6 +778,8 @@ python3 scripts/product/control-service.py stop
   转发到公开群聊或截图。
 - 管理 token 只在确实配置管理客户端时通过 `admin-token` 命令查看。
 - 每个朋友使用独立账号，每台 Connect 设备使用独立 device identity。
+- macOS/Linux 的 Connect 凭据文件虽然仅当前用户可读，但不具备 Keychain 的额外访问控制；
+  同一用户权限下运行的恶意软件仍可能读取它。不要在不可信或多人共用的系统账号中使用。
 - Relay 看不到 REALITY 明文，但可以观察元数据；VPS 管理员仍是信任边界的一部分。
 - Control 默认只保留最小化流量聚合；详细连接目的地记录默认关闭。
 - Node Host 流量最终从节点网络出口。节点所有者应明确同意，并理解朋友行为可能影响其公网 IP

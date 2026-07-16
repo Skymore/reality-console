@@ -25,8 +25,8 @@ VLESS, REALITY, UUIDs, and generated configuration remain implementation details
 2. Connect consumes the secret over HTTPS and creates a new `device_id` scoped to the member.
 3. The Control Service returns account metadata, a short-lived access token, and a rotating refresh
    credential.
-4. Connect stores the refresh credential in the operating-system credential store, obtains the
-   current signed bundle, selects a node, and is ready to connect.
+4. Connect stores the refresh credential in its platform credential backend, obtains the current
+   signed bundle, selects a node, and is ready to connect.
 
 Activation secrets are single-use and expire. Failed activation must not create a local signed-in
 state or reveal whether an unrelated account exists.
@@ -153,12 +153,14 @@ installer, and recovery design.
 ## 8. Credential and Local Data Security
 
 - Store refresh credentials, imported URIs, per-node UUIDs, REALITY connection secrets, and any key
-  that decrypts a cached bundle only in macOS Keychain or Windows Credential Manager.
-- Ordinary app-data files may contain account display metadata, device ID, bundle ID and timing,
-  node presentation data, health history, selection policy, and proxy recovery state. They must not
+  that decrypts a cached bundle only in the platform credential backend: an owner-only
+  application-managed file on macOS/Linux or Windows Credential Manager.
+- Ordinary metadata files may contain account display metadata, device ID, bundle ID and timing,
+  node presentation data, health history, selection policy, and proxy recovery state. Secret files
+  must be separate, atomically replaced, and owner-only; renderer and browser storage must never
   contain plaintext connection credentials or bearer tokens.
 - If the full signed envelope is cached in an app-data file, its secret-bearing payload is encrypted
-  with a random key held by the OS credential store and authenticated before parsing.
+  with a random key held by the platform credential backend and authenticated before parsing.
 - Persist replacement credentials before retiring rotated credentials. A crash during rotation must
   leave the new credential recoverable and must never restore a server-invalidated predecessor or
   write plaintext secrets.
@@ -180,8 +182,8 @@ installer, and recovery design.
   missing or unsupported fields before storage.
 - Imported profiles are local-only, are not associated with an account or device, do not receive
   updates, and do not participate in automatic multi-node selection.
-- The full URI is stored in the OS credential store; only non-secret display metadata is stored in
-  app data.
+- The full URI is stored in the platform credential backend; only non-secret display metadata is
+  stored in the profile index.
 - Compatibility mode is visibly labeled, and the app never falls back from a revoked or expired
   account bundle to an imported profile without an explicit member action.
 

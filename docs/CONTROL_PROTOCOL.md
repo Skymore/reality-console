@@ -528,7 +528,8 @@ authentication failures prevent account enumeration.
 family and source generation. The same key and current request reconstruct the same replacement
 credentials after response loss; using the prior token with a different key is reuse and revokes
 the complete session family. Connect persists the pending key beside the source refresh generation
-before network I/O and clears it only after the replacement is durable in the OS credential store.
+before network I/O and clears it only after the replacement is durable in the platform credential
+backend.
 
 ### Fetch profile bundle
 

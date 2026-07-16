@@ -239,11 +239,14 @@ packaging/macos/tests/uninstall-node-host.sh
 | Node Host state | `/Library/Application Support/Private Network Node/service-state/` |
 | Node Host LaunchDaemon | `/Library/LaunchDaemons/com.sky.realitynode.agent.plist` |
 | Node Host logs | `/Library/Logs/Private Network Node/` |
-| Connect secrets | 操作系统 credential store；普通 UI 不显示原始节点凭据 |
+| Connect secrets | macOS/Linux：`~/Library/Application Support/com.sky.realityclient/` 下的 `credentials-v1.json` 和按需创建的 `profile-credentials-v1.json`（目录 `0700`、文件 `0600`）；Windows：Credential Manager |
 
 Control UI、Node Host UI 可以关闭。Control Service 和 Node Host 由 launchd 独立运行；但
 Mac 进入系统睡眠后网络服务会暂停。需要持续可用时应使用保持唤醒的 Mac mini，或在明确理解
 电源和锁屏区别后配置仅阻止系统睡眠的工具。锁屏本身不会停止后台服务。
+
+Connect 会自动保存当前设备密钥、refresh credential 和账号绑定。macOS/Linux 不访问
+Keychain；这些数据由当前用户独占的应用文件保存。Windows 继续使用 Credential Manager。
 
 ## 安全原则
 

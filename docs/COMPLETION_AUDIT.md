@@ -30,7 +30,7 @@ restores it after an injected package-switch failure on macOS and Windows.
 | Requirement | State | Evidence still required |
 | --- | --- | --- |
 | ACC-001 | complete | Independent two-device revoke is covered by Control integration tests. |
-| ACC-002 | partial | Exercise native Keychain and Credential Manager from signed packages. |
+| ACC-002 | partial | Exercise owner-only macOS/Linux credential files and Windows Credential Manager from signed packages. |
 | ACC-003 | complete | Reset tokens are hashed, bounded, expiring, single-use, replay-safe, and audited. |
 | ACC-004 | partial | Stage 7 must prove removal on two installed Node Hosts and rejection of both old credentials. |
 | ACC-005 | partial | Frontend must keep manual VLESS import under compatibility only. |

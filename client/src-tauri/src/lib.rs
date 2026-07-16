@@ -4,6 +4,7 @@ pub mod control_api;
 mod core;
 mod error;
 mod headless;
+mod local_store;
 mod member_setup;
 mod process;
 mod profile;
@@ -232,7 +233,7 @@ fn run_application(headless: Option<HeadlessInvocation>) {
     let app = tauri::Builder::default()
         .setup(move |app| {
             let app_data_dir = app.path().app_data_dir()?;
-            let profiles = ProfileRepository::native(app_data_dir.clone())
+            let profiles = ProfileRepository::preferred(app_data_dir.clone())
                 .map_err(|error| std::io::Error::other(error.message))?;
             app.manage(profiles);
             let supervisor = XraySupervisor::new(app_data_dir.clone())
@@ -245,7 +246,9 @@ fn run_application(headless: Option<HeadlessInvocation>) {
                 }
             });
             app.manage(SetupSessionStore::new());
-            app.manage(ConnectRuntimeRegistry::new(app_data_dir, supervisor));
+            let runtime = ConnectRuntimeRegistry::new(app_data_dir, supervisor)
+                .map_err(|error| std::io::Error::other(error.message))?;
+            app.manage(runtime);
             if let Some(invocation) = headless {
                 if let Some(window) = app.get_webview_window("main") {
                     window.hide()?;

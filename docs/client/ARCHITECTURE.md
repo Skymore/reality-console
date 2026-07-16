@@ -33,7 +33,7 @@ flowchart LR
     Session -->|"HTTPS activate, login, refresh"| Control["Control Service"]
     App --> Bundle["Signed bundle repository"]
     Bundle -->|"conditional HTTPS fetch"| Control
-    Bundle --> Secrets["Keychain or Credential Manager"]
+    Bundle --> Secrets["Platform credential backend"]
     Bundle --> Cache["Atomic encrypted cache"]
     App --> Select["Node selection engine"]
     Select --> Health["Bounded endpoint probes and health history"]
@@ -71,8 +71,8 @@ device identity. It serializes refreshes so concurrent API calls cannot rotate t
 twice. Activation and login persist device keys, nonce, and operation identity before network I/O.
 Refresh persists a generation-scoped idempotency key beside the source credential. Exact retries
 therefore reproduce the same signed request and server response after a process or network failure.
-It stores the refresh credential under an account/device-scoped key in the OS credential store and
-commits a replacement before deleting the prior value.
+It stores the refresh credential under an account/device-scoped key in the selected credential
+backend and commits a replacement before deleting the prior value.
 
 Session restoration and bundle availability are separate states: Control Service failure may make
 online authentication unavailable while an unexpired verified cache still permits data-plane use.
@@ -114,14 +114,14 @@ Maintains two generations, `active` and `previous`, plus a small non-secret inde
 
 1. verify the complete candidate in memory;
 2. write and sync an authenticated encrypted candidate file, with its random encryption key stored
-   under a candidate `bundle_id` key in Keychain or Credential Manager;
+   under a candidate `bundle_id` key in the selected credential backend;
 3. atomically replace the non-secret active-generation pointer;
 4. retain the previous generation until the new one can be read, decrypted, reverified, and used;
 5. garbage-collect superseded credentials and cache files after commit.
 
 This ordering makes a crash recover to either complete generation. The encryption key and all
-refresh or URI credentials remain outside ordinary app data. Cache reads always reauthenticate the
-encrypted file and reverify the Control Service signature before use.
+refresh or URI credentials remain outside ordinary metadata files. Cache reads always
+reauthenticate the encrypted file and reverify the Control Service signature before use.
 
 ### `selection`
 
@@ -168,9 +168,9 @@ connection commands.
 ### `compatibility_profile`
 
 Retains the existing strict `vless://` parser and profile repository. The imported URI remains in
-the OS credential store. The module emits the same normalized `ConnectionProfile` consumed by the
-config generator and supervisor but has no account, refresh, bundle, automatic selection, or
-fallback behavior.
+the selected platform credential backend. The module emits the same normalized
+`ConnectionProfile` consumed by the config generator and supervisor but has no account, refresh,
+bundle, automatic selection, or fallback behavior.
 
 ## 4. State Model
 
@@ -225,13 +225,13 @@ reason.
 
 | Data | Owner | Storage |
 | --- | --- | --- |
-| Refresh credential | `account_session` | Keychain / Credential Manager |
+| Refresh credential | `account_session` | Owner-only app credential file on macOS/Linux; Credential Manager on Windows |
 | Access token | `account_session` | Memory only |
 | Bundle signing trust | `bundle` | App trust configuration plus authenticated rotation metadata |
 | Signed secret-bearing bundle | `bundle_repository` | Authenticated encrypted app-data file |
-| Bundle encryption key | `bundle_repository` | Keychain / Credential Manager |
-| Imported URI | `compatibility_profile` | Keychain / Credential Manager |
-| Installed account binding and controller trust | application service | Versioned native credential-store record |
+| Bundle encryption key | `bundle_repository` | Selected platform credential backend |
+| Imported URI | `compatibility_profile` | Owner-only app credential file on macOS/Linux; Credential Manager on Windows |
+| Installed account binding and controller trust | application service | Versioned platform credential record |
 | Node labels, selection policy, health history | `selection` | Non-secret atomic app-data files |
 | Runtime Xray config | `XraySupervisor` | Ephemeral owner-only runtime file |
 | Prior system proxy state | `system_proxy` | Durable non-secret recovery record with owner-only access |
@@ -320,5 +320,5 @@ in a production build through renderer input or ordinary settings.
 - Relay unavailable: mark only affected relay paths unhealthy.
 - Xray exits or fails validation/readiness: clean runtime state, restore proxy settings, and retain
   the selected policy for explicit retry.
-- Credential store unavailable: do not write secrets to app data; expose recovery guidance.
+- Credential store unavailable or unsafe: reject startup/storage and expose recovery guidance.
 - Port occupied: fail before Xray launch or system proxy mutation.

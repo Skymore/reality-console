@@ -75,7 +75,8 @@ node's Internet exit IP. Cloudflare Tunnel is limited to HTTP control APIs.
 
 - Tauri application with bundled Xray, account session, signed bundle cache, selection policy, and
   OS proxy integration.
-- Stores refresh tokens and connection secrets in the OS credential store.
+- Stores refresh tokens and connection secrets in an owner-only app credential file on macOS/Linux
+  or Windows Credential Manager.
 - Continues using an unexpired cached bundle while the Control Service is unavailable.
 
 ### Relay

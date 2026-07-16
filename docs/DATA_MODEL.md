@@ -555,10 +555,11 @@ paused rather than silently losing quota/accounting data.
 
 ## 5. Connect Local Persistence Version 1
 
-Connect does not share Control's SQLite database. Native Keychain/Credential Manager entries hold
-device private keys, two refresh slots with pending idempotency state, activation/login pending
-operations, and one versioned installed-account record containing public controller trust and the
-device binding. The renderer cannot enumerate or read these records.
+Connect does not share Control's SQLite database. Its platform credential backend holds device
+private keys, two refresh slots with pending idempotency state, activation/login pending operations,
+and one versioned installed-account record containing public controller trust and the device
+binding. macOS/Linux use an atomically replaced owner-only application file; Windows uses
+Credential Manager. The renderer cannot enumerate or read these records.
 
 Each device has an owner-only `account-bundles-v1/<network>/<user>/<device>` directory containing
 immutable signed HPKE bundle artifacts plus one atomic `active.json` pointer. Writes sync the file

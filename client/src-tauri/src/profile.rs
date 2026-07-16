@@ -1,6 +1,8 @@
 use crate::core::connection::ConnectionProfile;
 use crate::core::invite::parse_invitation;
 use crate::error::ClientError;
+#[cfg(not(target_os = "windows"))]
+use crate::local_store::OwnerOnlySecretFile;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -10,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const PROFILE_INDEX_VERSION: u8 = 1;
+#[cfg(target_os = "windows")]
 const KEYRING_SERVICE: &str = "com.sky.realityclient.profile";
 
 pub trait SecretStore: Send + Sync {
@@ -18,8 +21,10 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, key: &str) -> Result<(), ClientError>;
 }
 
+#[cfg(target_os = "windows")]
 pub struct NativeSecretStore;
 
+#[cfg(target_os = "windows")]
 impl NativeSecretStore {
     fn entry(key: &str) -> Result<keyring::Entry, ClientError> {
         keyring::Entry::new(KEYRING_SERVICE, key).map_err(|_| {
@@ -31,6 +36,36 @@ impl NativeSecretStore {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+struct LocalSecretStore {
+    store: OwnerOnlySecretFile,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl LocalSecretStore {
+    fn new(app_data_dir: &Path) -> Result<Self, ClientError> {
+        Ok(Self {
+            store: OwnerOnlySecretFile::new(app_data_dir, "profile-credentials-v1.json")?,
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl SecretStore for LocalSecretStore {
+    fn set(&self, key: &str, secret: &str) -> Result<(), ClientError> {
+        self.store.set(key, secret)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>, ClientError> {
+        self.store.get(key)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), ClientError> {
+        self.store.delete(key)
+    }
+}
+
+#[cfg(target_os = "windows")]
 impl SecretStore for NativeSecretStore {
     fn set(&self, key: &str, secret: &str) -> Result<(), ClientError> {
         Self::entry(key)?.set_password(secret).map_err(|_| {
@@ -113,6 +148,19 @@ pub struct ProfileRepository {
 }
 
 impl ProfileRepository {
+    pub fn preferred(app_data_dir: PathBuf) -> Result<Self, ClientError> {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let local = Arc::new(LocalSecretStore::new(&app_data_dir)?);
+            Self::new(app_data_dir, local)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self::native(app_data_dir)
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     pub fn native(app_data_dir: PathBuf) -> Result<Self, ClientError> {
         Self::new(app_data_dir, Arc::new(NativeSecretStore))
     }

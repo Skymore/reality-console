@@ -34,7 +34,8 @@ Deliverables:
   envelopes, cancellation, and retry classification;
 - one-time activation and optional password-login flows;
 - device-scoped refresh session restoration and serialized refresh-token rotation;
-- Keychain and Credential Manager storage adapters with account/device namespaces;
+- owner-only macOS/Linux file storage and Windows Credential Manager adapters with account/device
+  namespaces;
 - in-memory access tokens, logout, local credential cleanup, and revocation/disabled-account states;
 - activation, login, refresh rotation, crash-during-rotation, logout, rate-limit, and generic-auth-
   failure tests.
@@ -133,7 +134,7 @@ Exit criteria:
 Deliverables:
 
 - move existing `vless://` import behind an explicit Compatibility/Advanced action;
-- preserve strict field validation, field-specific errors, Keychain/Credential Manager storage, and
+- preserve strict field validation, field-specific errors, platform credential storage, and
   local-only profile management;
 - clearly distinguish compatibility profiles from account nodes and disable account bundle refresh,
   automatic selection, and fallback controls for them;

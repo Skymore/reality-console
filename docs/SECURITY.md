@@ -61,7 +61,7 @@ resource bounds, and safe failure behavior.
 ### Core Assumptions
 
 - the controller host and at least one administrator recovery device are initially trusted;
-- operating systems provide a working CSPRNG and supported credential store;
+- operating systems provide a working CSPRNG and supported secret-storage backend;
 - Xray, the TLS implementation, the OS, and cryptographic libraries are kept supported;
 - a node compromise exposes that node's traffic, local telemetry, VLESS credentials, and REALITY
   private key, but must not expose credentials for other nodes;
@@ -217,9 +217,9 @@ process arguments, crash reports, and renderer persistence must not contain it.
 5. The controller issues the minimum credential for that identity: a node certificate, an admin
    device credential, or a device enrollment credential. Its response is bound to both nonces,
    both public keys, the controller identity, purpose, and pairing record ID.
-6. The joining party verifies that binding, stores credentials in the OS credential store, and
-   sends authenticated completion. If completion does not arrive, the record remains consumed and
-   a new pairing ceremony is required.
+6. The joining party verifies that binding, stores credentials in its approved platform credential
+   backend, and sends authenticated completion. If completion does not arrive, the record remains
+   consumed and a new pairing ceremony is required.
 
 Replay, second claim, expired claim, purpose substitution, transcript modification, and unknown
 controller fingerprint MUST fail closed and create a redacted audit event. Pairing secrets MUST
@@ -253,7 +253,8 @@ expiry, token-family ID, and revocation state. Tokens are never stored plaintext
 - Tokens have an exact audience and narrow scopes; admin, node, device, relay, and update tokens
   are not interchangeable.
 - Browser-facing tokens use `Secure`, `HttpOnly`, and `SameSite=Strict` cookies with CSRF
-  protection. Native clients store tokens only in the OS credential store, never web storage.
+  protection. Native clients store tokens only in the platform credential backend, never web
+  storage.
 - Logout revokes the current refresh-token family. Account disable/delete blocks refresh
   immediately and publishes cross-node removals. Administrative device revoke and password/session
   reset also rotate every enabled per-node member credential so the lost device's cached bundle
@@ -385,6 +386,15 @@ Secrets MUST NOT be placed in source control, environment-variable dumps, comman
 analytics, crash reports, support bundles, browser storage, or world-readable temporary files.
 Memory containing secrets SHOULD be zeroized when supported. Support exports use an allowlist and
 are scanned for known secret formats before creation.
+
+### Connect Client Devices
+
+Connect uses an atomically replaced application-managed file with directory mode `0700` and file
+mode `0600` on macOS/Linux. Windows uses Credential Manager. The file backend is the deliberate
+default for low-friction trusted-friends deployments, not an encrypted substitute for Keychain:
+malware already running as the same OS user can read it. Connect rejects symlinked credential
+directories and unsafe credential paths, keeps access tokens memory-only, and never exposes the
+stored values to renderer or browser storage.
 
 ### Relay Provisioning Material
 
@@ -748,8 +758,9 @@ documented manual review demonstrate all of the following.
   stale generations, duplicate generations with different content, and unsupported client
   versions.
 - Device A cannot decrypt or install Device B's bundle.
-- Native secret-storage inspection confirms long-lived keys and refresh tokens are in the OS
-  credential store, not SQLite, web storage, command lines, or plaintext files.
+- Native secret-storage inspection confirms long-lived keys and refresh tokens are in Windows
+  Credential Manager or an atomically replaced owner-only Connect file, not SQLite, web storage,
+  command lines, or ordinary metadata files.
 - A controller database and backup compromise test does not reveal any node REALITY private key.
 - Files containing node runtime secrets have owner-only permissions and atomic replacement tests
   leave either the old or new complete file after simulated interruption.
