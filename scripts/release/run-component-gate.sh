@@ -37,7 +37,8 @@ case "$component" in
     cargo test --locked --manifest-path "$manifest" --lib db::tests::applies_required_pragmas_and_records_authoritative_migration -- --exact
     cargo test --locked --manifest-path "$manifest" --lib db::tests::v3_upgrade_discards_untrusted_heartbeat_progress_and_builds_revision_journal -- --exact
     cargo test --locked --manifest-path "$manifest" --lib db::tests::v4_upgrade_preserves_revision_graph_and_accepts_schema_two -- --exact
-    python3 scripts/release/verify-control-previous-migration.py
+    target_dir=$(python3 scripts/release/cargo-target-dir.py "$manifest")
+    python3 scripts/release/verify-control-previous-migration.py --binary "$target_dir/debug/control-server"
     python3 -m unittest discover -s scripts/product/tests -v
     version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' control-server/Cargo.toml | head -1)
     ;;
@@ -77,7 +78,8 @@ case "$component" in
     checks=(format build test clippy rustdoc headless-smoke sidecar-test typecheck production-build)
     scripts/release/prepare-sidecars.sh --product connect --target aarch64-apple-darwin
     rust_gate client/src-tauri/Cargo.toml
-    scripts/smoke/run-connect-headless.sh client/src-tauri/target/debug/reality-client
+    target_dir=$(python3 scripts/release/cargo-target-dir.py client/src-tauri/Cargo.toml)
+    scripts/smoke/run-connect-headless.sh "$target_dir/debug/reality-client"
     npm_gate client "npm run test:sidecar" "npx tsc --noEmit" "npm run build"
     version=$(python3 -c 'import json; print(json.load(open("client/src-tauri/tauri.conf.json"))["version"])')
     ;;

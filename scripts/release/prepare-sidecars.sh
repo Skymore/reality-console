@@ -34,7 +34,8 @@ case "$PRODUCT" in
     mkdir -p "$OUT_DIR"
     OUT="$OUT_DIR/xray-$TARGET$EXT"
     cargo build --locked --manifest-path "$ROOT/node-host/Cargo.toml" --target "$TARGET" $( [ "$PROFILE" = release ] && printf %s --release )
-    SOURCE="$ROOT/node-host/target/$TARGET/$PROFILE/node-host$EXT"
+    CARGO_TARGET_DIR=$(python3 "$ROOT/scripts/release/cargo-target-dir.py" "$ROOT/node-host/Cargo.toml")
+    SOURCE="$CARGO_TARGET_DIR/$TARGET/$PROFILE/node-host$EXT"
     [ -f "$SOURCE" ] || { echo "missing Node Host build: $SOURCE" >&2; exit 1; }
     cp "$SOURCE" "$OUT_DIR/node-host-$TARGET$EXT"
     chmod 755 "$OUT_DIR/node-host-$TARGET$EXT" 2>/dev/null || true

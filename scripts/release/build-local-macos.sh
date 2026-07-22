@@ -28,6 +28,8 @@ case "$PRODUCT" in
   node-host) DIRECTORY=$ROOT/node-host-app ;;
   *) echo "unknown product: $PRODUCT" >&2; exit 64 ;;
 esac
+APP_NAME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["productName"])' \
+  "$DIRECTORY/src-tauri/tauri.conf.json")
 
 (
   cd "$DIRECTORY"
@@ -36,9 +38,9 @@ esac
     --config src-tauri/tauri.local.conf.json
 )
 
-APP=$(find "$DIRECTORY/src-tauri/target/$TARGET/release/bundle/macos" \
-  -maxdepth 1 -type d -name '*.app' -print -quit)
-if [[ -z "$APP" ]]; then
+TARGET_DIR=$(python3 "$ROOT/scripts/release/cargo-target-dir.py" "$DIRECTORY/src-tauri/Cargo.toml")
+APP="$TARGET_DIR/$TARGET/release/bundle/macos/$APP_NAME.app"
+if [[ ! -d "$APP" ]]; then
   echo "Tauri did not produce a macOS application bundle" >&2
   exit 1
 fi

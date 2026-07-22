@@ -15,6 +15,8 @@ permissions:
   contents: read
 
 env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
   CARGO_TERM_COLOR: always
   RUST_TOOLCHAIN: "1.88.0"
   NODE_VERSION: "22.17.0"
@@ -240,7 +242,7 @@ jobs:
         run: |
           cargo build --locked --manifest-path client/src-tauri/Cargo.toml --release --target "${{ matrix.triple }}"
           scripts/release/sign-windows.ps1 `
-            -Files "client/src-tauri/target/${{ matrix.triple }}/release/reality-client.exe","client/src-tauri/binaries/xray-${{ matrix.triple }}.exe" `
+            -Files "$env:CARGO_TARGET_DIR/${{ matrix.triple }}/release/reality-client.exe","client/src-tauri/binaries/xray-${{ matrix.triple }}.exe" `
             -StatusFile "$env:RUNNER_TEMP/windows-inner-signing-status.json"
       - name: Build Tauri package
         working-directory: ${{ matrix.project }}
@@ -256,7 +258,7 @@ jobs:
           VERSION=$(python3 -c 'import json; print(json.load(open("${{ matrix.project }}/src-tauri/tauri.conf.json"))["version"])')
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           mkdir -p release-output
-          bundle="${{ matrix.project }}/src-tauri/target/${{ matrix.triple }}/release/bundle"
+          bundle="$CARGO_TARGET_DIR/${{ matrix.triple }}/release/bundle"
           if [[ "${{ matrix.product }}" == nodeHost ]]; then
             app=$(find "$bundle/macos" -maxdepth 1 -name '*.app' -type d -print -quit)
             ext=""; agent="node-host-${{ matrix.triple }}"; xray="xray-${{ matrix.triple }}"

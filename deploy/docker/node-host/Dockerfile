@@ -1,6 +1,8 @@
 FROM rust:1.88-bookworm AS builder
 
 WORKDIR /source
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_DIR=/source/target/cargo
 COPY . .
 RUN cargo build --release --locked --manifest-path node-host/Cargo.toml --bin node-host
 
@@ -31,7 +33,7 @@ RUN apt-get update \
     && groupadd --gid 10001 private-network \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin private-network \
     && install -d -m 0700 -o 10001 -g 10001 /var/lib/private-network-node
-COPY --from=builder /source/node-host/target/release/node-host /opt/private-network/node-host
+COPY --from=builder /source/target/cargo/release/node-host /opt/private-network/node-host
 COPY --from=xray /xray /opt/private-network/xray
 COPY --from=xray /xray.sha256 /opt/private-network/xray.sha256
 COPY deploy/docker/node-host/entrypoint.sh /usr/local/bin/private-network-node

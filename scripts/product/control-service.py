@@ -334,7 +334,22 @@ def install(args: argparse.Namespace) -> None:
         cwd=ROOT,
         check=True,
     )
-    built = ROOT / "control-server/target/release/control-server"
+    metadata = subprocess.run(
+        [
+            "cargo",
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--manifest-path",
+            str(ROOT / "control-server/Cargo.toml"),
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    built = Path(json.loads(metadata.stdout)["target_directory"]) / "release/control-server"
     installed = data_dir / "bin/control-server"
     temporary = installed.with_name(f".{installed.name}.{os.getpid()}.tmp")
     shutil.copyfile(built, temporary)

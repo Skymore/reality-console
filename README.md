@@ -183,9 +183,31 @@ npm --prefix node-host-app run bundle:macos:local
 npm --prefix client run bundle:macos:local
 ```
 
-输出位于各应用的 `src-tauri/target/<target>/release/bundle/`。本机身份仅用于开发验证；Node
+输出位于共享的 `target/cargo/<target>/release/bundle/`。本机身份仅用于开发验证；Node
 Host 系统 `.pkg`、公开签名、notarization 和 Windows 安装器请按 [RELEASE.md](./RELEASE.md)
 执行，不能把本机 bundle 重新命名为正式发行版。
+
+## Cargo 磁盘占用
+
+仓库内所有独立 Cargo 项目通过 [`.cargo/config.toml`](./.cargo/config.toml) 共用
+`target/cargo/`。Debug 和 Test 默认关闭增量编译，并保留行号级而不是完整变量级调试信息，
+避免每个组件重复保存 Tokio、Tauri、数据库和加密依赖。需要临时恢复增量编译时可以为单次命令
+设置 `CARGO_INCREMENTAL=1`。
+
+查看共享目录和旧目录占用：
+
+```bash
+npm run cargo:storage
+```
+
+升级到共享目录后，删除原来分散在各组件下的构建结果：
+
+```bash
+npm run cargo:clean:legacy
+```
+
+需要彻底清空所有 Rust 构建缓存时使用 `npm run cargo:clean:all`。两个清理命令只删除 Cargo
+构建产物；运行前先确认本仓库没有正在执行的 Cargo/Tauri 构建。下次构建会重新编译依赖。
 
 ## 常用测试
 

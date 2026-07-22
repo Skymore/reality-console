@@ -7,6 +7,9 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "bundle:macos:local": "scripts/release/build-local-macos.sh control",
+    "cargo:storage": "scripts/dev/cargo-storage.sh audit",
+    "cargo:clean:legacy": "scripts/dev/cargo-storage.sh clean-legacy",
+    "cargo:clean:all": "scripts/dev/cargo-storage.sh clean-all",
     "preview": "vite preview",
     "tauri": "tauri"
   },

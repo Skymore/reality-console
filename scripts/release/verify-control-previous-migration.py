@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -125,8 +126,24 @@ def verify_database(path: Path, current: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=Path("control-server/src/db.rs"))
-    parser.add_argument("--binary", type=Path, default=Path("control-server/target/debug/control-server"))
+    parser.add_argument("--binary", type=Path)
     args = parser.parse_args()
+    if args.binary is None:
+        metadata = subprocess.run(
+            [
+                "cargo",
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--manifest-path",
+                "control-server/Cargo.toml",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        args.binary = Path(json.loads(metadata.stdout)["target_directory"]) / "debug/control-server"
     if not args.binary.is_file():
         raise ValueError(f"built Control binary is missing: {args.binary}")
     current, records = migrations(args.source.read_text(encoding="utf-8"))
