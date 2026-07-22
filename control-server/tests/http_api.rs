@@ -512,9 +512,11 @@ fn assert_revoked_state_and_lifecycle_audit(app: &TestApp, node_id: NodeId) {
     assert_eq!(events[3].3["idempotent"], true);
     assert_eq!(
         (events[4].1.as_str(), events[4].2.as_str()),
-        ("node.approved", "rejected")
+        ("node.approved", "success")
     );
-    assert_eq!(events[4].3["reason"], "invalid-state-transition");
+    assert_eq!(events[4].3["fromStatus"], "disabled");
+    assert_eq!(events[4].3["toStatus"], "active");
+    assert_eq!(events[4].3["idempotent"], false);
     assert_eq!(
         (events[5].1.as_str(), events[5].2.as_str()),
         ("node.revoked", "success")
@@ -1199,9 +1201,12 @@ async fn operator_lifecycle_is_strict_idempotent_audited_and_blocks_node_auth() 
         "node_revoked"
     );
 
-    let conflict = admin_node_action(&app, node.node_id, "approve").await;
-    assert_eq!(conflict.status(), StatusCode::CONFLICT);
-    assert_eq!(json(conflict).await["error"]["code"], "conflict");
+    assert_eq!(
+        admin_node_action(&app, node.node_id, "approve")
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
 
     assert_eq!(
         admin_node_action(&app, node.node_id, "revoke")

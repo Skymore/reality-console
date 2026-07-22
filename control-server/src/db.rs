@@ -9850,7 +9850,9 @@ fn node_lifecycle_target(
     current_status: &str,
 ) -> Result<Option<&'static str>, DatabaseError> {
     match action {
-        NodeLifecycleAction::Approve if matches!(current_status, "pending" | "active") => {
+        NodeLifecycleAction::Approve
+            if matches!(current_status, "pending" | "active" | "disabled") =>
+        {
             Ok(Some("active"))
         }
         NodeLifecycleAction::Disable

@@ -273,6 +273,7 @@ function App() {
   const [editingNodeIds, setEditingNodeIds] = useState<string[]>([])
   const [delivery, setDelivery] = useState<SetupDelivery | null>(null)
   const [deliveryKind, setDeliveryKind] = useState<"connect" | "node">("connect")
+  const [nodePendingRevoke, setNodePendingRevoke] = useState<ControlNode | null>(null)
   const [mutating, setMutating] = useState(false)
 
   const activeNodes = control.nodes.filter((node) => node.status === "active")
@@ -417,19 +418,20 @@ function App() {
     )
   }
 
-  async function runNodeAction(node: ControlNode, action: "approve" | "disable" | "revoke") {
-    if (action === "revoke") {
-      const confirmed = window.confirm(
-        language === "zh"
-          ? `永久撤销节点 ${node.displayName}？它必须重新加入网络才能恢复。`
-          : `Permanently revoke ${node.displayName}? It must join again to recover.`,
-      )
-      if (!confirmed) return
-    }
-    await mutate(
+  async function performNodeAction(node: ControlNode, action: "approve" | "disable" | "revoke") {
+    const result = await mutate(
       () => invoke("control_node_action", { input: { nodeId: node.nodeId, action } }),
       language === "zh" ? "节点状态已更新" : "Node state updated",
     )
+    if (result !== null && action === "revoke") setNodePendingRevoke(null)
+  }
+
+  function runNodeAction(node: ControlNode, action: "approve" | "disable" | "revoke") {
+    if (action === "revoke") {
+      setNodePendingRevoke(node)
+      return
+    }
+    void performNodeAction(node, action)
   }
 
   async function serviceAction(action: "start" | "stop" | "restart") {
@@ -701,6 +703,38 @@ function App() {
             <Button variant="outline" onClick={() => delivery && void copyText(delivery.setupLink, setNotice, t.copied)}><Link2 />{language === "zh" ? "复制链接" : "Copy link"}</Button>
           </div>
           <DialogFooter><Button onClick={() => setDelivery(null)}>{t.close}</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(nodePendingRevoke)}
+        onOpenChange={(open) => {
+          if (!open && !mutating) setNodePendingRevoke(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{language === "zh" ? "永久撤销这个节点？" : "Permanently revoke this node?"}</DialogTitle>
+            <DialogDescription>
+              {language === "zh"
+                ? `${nodePendingRevoke?.displayName ?? "该节点"} 将立即失去控制面和所有朋友账号的访问权限。此操作无法撤销；这台设备必须使用新的节点邀请码重新加入。`
+                : `${nodePendingRevoke?.displayName ?? "This node"} will immediately lose Control and all friend-account access. This cannot be undone; the device must join again with a new node setup code.`}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-xl border border-destructive/25 bg-destructive/5 p-3 text-sm">
+            <p className="font-medium">{nodePendingRevoke?.displayName}</p>
+            <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{nodePendingRevoke?.nodeId}</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setNodePendingRevoke(null)} disabled={mutating}>{t.cancel}</Button>
+            <Button
+              variant="destructive"
+              onClick={() => nodePendingRevoke && void performNodeAction(nodePendingRevoke, "revoke")}
+              disabled={!nodePendingRevoke || mutating}
+            >
+              {language === "zh" ? "永久撤销" : "Revoke permanently"}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
