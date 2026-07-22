@@ -51,6 +51,7 @@ import type { XraySnapshot } from "@/lib/xray"
 import { cn } from "@/lib/utils"
 
 type PageId = "network" | "nodes" | "friends" | "local" | "settings"
+type MutationResult<T> = { succeeded: true; value: T } | { succeeded: false }
 
 const fallbackLocal: XraySnapshot = {
   installed: false,
@@ -318,17 +319,17 @@ function App() {
     localStorage.setItem("locale", next)
   }
 
-  async function mutate<T>(operation: () => Promise<T>, success: string): Promise<T | null> {
+  async function mutate<T>(operation: () => Promise<T>, success: string): Promise<MutationResult<T>> {
     setMutating(true)
     setError(null)
     try {
       const result = await operation()
       setNotice(success)
       await refresh()
-      return result
+      return { succeeded: true, value: result }
     } catch (reason) {
       setError(errorMessage(reason))
-      return null
+      return { succeeded: false }
     } finally {
       setMutating(false)
     }
@@ -337,11 +338,12 @@ function App() {
   async function createFriend() {
     const name = friendName.trim()
     if (!name) return
-    const account = await mutate(
+    const result = await mutate(
       () => invoke<ControlAccount>("create_control_account", { input: { displayName: name } }),
       language === "zh" ? "朋友账号已创建" : "Friend account created",
     )
-    if (!account) return
+    if (!result.succeeded) return
+    const account = result.value
     if (friendNodeIds.length > 0) {
       await mutate(
         () => invoke("update_control_account_nodes", {
@@ -371,11 +373,11 @@ function App() {
       }),
       language === "zh" ? "节点邀请码已创建" : "Node invitation created",
     )
-    if (!result) return
+    if (!result.succeeded) return
     setNodeDialogOpen(false)
     setNodeName("")
     setDeliveryKind("node")
-    setDelivery(result)
+    setDelivery(result.value)
   }
 
   async function saveAccountNodes() {
@@ -386,7 +388,7 @@ function App() {
       }),
       language === "zh" ? "账号节点已更新" : "Account nodes updated",
     )
-    if (result !== null) setEditingAccount(null)
+    if (result.succeeded) setEditingAccount(null)
   }
 
   async function createConnectCode(account: ControlAccount) {
@@ -396,9 +398,9 @@ function App() {
       }),
       language === "zh" ? "客户端登录码已创建" : "Connect setup code created",
     )
-    if (!result) return
+    if (!result.succeeded) return
     setDeliveryKind("connect")
-    setDelivery(result)
+    setDelivery(result.value)
   }
 
   async function setAccountStatus(account: ControlAccount, status: "active" | "disabled" | "deleted") {
@@ -423,7 +425,7 @@ function App() {
       () => invoke("control_node_action", { input: { nodeId: node.nodeId, action } }),
       language === "zh" ? "节点状态已更新" : "Node state updated",
     )
-    if (result !== null && action === "revoke") setNodePendingRevoke(null)
+    if (result.succeeded && action === "revoke") setNodePendingRevoke(null)
   }
 
   function runNodeAction(node: ControlNode, action: "approve" | "disable" | "revoke") {
@@ -439,7 +441,7 @@ function App() {
       () => invoke("service_action", { action }),
       language === "zh" ? "本机 Xray 状态已更新" : "Local Xray state updated",
     )
-    if (result !== null) {
+    if (result.succeeded) {
       setNotice(
         language === "zh"
           ? action === "stop" ? "兼容 Xray 已停止" : action === "restart" ? "兼容 Xray 已重启" : "兼容 Xray 已启动"
