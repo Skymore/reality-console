@@ -41,7 +41,13 @@ try {
 
   $process = Start-Process -FilePath $Artifact -ArgumentList "/S" -Wait -PassThru
   if ($process.ExitCode -ne 0) { throw "Installer exited with code $($process.ExitCode)" }
-  $uninstall = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* -ErrorAction SilentlyContinue |
+  $uninstallRegistryPaths = @(
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+  )
+  $uninstall = Get-ItemProperty -Path $uninstallRegistryPaths -ErrorAction SilentlyContinue |
     Where-Object { $_.DisplayName -in "Reality Client", "Private Network Connect" } |
     Select-Object -First 1
   if (-not $uninstall -or -not $uninstall.InstallLocation) { throw "Installed application was not registered with an install location" }
