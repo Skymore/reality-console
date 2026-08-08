@@ -18,7 +18,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 

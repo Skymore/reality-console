@@ -115,6 +115,14 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - name: Install pinned Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Compile Connect Windows boundary
+        shell: bash
+        run: cargo check --locked --manifest-path client/src-tauri/Cargo.toml
       - name: Validate PowerShell and simulated lifecycle semantics
         shell: pwsh
         run: |
