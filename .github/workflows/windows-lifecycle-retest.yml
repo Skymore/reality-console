@@ -1,0 +1,48 @@
+name: Windows lifecycle retest
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Release build run containing the unsigned Windows artifact
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Actual Windows installer retest
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: connect-windows-x86_64-unsigned-validation
+          path: lifecycle-input
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - name: Select actual installer
+        shell: bash
+        run: |
+          artifact=$(find lifecycle-input -maxdepth 1 -type f -name '*.exe' -print -quit)
+          [[ -n "$artifact" ]] || { echo "actual Windows installer is missing" >&2; exit 66; }
+          echo "LIFECYCLE_ARTIFACT=$artifact" >> "$GITHUB_ENV"
+          mkdir -p lifecycle-evidence
+      - name: Install, exercise, and uninstall actual package
+        shell: pwsh
+        run: |
+          scripts/smoke/run-windows-artifact-lifecycle.ps1 `
+            -Artifact $env:LIFECYCLE_ARTIFACT `
+            -Target "connect-windows-x86_64" `
+            -Mode validation `
+            -SignatureOutput "lifecycle-evidence/connect-windows-x86_64.signature-verification.json" `
+            -LifecycleOutput "lifecycle-evidence/connect-windows-x86_64.lifecycle.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-lifecycle-retest-${{ inputs.source_run_id }}
+          path: lifecycle-evidence/
+          if-no-files-found: warn

@@ -53,7 +53,8 @@ try {
   if (-not $uninstall -or -not $uninstall.InstallLocation) { throw "Installed application was not registered with an install location" }
   $installLocation = $uninstall.InstallLocation
   $installedDuringRun = $true
-  $executables = Get-ChildItem -LiteralPath $installLocation -Recurse -File -Filter *.exe
+  $executables = Get-ChildItem -LiteralPath $installLocation -Recurse -Filter *.exe |
+    Where-Object { -not $_.PSIsContainer }
   if (-not $executables) { throw "Installed package contains no executable binaries" }
   $connectBinary = Join-Path $installLocation "reality-client.exe"
   if (-not (Test-Path -LiteralPath $connectBinary -PathType Leaf)) {
@@ -73,7 +74,9 @@ try {
   }
 } finally {
   if ($installedDuringRun -and $installLocation -and (Test-Path -LiteralPath $installLocation)) {
-    $uninstaller = Get-ChildItem -LiteralPath $installLocation -File -Filter "uninstall*.exe" | Select-Object -First 1
+    $uninstaller = Get-ChildItem -LiteralPath $installLocation -Filter "uninstall*.exe" |
+      Where-Object { -not $_.PSIsContainer } |
+      Select-Object -First 1
     if (-not $uninstaller) { throw "Installed package has no uninstaller; refusing to leave test state behind" }
     $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList "/S" -Wait -PassThru
     if ($uninstallProcess.ExitCode -ne 0 -or (Test-Path -LiteralPath $installLocation)) {
