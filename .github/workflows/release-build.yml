@@ -259,6 +259,10 @@ jobs:
         working-directory: ${{ matrix.project }}
         shell: bash
         run: |
+          if [[ "$MODE" == validation ]]; then
+            # Tauri treats an exported empty certificate as a signing request.
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
+          fi
           bundle=dmg
           [[ "${{ matrix.platform }}" == windows ]] && bundle=nsis
           [[ "${{ matrix.product }}" == nodeHost ]] && bundle=app
