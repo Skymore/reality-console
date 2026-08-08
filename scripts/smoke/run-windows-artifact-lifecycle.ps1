@@ -51,7 +51,10 @@ try {
     Where-Object { $_.DisplayName -in "Reality Client", "Private Network Connect" } |
     Select-Object -First 1
   if (-not $uninstall -or -not $uninstall.InstallLocation) { throw "Installed application was not registered with an install location" }
-  $installLocation = $uninstall.InstallLocation
+  $installLocation = [Environment]::ExpandEnvironmentVariables(
+    ([string]$uninstall.InstallLocation).Trim().Trim([char]'"')
+  )
+  if (-not [IO.Path]::IsPathRooted($installLocation)) { throw "Installed application registered an invalid install location" }
   $installedDuringRun = $true
   $executables = Get-ChildItem -LiteralPath $installLocation -Recurse -Filter *.exe |
     Where-Object { -not $_.PSIsContainer }
