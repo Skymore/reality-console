@@ -65,6 +65,23 @@ def extract_exact(archive: Path, member_name: str, destination: Path) -> None:
             shutil.copyfileobj(source, output, length=1024 * 1024)
 
 
+def install_verified_binary(source: Path, output: Path) -> None:
+    """Atomically install a verified binary, including across Windows drives."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=output.parent,
+        prefix=f".{output.name}.",
+        delete=False,
+    ) as staged_file:
+        staged = Path(staged_file.name)
+    try:
+        shutil.copyfile(source, staged)
+        os.chmod(staged, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        os.replace(staged, output)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -88,8 +105,7 @@ def main() -> None:
         extract_exact(archive, asset["binary"], extracted)
         if sha256(extracted) != asset["binarySha256"]:
             raise ValueError("Xray executable SHA-256 mismatch")
-        os.chmod(extracted, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-        os.replace(extracted, args.output)
+        install_verified_binary(extracted, args.output)
 
     print(json.dumps({
         "component": "xray",
