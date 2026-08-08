@@ -40,6 +40,7 @@ if [ "${REQUIRE_SIGNING:-0}" = 1 ]; then
   /usr/bin/codesign --verify --strict --verbose=2 "$XRAY"
 fi
 mkdir -p "$PAYLOAD/Applications" "$BASE/bin" "$BASE/releases/$VERSION" "$PAYLOAD/Library/LaunchDaemons" "$PKG_SCRIPTS" "$OUTPUT"
+OUTPUT=$(CDPATH= cd -- "$OUTPUT" && pwd)
 # Copy the signed bundle without host-local xattrs. Those attributes are not
 # part of the code signature and pkgbuild would encode them as AppleDouble files.
 /usr/bin/ditto --norsrc --noextattr --noacl --noqtn "$APP" "$PAYLOAD/Applications/Private Network Node.app"
