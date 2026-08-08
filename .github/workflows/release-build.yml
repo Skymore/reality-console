@@ -120,6 +120,9 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
+      - name: Prepare verified Connect sidecar
+        shell: bash
+        run: scripts/release/prepare-sidecars.sh --product connect --target x86_64-pc-windows-msvc
       - name: Compile Connect Windows boundary
         shell: bash
         run: cargo check --locked --manifest-path client/src-tauri/Cargo.toml
