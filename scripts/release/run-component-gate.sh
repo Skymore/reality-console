@@ -92,7 +92,7 @@ case "$component" in
   node-host-app)
     checks=(format build test clippy rustdoc package-frontend)
     scripts/release/prepare-sidecars.sh --product node-host --target aarch64-apple-darwin
-    test -s node-host-app/dist/index.html
+    npm_gate node-host-app "npm run build"
     rust_gate node-host-app/src-tauri/Cargo.toml
     version=$(python3 -c 'import json; print(json.load(open("node-host-app/src-tauri/tauri.conf.json"))["version"])')
     ;;
