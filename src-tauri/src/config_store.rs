@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BACKUPS_PER_FILE: usize = 20;
+const BACKUP_PREFIX: &str = "private-network-backup-";
 
 pub fn persist_validated_pair<F>(
     config_path: &Path,
@@ -76,7 +77,7 @@ fn ensure_unchanged(path: &Path, expected: Option<&[u8]>) -> Result<(), String> 
         Ok(())
     } else {
         Err(format!(
-            "{} changed outside Reality Console; refresh before saving.",
+            "{} changed outside Private Network; refresh before saving.",
             path.display()
         ))
     }
@@ -106,10 +107,7 @@ fn create_backup(path: &Path) -> Result<PathBuf, String> {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("config.json");
-    let backup_path = parent.join(format!(
-        "{file_name}.reality-console-backup-{}",
-        unique_timestamp()
-    ));
+    let backup_path = parent.join(format!("{file_name}.{BACKUP_PREFIX}{}", unique_timestamp()));
     fs::copy(path, &backup_path)
         .map_err(|error| format!("Failed to back up {}: {error}", path.display()))?;
     let backup = fs::OpenOptions::new()
@@ -197,7 +195,7 @@ fn prune_backups(path: &Path, keep: usize) {
     let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
         return;
     };
-    let prefix = format!("{file_name}.reality-console-backup-");
+    let prefix = format!("{file_name}.{BACKUP_PREFIX}");
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };

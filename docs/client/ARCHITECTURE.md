@@ -8,7 +8,7 @@ Connect remains the independent Tauri application under `client/`. The repositor
 application is a separate product and process boundary.
 
 ```text
-reality-console/
+private-network/
 ├── src/                         # Control renderer
 ├── src-tauri/                   # Control backend
 ├── client/

@@ -1171,7 +1171,7 @@ fn metadata_path_for(config_path: &Path) -> Result<PathBuf, String> {
     let parent = config_path
         .parent()
         .ok_or_else(|| "Config path has no parent directory.".to_string())?;
-    Ok(parent.join("reality-console.users.json"))
+    Ok(parent.join("private-network.users.json"))
 }
 
 fn read_metadata(path: &Path) -> Result<(UserMetadataStore, Option<Vec<u8>>), String> {

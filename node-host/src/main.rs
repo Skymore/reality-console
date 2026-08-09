@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Parser)]
-#[command(name = "node-host", about = "Reality Console node host")]
+#[command(name = "node-host", about = "Private Network node host")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

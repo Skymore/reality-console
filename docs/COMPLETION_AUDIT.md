@@ -93,7 +93,7 @@ The remaining release blockers are external evidence, not permission to weaken t
 ## Authoritative Naming
 
 - `Private Network`, `Private Network Node`, and `_privnetnode` are the product/package names.
-- Historical `Reality Console`, `Reality Node`, and internal compatibility labels are not user-facing
+- Historical prototype and internal compatibility labels are not user-facing
   product terminology.
 - Stage 6 is one product-sized implementation commit; Stage 7 is a separate signed-candidate
   acceptance stage and cannot be completed by unsigned or simulated artifacts.

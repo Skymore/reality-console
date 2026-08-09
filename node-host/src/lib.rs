@@ -1,4 +1,4 @@
-//! Persistent local foundation for the Reality Console node host.
+//! Persistent local foundation for the Private Network node host.
 
 mod activation;
 mod admission;

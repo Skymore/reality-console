@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://reality-console.invalid/schemas/release-acceptance-evidence-v1.json",
+  "$id": "https://private-network.invalid/schemas/release-acceptance-evidence-v1.json",
   "title": "Release acceptance evidence",
   "type": "object",
   "additionalProperties": false,

@@ -274,6 +274,7 @@ function App() {
   const [editingNodeIds, setEditingNodeIds] = useState<string[]>([])
   const [delivery, setDelivery] = useState<SetupDelivery | null>(null)
   const [deliveryKind, setDeliveryKind] = useState<"connect" | "node">("connect")
+  const [accountPendingDelete, setAccountPendingDelete] = useState<ControlAccount | null>(null)
   const [nodePendingRevoke, setNodePendingRevoke] = useState<ControlNode | null>(null)
   const [mutating, setMutating] = useState(false)
 
@@ -404,20 +405,21 @@ function App() {
   }
 
   async function setAccountStatus(account: ControlAccount, status: "active" | "disabled" | "deleted") {
-    if (status === "deleted") {
-      const confirmed = window.confirm(
-        language === "zh"
-          ? `永久删除 ${account.account.displayName}？所有节点上的访问会被撤销。`
-          : `Permanently delete ${account.account.displayName}? Access will be revoked from every node.`,
-      )
-      if (!confirmed) return
-    }
-    await mutate(
+    const result = await mutate(
       () => invoke("set_control_account_status", {
         input: { userId: account.account.userId, status },
       }),
       language === "zh" ? "账号状态已更新" : "Account status updated",
     )
+    if (result.succeeded && status === "deleted") setAccountPendingDelete(null)
+  }
+
+  function runAccountStatus(account: ControlAccount, status: "active" | "disabled" | "deleted") {
+    if (status === "deleted") {
+      setAccountPendingDelete(account)
+      return
+    }
+    void setAccountStatus(account, status)
   }
 
   async function performNodeAction(node: ControlNode, action: "approve" | "disable" | "revoke") {
@@ -597,7 +599,7 @@ function App() {
                   onAdd={() => setFriendDialogOpen(true)}
                   onEdit={openAccountEditor}
                   onSetup={createConnectCode}
-                  onStatus={setAccountStatus}
+                  onStatus={runAccountStatus}
                 />
               ) : null}
               {page === "local" ? (
@@ -705,6 +707,38 @@ function App() {
             <Button variant="outline" onClick={() => delivery && void copyText(delivery.setupLink, setNotice, t.copied)}><Link2 />{language === "zh" ? "复制链接" : "Copy link"}</Button>
           </div>
           <DialogFooter><Button onClick={() => setDelivery(null)}>{t.close}</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(accountPendingDelete)}
+        onOpenChange={(open) => {
+          if (!open && !mutating) setAccountPendingDelete(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{language === "zh" ? "永久删除这个朋友账号？" : "Permanently delete this friend account?"}</DialogTitle>
+            <DialogDescription>
+              {language === "zh"
+                ? `${accountPendingDelete?.account.displayName ?? "该账号"} 将立即失去所有节点访问权限，已登录设备也不能再同步。此操作无法撤销。`
+                : `${accountPendingDelete?.account.displayName ?? "This account"} will immediately lose access to every node, and signed-in devices will stop syncing. This cannot be undone.`}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="rounded-xl border border-destructive/25 bg-destructive/5 p-3 text-sm">
+            <p className="font-medium">{accountPendingDelete?.account.displayName}</p>
+            <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{accountPendingDelete?.account.userId}</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAccountPendingDelete(null)} disabled={mutating}>{t.cancel}</Button>
+            <Button
+              variant="destructive"
+              onClick={() => accountPendingDelete && void setAccountStatus(accountPendingDelete, "deleted")}
+              disabled={!accountPendingDelete || mutating}
+            >
+              {language === "zh" ? "永久删除" : "Delete permanently"}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

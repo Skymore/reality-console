@@ -24,9 +24,9 @@ max_node_connections = 1024
 # must be owned by the relay process effective UID (normally root) with modes 0700 and 0600.
 # [managed_routes]
 # relay_id = "00000000-0000-4000-8000-000000000001"
-# managed_routes_directory = "/var/lib/reality-console/relay-routes"
+# managed_routes_directory = "/var/lib/private-network/relay-routes"
 # Durable monthly usage ledger. Keep this separate from the signed route registry directory.
-# quota_state_directory = "/var/lib/reality-console/relay-quota"
+# quota_state_directory = "/var/lib/private-network/relay-quota"
 # Pinned Ed25519 controller public key: exactly 32 bytes as unpadded base64url.
 # controller_public_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 # Managed public listeners bind this local IP; signed documents select only a port in this range.
